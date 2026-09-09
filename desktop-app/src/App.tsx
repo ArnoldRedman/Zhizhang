@@ -1301,6 +1301,10 @@ function App() {
   const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
+  const [copiedTitle, setCopiedTitle] = useState(false);
+  const [copiedContent, setCopiedContent] = useState(false);
+  const titleCopyTimerRef = useRef<number | null>(null);
+  const contentCopyTimerRef = useRef<number | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
   const [activeCardId, setActiveCardId] = useState<number | null>(null);
   const [activeMemoryDocumentId, setActiveMemoryDocumentId] = useState<string>(memoryDocumentId('章节快照'));
@@ -3490,6 +3494,50 @@ function App() {
     try {
       await navigator.clipboard.writeText(content);
       setNotice({ title: '已复制', content: '文本已复制到剪贴板。' });
+    } catch {
+      setNotice({ title: '复制失败', content: '当前系统未允许访问剪贴板，请手动选择文本复制。' });
+    }
+  };
+
+  useEffect(() => {
+    setCopiedTitle(false);
+    setCopiedContent(false);
+  }, [activeChapter?.id]);
+
+  useEffect(() => {
+    return () => {
+      if (titleCopyTimerRef.current) window.clearTimeout(titleCopyTimerRef.current);
+      if (contentCopyTimerRef.current) window.clearTimeout(contentCopyTimerRef.current);
+    };
+  }, []);
+
+  const copyChapterTitle = async () => {
+    if (!activeChapter || !activeChapter.title.trim()) {
+      setNotice({ title: '标题为空', content: '当前章节暂无标题可复制。' });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(activeChapter.title.trim());
+      setCopiedTitle(true);
+      if (titleCopyTimerRef.current) window.clearTimeout(titleCopyTimerRef.current);
+      titleCopyTimerRef.current = window.setTimeout(() => setCopiedTitle(false), 2000);
+      setNotice({ title: '标题已复制', content: `《${activeChapter.title.trim()}》已复制到剪贴板，可直接粘贴到发布平台。` });
+    } catch {
+      setNotice({ title: '复制失败', content: '当前系统未允许访问剪贴板，请手动选择文本复制。' });
+    }
+  };
+
+  const copyChapterContent = async () => {
+    if (!activeChapter || !activeChapter.content.trim()) {
+      setNotice({ title: '正文为空', content: '当前章节暂无正文可复制。' });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(activeChapter.content);
+      setCopiedContent(true);
+      if (contentCopyTimerRef.current) window.clearTimeout(contentCopyTimerRef.current);
+      contentCopyTimerRef.current = window.setTimeout(() => setCopiedContent(false), 2000);
+      setNotice({ title: '正文已复制', content: `当前章节正文（共 ${activeChapter.wordCount.toLocaleString()} 字）已复制到剪贴板，可直接粘贴到发布平台。` });
     } catch {
       setNotice({ title: '复制失败', content: '当前系统未允许访问剪贴板，请手动选择文本复制。' });
     }
@@ -6421,19 +6469,33 @@ function App() {
                       <div className="search-panel-row replace-row"><input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} /><button className="editor-tool-button" onClick={replaceCurrentMatch} disabled={!searchQuery}>替换</button><button className="editor-tool-button" onClick={replaceAllMatches} disabled={!searchQuery}>全部替换</button><small>{currentSearchMatches ? `${Math.min(searchMatchIndex + 1, currentSearchMatches)} / ${currentSearchMatches}` : '无匹配'}</small></div>
                     </section>
                   )}
-                  <input
-                    type="text"
-                    className="chapter-title-input"
-                    value={activeChapter.title}
-                    onChange={(e) => {
-                      const updatedChapter = { ...activeChapter, title: e.target.value, updatedAt: new Date().toISOString() };
-                      const updatedChapters = editingProject.chapters.map(c => c.id === activeChapter.id ? updatedChapter : c);
-                      const updated = { ...editingProject, chapters: updatedChapters, updatedAt: new Date().toISOString() };
-                      setEditingProject(updated);
-                      setActiveChapter(updatedChapter);
-                      setProjects(current => current.map(p => p.id === updated.id ? updated : p));
-                    }}
-                  />
+                  <div className="chapter-title-wrap">
+                    <input
+                      type="text"
+                      className="chapter-title-input"
+                      value={activeChapter.title}
+                      onChange={(e) => {
+                        const updatedChapter = { ...activeChapter, title: e.target.value, updatedAt: new Date().toISOString() };
+                        const updatedChapters = editingProject.chapters.map(c => c.id === activeChapter.id ? updatedChapter : c);
+                        const updated = { ...editingProject, chapters: updatedChapters, updatedAt: new Date().toISOString() };
+                        setEditingProject(updated);
+                        setActiveChapter(updatedChapter);
+                        setProjects(current => current.map(p => p.id === updated.id ? updated : p));
+                      }}
+                      placeholder="章节标题"
+                    />
+                    <button
+                      type="button"
+                      className={`chapter-quick-copy-button ${copiedTitle ? 'copied' : ''}`}
+                      title="快捷复制标题（用于发布平台）"
+                      aria-label="快捷复制标题"
+                      disabled={!activeChapter.title.trim()}
+                      onClick={() => void copyChapterTitle()}
+                    >
+                      <Icon name={copiedTitle ? 'check' : 'copy'} size={14} />
+                      <span>{copiedTitle ? '已复制标题' : '复制标题'}</span>
+                    </button>
+                  </div>
                   <div className="chapter-editor-wrap">
                     <div ref={highlightLayerRef} className="chapter-highlight-layer" aria-hidden="true">{renderMarkedContent(activeChapter.content)}</div>
                     <textarea
@@ -6446,6 +6508,17 @@ function App() {
                       placeholder="开始写作..."
                       spellCheck={false}
                     />
+                    <button
+                      type="button"
+                      className={`chapter-floating-copy-button ${copiedContent ? 'copied' : ''}`}
+                      title="快捷复制正文（用于发布平台）"
+                      aria-label="快捷复制正文"
+                      disabled={!activeChapter.content.trim()}
+                      onClick={() => void copyChapterContent()}
+                    >
+                      <Icon name={copiedContent ? 'check' : 'copy'} size={14} />
+                      <span>{copiedContent ? '已复制正文' : '复制正文'}</span>
+                    </button>
                   </div>
                   <div className="chapter-live-footer">
                     <span>本章实时字数 <strong>{activeChapter.wordCount.toLocaleString()}</strong></span>

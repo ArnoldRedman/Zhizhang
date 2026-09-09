@@ -37,6 +37,7 @@ export type IconName =
   | 'refresh'
   | 'upload'
   | 'send'
+  | 'copy'
   | 'archive';
 
 interface IconProps extends Omit<SVGProps<SVGSVGElement>, 'name'> {
@@ -163,6 +164,10 @@ const icons: Record<IconName, ReactNode> = {
   send: <>
     <path d="m21 3-7.5 18-3.3-7.2L3 10.5 21 3Z" />
     <path d="M10.2 13.8 21 3" />
+  </>,
+  copy: <>
+    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
   </>,
   archive: <>
     <path d="M4 7h16v13H4V7ZM3 4h18v3H3V4Z" />
