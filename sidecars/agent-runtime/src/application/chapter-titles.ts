@@ -127,11 +127,91 @@ export function applyDraftChapterTitle(currentTitle: string, draftHeading: strin
   return currentTitle;
 }
 
+/** 把正整数写成中文章号：151 → 一百五十一，110 → 一百一十，1005 → 一千零五，10 → 十 */
+export function formatChineseNumber(value: number): string {
+  const digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+  const units = ["", "十", "百", "千"];
+  const n = Math.max(0, Math.floor(value));
+  if (n === 0) return "零";
+  if (n >= 10000) {
+    const rest = n % 10000;
+    // 万以下不足千位时要补“零”：一万零五、一万零五十
+    const tail = rest === 0 ? "" : (rest < 1000 ? `零${formatChineseNumber(rest)}` : formatChineseNumber(rest));
+    return `${formatChineseNumber(Math.floor(n / 10000))}万${tail}`;
+  }
+  let text = "";
+  let pendingZero = false;
+  const chars = String(n);
+  for (let i = 0; i < chars.length; i += 1) {
+    const digit = Number(chars[i]);
+    const unit = units[chars.length - 1 - i];
+    if (digit === 0) {
+      pendingZero = text.length > 0;
+      continue;
+    }
+    if (pendingZero) text += "零";
+    pendingZero = false;
+    text += `${digits[digit]}${unit}`;
+  }
+  // 10 到 19 习惯写“十X”而不是“一十X”；一百一十不受影响
+  return text.replace(/^一十/u, "十");
+}
+
+/**
+ * 章号的书写格式：数字用中文还是阿拉伯、“第”“章”与数字之间有没有空格、章号和名字之间用什么隔开
+ * 全部从作者已有标题里学，重编时才能和前文保持一致
+ */
+export interface ChapterNumberStyle {
+  digits: "chinese" | "arabic";
+  /** “第”和数字之间的字符，通常是空格或空 */
+  open: string;
+  /** 数字和“章”之间的字符 */
+  close: string;
+  /** 章号和名字之间的分隔，如空格、“：” */
+  separator: string;
+}
+
+/** 应用新建章节的占位格式「第 N 章」，没有任何可参考的标题时用它 */
+const defaultChapterNumberStyle: ChapterNumberStyle = { digits: "arabic", open: " ", close: " ", separator: " " };
+
+/**
+ * 从已有章节标题里学章号格式，取最后一条能解析的：离要重编的章最近的格式最可能是作者现在在用的
+ * 传入时调用方应按目录顺序给出、并只给待重编范围之前的标题
+ */
+export function detectChapterNumberStyle(titles: readonly string[]): ChapterNumberStyle {
+  for (let i = titles.length - 1; i >= 0; i -= 1) {
+    const match = /^第(\s*)([\d零〇一二两三四五六七八九十百千万]+)(\s*)章(\s*[：:·、.\-—]?\s*)(\S?)/u.exec(titles[i].trim());
+    if (!match) continue;
+    const [, open, number, close, gap, next] = match;
+    return {
+      digits: /^\d+$/u.test(number) ? "arabic" : "chinese",
+      open,
+      close,
+      // 章号后面直接接名字（没有任何分隔）时保持紧贴；没有名字可参考时按空格
+      separator: next ? gap : (gap || " "),
+    };
+  }
+  return defaultChapterNumberStyle;
+}
+
+/** 按学到的格式生成章号前缀，不含名字：formatChapterNumber(151, 中文) → 第一百五十一章 */
+export function formatChapterNumber(ordinal: number, style: ChapterNumberStyle): string {
+  const number = style.digits === "chinese" ? formatChineseNumber(ordinal) : String(ordinal);
+  return `第${style.open}${number}${style.close}章`;
+}
+
+/** 去掉章号前缀后剩下的名字部分 */
+export function chapterTitleName(title: string): string {
+  return title.trim().replace(chapterNumberPrefix, "").trim();
+}
+
 export interface ChapterTitleCandidate {
   targetId: number;
   /** 当前标题，通常是「第 N 章」这种占位；生成的名字会接在它后面 */
   currentTitle: string;
   content: string;
+  /** 这一章在目录里的位置（从 1 起）；重编章号时以它为准，也是模型回包 index 的首选配对键 */
+  ordinal?: number;
 }
 
 export interface ChapterTitleEntry {
@@ -147,8 +227,31 @@ export interface ChapterTitleResult {
   recovered: number;
   /** 交给模型命名的章数 */
   named: number;
+  /** 模型给的标题和当前一模一样、不需要改动的章数：这不是失败，不能报成“没给出可用标题” */
+  unchanged: number;
   /** 没能命名的批次原因，交给调用方写进 toolEvents */
   failures: string[];
+}
+
+/** 一次批量命名的可选项 */
+export interface ChapterTitlesOptions {
+  instruction?: string;
+  projectTitle?: string;
+  /** 给了格式就按各章 ordinal 重编章号；模型只负责名字，章号一律由应用按位置生成 */
+  renumber?: ChapterNumberStyle;
+  onProgress?: (done: number, total: number) => void;
+}
+
+/**
+ * 把模型给的名字装成最终标题
+ * 重编模式：章号按目录位置生成，名字取模型给的；模型只回了章号没回名字时沿用当前名字（作者要的只是重排编号）
+ * 普通模式：沿用当前章号，只换名字
+ */
+function composeChapterTitle(candidate: ChapterTitleCandidate, draftName: string, renumber?: ChapterNumberStyle): string {
+  if (!renumber || !candidate.ordinal) return applyDraftChapterTitle(candidate.currentTitle, draftName, { overwrite: true });
+  const name = chapterTitleName(draftName) || chapterTitleName(candidate.currentTitle);
+  const prefix = formatChapterNumber(candidate.ordinal, renumber);
+  return name ? `${prefix}${renumber.separator}${name}` : prefix;
 }
 
 /** 一次模型请求里塞多少章：标题只有十来个字，20 章一批兼顾吞吐与稳定性 */
@@ -205,19 +308,22 @@ function firstNumericField(value: unknown): number | null {
 /**
  * 把模型回的标题行配到具体章节上
  * 配对按“序号 → 章号（第 N 章里的 N）→ 十几位真实 id → 数量对上时按位置”四层降级：
- * 支持阿拉伯数字与中文数字章号精准配对
+ * 序号优先看调用方给的目录位置 ordinal（提示词里让模型抄的就是它），其次才是标题里写的章号——
+ * 重排过的章目录位置和旧章号不一致，只认旧章号就会整批配不上
  */
 function matchTitleRow(row: { index: number | null; id: string }, batch: readonly ChapterTitleCandidate[], used: Set<number>): ChapterTitleCandidate | null {
-  const chapterNumber = (candidate: ChapterTitleCandidate) => extractChapterNumber(candidate.currentTitle);
+  const chapterNumber = (candidate: ChapterTitleCandidate) => candidate.ordinal ?? extractChapterNumber(candidate.currentTitle);
+  const oldNumber = (candidate: ChapterTitleCandidate) => extractChapterNumber(candidate.currentTitle);
+  const free = (predicate: (item: ChapterTitleCandidate, i: number) => boolean) => batch.find((item, i) => !used.has(i) && predicate(item, i));
   if (row.index !== null) {
-    const target = batch.find((item, i) => !used.has(i) && chapterNumber(item) === row.index) || batch.find((item, i) => !used.has(i) && i + 1 === row.index);
+    const target = free(item => chapterNumber(item) === row.index) || free(item => oldNumber(item) === row.index) || free((_, i) => i + 1 === row.index);
     if (target) return target;
   }
   const rawId = row.id.trim();
   if (rawId) {
     const idNumber = parseChapterNumber(rawId);
-    const byExactId = batch.find((item, i) => !used.has(i) && String(item.targetId) === rawId);
-    const byNumber = idNumber !== null ? batch.find((item, i) => !used.has(i) && (chapterNumber(item) === idNumber || i + 1 === idNumber)) : undefined;
+    const byExactId = free(item => String(item.targetId) === rawId);
+    const byNumber = idNumber !== null ? free((item, i) => chapterNumber(item) === idNumber || oldNumber(item) === idNumber || i + 1 === idNumber) : undefined;
     const target = byExactId || byNumber;
     if (target) return target;
   }
@@ -228,9 +334,9 @@ const titleSystemPrompt = `你是中文长篇网文的责任编辑，正在为�
 
 要求：
 1. 每个标题只概括该章真正发生的事，不得使用别章的情节，不得凭空发明设定。
-2. 4 到 14 个汉字，不带“第几章”前缀，不带书名号、引号、句号和省略号。
+2. 4 到 14 个汉字，不带“第几章”前缀，不带书名号、引号、句号和省略号。章号由应用自己编，你只负责名字。
 3. 同一批里的标题必须互不相同，不要都写成“危机”“转机”这类空词。
-4. 严格返回 JSON 对象：{"titles":[{"index":序号,"title":"标题"}]}，不要代码围栏，不要解释。index 直接抄回各章开头的“第 X 章”那个 X。
+4. 严格返回 JSON 对象：{"titles":[{"index":序号,"title":"标题"}]}，不要代码围栏，不要解释。index 直接抄回各章标头里的 index= 后面那个数。
 5. 给了几章就返回几条，不要新增或漏掉章节。`;
 
 const singleTitleSystemPrompt = `你是中文长篇网文的责任编辑，正在为刚写完的一章起标题。
@@ -303,12 +409,13 @@ export async function generateChapterTitle(
 async function retrySingles(
   source: { client: ModelApiClient; projectTitle: string },
   missing: readonly ChapterTitleCandidate[],
-  options: { instruction?: string },
-): Promise<{ entries: ChapterTitleEntry[]; missing: ChapterTitleCandidate[] }> {
-  if (!missing.length) return { entries: [], missing: [] };
+  options: { instruction?: string; renumber?: ChapterNumberStyle },
+): Promise<{ entries: ChapterTitleEntry[]; missing: ChapterTitleCandidate[]; unchanged: number }> {
+  if (!missing.length) return { entries: [], missing: [], unchanged: 0 };
   const capped = missing.slice(0, TITLE_SINGLE_RETRY_LIMIT);
   const entries: ChapterTitleEntry[] = [];
   const still: ChapterTitleCandidate[] = missing.slice(TITLE_SINGLE_RETRY_LIMIT);
+  let unchanged = 0;
   for (const candidate of capped) {
     const name = await generateChapterTitle(source.client, candidate.content, {
       projectTitle: source.projectTitle,
@@ -318,44 +425,51 @@ async function retrySingles(
       still.push(candidate);
       continue;
     }
-    const title = applyDraftChapterTitle(candidate.currentTitle, name, { overwrite: true });
+    const title = composeChapterTitle(candidate, name, options.renumber);
     if (title.trim() === candidate.currentTitle.trim()) {
-      still.push(candidate);
+      unchanged += 1;
       continue;
     }
     entries.push({ targetId: candidate.targetId, title: title.slice(0, 160) });
   }
-  return { entries, missing: still };
+  return { entries, missing: still, unchanged };
 }
 
 /** 失败名单里的章号列表，拼进提示语让作者知道再说一次时点哪些章 */
 function labelList(missing: readonly ChapterTitleCandidate[]): string {
   const labels = missing.map(item => {
-    const chapterNumber = extractChapterNumber(item.currentTitle);
+    const chapterNumber = item.ordinal ?? extractChapterNumber(item.currentTitle);
     return chapterNumber !== null ? `第 ${chapterNumber} 章` : (item.currentTitle.trim() || `id=${item.targetId}`);
   });
   return labels.length > 5 ? `${labels.slice(0, 5).join("、")} 等 ${labels.length} 章` : labels.join("、");
 }
 
+/** 回包摘要：排查“为什么没配上”时作者至少要能看到模型到底回了什么 */
+function responseGlimpse(content: string): string {
+  const flat = content.replace(/\s+/gu, " ").trim();
+  return flat.length > 160 ? `${flat.slice(0, 160)}……` : flat;
+}
+
 export async function generateChapterTitles(
   client: ModelApiClient,
   candidates: readonly ChapterTitleCandidate[],
-  options: { instruction?: string; projectTitle?: string; onProgress?: (done: number, total: number) => void } = {},
+  options: ChapterTitlesOptions = {},
 ): Promise<ChapterTitleResult> {
   const entries: ChapterTitleEntry[] = [];
   const failures: string[] = [];
   const pending: ChapterTitleCandidate[] = [];
   let recovered = 0;
+  let unchanged = 0;
 
   for (const candidate of candidates) {
     const draft = splitChapterTitleHeading(candidate.content);
     if (!draft.title) {
       if (candidate.content.trim()) pending.push(candidate);
-      else failures.push(`章节 ${candidate.targetId} 没有正文，无法起名`);
+      else failures.push(`章节 ${candidate.ordinal ? `#${candidate.ordinal}` : candidate.targetId} 没有正文，无法起名`);
       continue;
     }
     // 正文开头本来就写着标题：搬到标题栏并把那一行从正文里移走，不需要问模型
-    const title = applyDraftChapterTitle(candidate.currentTitle, draft.title);
+    const title = options.renumber ? composeChapterTitle(candidate, draft.title, options.renumber) : applyDraftChapterTitle(candidate.currentTitle, draft.title);
     entries.push({ targetId: candidate.targetId, title: title.slice(0, 160), stripHeading: true });
     recovered += 1;
   }
@@ -368,17 +482,21 @@ export async function generateChapterTitles(
   let done = recovered;
   const extra = options.instruction?.trim() ? `\n作者额外要求：${options.instruction.trim()}` : "";
   const singleFallbackClient = { client, projectTitle: options.projectTitle || "" };
+  const retryOptions = { instruction: options.instruction, renumber: options.renumber };
 
   const batchResults = await mapWithConcurrency(batches, TITLE_BATCH_CONCURRENCY, async batch => {
+    // 标头里的 index 就是配对键：优先用目录位置，没有就用标题里的章号，再没有才按批内顺序
     const listing = batch
       .map((item, i) => {
-        const num = extractChapterNumber(item.currentTitle);
-        const indexLabel = num !== null ? String(num) : String(i + 1);
-        return `### ${item.currentTitle.trim() || "无标题"}（index=${indexLabel}）\n${titleExcerpt(item.content)}`;
+        const indexLabel = String(item.ordinal ?? extractChapterNumber(item.currentTitle) ?? i + 1);
+        return `### index=${indexLabel}｜当前标题：${item.currentTitle.trim() || "（无）"}\n${titleExcerpt(item.content)}`;
       })
       .join("\n\n");
     const produced: ChapterTitleEntry[] = [];
     const missing: ChapterTitleCandidate[] = [];
+    let batchUnchanged = 0;
+    // 记下这一批为什么有章没配上，最后报给作者，而不是笼统一句“没给出可用标题”
+    let reason = "";
     try {
       const response = await client.chat([
         { role: "system", content: titleSystemPrompt },
@@ -389,6 +507,17 @@ export async function generateChapterTitles(
       const rows = collectTitleRows(parsed);
       const used = new Set<number>();
       const leftovers: Array<{ index: number | null; id: string; title: string }> = [];
+      const accept = (candidate: ChapterTitleCandidate, rawTitle: string) => {
+        const name = cleanChapterTitleName(rawTitle);
+        if (!name) return;
+        used.add(batch.indexOf(candidate));
+        const title = composeChapterTitle(candidate, name, options.renumber);
+        if (title.trim() === candidate.currentTitle.trim()) {
+          batchUnchanged += 1;
+          return;
+        }
+        produced.push({ targetId: candidate.targetId, title: title.slice(0, 160) });
+      };
       for (const row of rows) {
         const candidate = matchTitleRow(row, batch, used);
         if (!candidate) {
@@ -396,39 +525,32 @@ export async function generateChapterTitles(
           leftovers.push(row);
           continue;
         }
-        const name = cleanChapterTitleName(row.title);
-        if (!name) continue;
-        const title = applyDraftChapterTitle(candidate.currentTitle, name, { overwrite: true });
-        if (title.trim() === candidate.currentTitle.trim()) continue;
-        used.add(batch.indexOf(candidate));
-        produced.push({ targetId: candidate.targetId, title: title.slice(0, 160) });
+        accept(candidate, row.title);
       }
       // 模型不带任何键、纯按顺序回标题时（或键写错时）：尽量按顺序对齐匹配未命中的章节
       const unmatched = batch.filter((_, i) => !used.has(i));
       if (leftovers.length > 0 && unmatched.length > 0) {
         const pairCount = Math.min(leftovers.length, unmatched.length);
-        for (let i = 0; i < pairCount; i += 1) {
-          const candidate = unmatched[i];
-          const name = cleanChapterTitleName(leftovers[i].title);
-          if (!name) continue;
-          const title = applyDraftChapterTitle(candidate.currentTitle, name, { overwrite: true });
-          if (title.trim() === candidate.currentTitle.trim()) continue;
-          used.add(batch.indexOf(candidate));
-          produced.push({ targetId: candidate.targetId, title: title.slice(0, 160) });
-        }
+        for (let i = 0; i < pairCount; i += 1) accept(unmatched[i], leftovers[i].title);
       }
       for (let i = 0; i < batch.length; i += 1) if (!used.has(i)) missing.push(batch[i]);
+      if (missing.length) {
+        reason = rows.length
+          ? `批量回包 ${rows.length} 行只配上 ${batch.length - missing.length}/${batch.length} 章`
+          : `批量回包里没有标题行，回包开头：${responseGlimpse(response.content)}`;
+      }
     } catch (error) {
       missing.push(...batch);
-      return { produced, missing, failure: `一批 ${batch.length} 章命名失败：${describeTitleError(error)}` };
+      // 整批异常时还没做过逐章重试，标记出来交给收尾统一救一次
+      return { produced, missing, unchanged: batchUnchanged, needsRescue: true, failure: `一批 ${batch.length} 章命名失败：${describeTitleError(error)}` };
     } finally {
       done += batch.length;
       options.onProgress?.(Math.min(done, candidates.length), candidates.length);
     }
     // 批量回包没配上的章节逐章补一次：几百 token 一章的小请求，比让作者自己挨章补名划算
-    const retried = await retrySingles(singleFallbackClient, missing, options);
-    const failure = retried.missing.length ? `${labelList(retried.missing)} 模型没给出可用标题，可以再说一次只处理这几章` : "";
-    return { produced: [...produced, ...retried.entries], missing: retried.missing, failure };
+    const retried = await retrySingles(singleFallbackClient, missing, retryOptions);
+    const failure = retried.missing.length ? `${labelList(retried.missing)} 模型没给出可用标题（${reason}，逐章重试也没拿到名字），可以再说一次只处理这几章` : "";
+    return { produced: [...produced, ...retried.entries], missing: retried.missing, unchanged: batchUnchanged + retried.unchanged, needsRescue: false, failure };
   });
 
   let named = 0;
@@ -436,19 +558,19 @@ export async function generateChapterTitles(
   for (const result of batchResults) {
     entries.push(...result.produced);
     named += result.produced.length;
-    stillMissing.push(...result.missing);
+    unchanged += result.unchanged;
+    if (result.needsRescue) stillMissing.push(...result.missing);
+    if (result.failure) failures.push(result.failure);
   }
-  // 批内重试只处理本批配不上的；整批异常（网络/JSON 挂掉）在上面 catch 里跳过了单章重试，这里统一再救一次
+  // 整批异常（网络/JSON 挂掉）的批次在 catch 里跳过了逐章重试，这里统一救一次；批内已经重试过的不再重复调模型
   if (stillMissing.length) {
-    const rescued = await retrySingles(singleFallbackClient, stillMissing, options);
+    const rescued = await retrySingles(singleFallbackClient, stillMissing, retryOptions);
     entries.push(...rescued.entries);
     named += rescued.entries.length;
+    unchanged += rescued.unchanged;
     if (rescued.missing.length) failures.push(`${labelList(rescued.missing)} 模型没给出可用标题，可以再说一次只处理这几章`);
   }
-  for (const result of batchResults) {
-    if (result.failure && !result.failure.includes("模型没给出可用标题")) failures.push(result.failure);
-  }
-  return { entries, recovered, named, failures };
+  return { entries, recovered, named, unchanged, failures };
 }
 
 /** 命名失败时给一句能照着做的话，而不是只丢一句“网络错误” */

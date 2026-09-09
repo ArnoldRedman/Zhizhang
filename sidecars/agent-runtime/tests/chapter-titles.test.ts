@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { mapWithConcurrency } from "../src/application/concurrency.js";
-import { generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "../src/application/chapter-titles.js";
+import { detectChapterNumberStyle, formatChineseNumber, generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "../src/application/chapter-titles.js";
 import { ModelApiClient } from "../src/models/model-api.js";
 
 const clientReturning = (bodies: string[]) => {
@@ -281,3 +281,86 @@ describe("generateChapterTitle", () => {
       { targetId: 20003, title: "第 15 章 青云试炼" },
     ]);
   });
+
+  it("模型回的名字和当前标题一样时算未变，不报成没给出可用标题", async () => {
+    const { client, chat } = clientReturning([
+      JSON.stringify({ titles: [{ index: 15, title: "青云试炼" }] }),
+    ]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 20003, currentTitle: "第 15 章 青云试炼", content: "少年踏上青云宗的天梯。" },
+    ]);
+
+    expect(chat).toHaveBeenCalledTimes(1);
+    expect(result.entries).toEqual([]);
+    expect(result.unchanged).toBe(1);
+    expect(result.failures).toEqual([]);
+  });
+
+  it("重排后的章按目录位置配对，不被标题里的旧章号带偏", async () => {
+    // 线上事故：#151~#171 里夹着 12 章新章，旧章号和目录位置对不上，模型按 index 回，旧逻辑只认旧章号整批配不上
+    const { client } = clientReturning([
+      JSON.stringify({ titles: [
+        { index: 151, title: "试捞湿纸见裂" },
+        { index: 152, title: "缺页归档待补" },
+        { index: 153, title: "婚期喜帖入匣" },
+      ] }),
+    ]);
+    const style = detectChapterNumberStyle(["第一百四十九章 修复通论定纲", "第一百五十章 夜校开讲"]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 1, ordinal: 151, currentTitle: "第一百五十二章 试捞湿纸一张见裂", content: "湿纸出水。" },
+      { targetId: 2, ordinal: 152, currentTitle: "第 151 章", content: "归档缺页。" },
+      { targetId: 3, ordinal: 153, currentTitle: "择定婚期喜帖入匣", content: "喜帖入匣。" },
+    ], { renumber: style });
+
+    expect(result.failures).toEqual([]);
+    expect(result.entries).toEqual([
+      { targetId: 1, title: "第一百五十一章 试捞湿纸见裂" },
+      { targetId: 2, title: "第一百五十二章 缺页归档待补" },
+      { targetId: 3, title: "第一百五十三章 婚期喜帖入匣" },
+    ]);
+  });
+
+  it("重编章号时模型没回名字的章沿用原名，只换章号", async () => {
+    const { client, chat } = clientReturning([JSON.stringify({ titles: [] }), JSON.stringify({ title: "" })]);
+    const style = detectChapterNumberStyle(["第一百五十章 夜校开讲"]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 7, ordinal: 171, currentTitle: "第一百六十一章 受聘主编筹备教材", content: "受聘主编。" },
+    ], { renumber: style });
+
+    // 批量与单章都没拿到名字：仍然报失败而不是静默沿用，作者要的是可区分的新名字
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(result.entries).toEqual([]);
+    expect(result.failures[0]).toContain("第 171 章");
+    expect(result.failures[0]).toContain("批量回包");
+  });
+
+  it("批量没配上但单章重试拿到名字时按目录位置重编", async () => {
+    const { client } = clientReturning([JSON.stringify({ titles: [] }), JSON.stringify({ title: "《受聘主编》。" })]);
+    const style = detectChapterNumberStyle(["第一百五十章 夜校开讲"]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 7, ordinal: 171, currentTitle: "第一百六十一章 受聘主编筹备教材", content: "受聘主编。" },
+    ], { renumber: style });
+
+    expect(result.entries).toEqual([{ targetId: 7, title: "第一百七十一章 受聘主编" }]);
+  });
+
+describe("章号格式", () => {
+  it("中文数字按口语习惯写", () => {
+    expect(formatChineseNumber(10)).toBe("十");
+    expect(formatChineseNumber(15)).toBe("十五");
+    expect(formatChineseNumber(110)).toBe("一百一十");
+    expect(formatChineseNumber(151)).toBe("一百五十一");
+    expect(formatChineseNumber(205)).toBe("二百零五");
+    expect(formatChineseNumber(1005)).toBe("一千零五");
+  });
+
+  it("从前文标题学格式，取最近一条能解析的", () => {
+    expect(detectChapterNumberStyle(["第 12 章 夜雨", "第一百五十章 夜校开讲"])).toEqual({ digits: "chinese", open: "", close: "", separator: " " });
+    expect(detectChapterNumberStyle(["第一百五十章 夜校开讲", "第 151 章：口供"])).toEqual({ digits: "arabic", open: " ", close: " ", separator: "：" });
+    expect(detectChapterNumberStyle(["随便起的名字"])).toEqual({ digits: "arabic", open: " ", close: " ", separator: " " });
+  });
+});

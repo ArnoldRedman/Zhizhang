@@ -8,7 +8,7 @@ import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPrepar
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
-import { applyDraftChapterTitle, generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
+import { applyDraftChapterTitle, detectChapterNumberStyle, generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
 import { planChapterSplits } from "./application/chapter-split.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
@@ -294,20 +294,28 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const delegateChapterTitles = async (request: ProjectAgentChapterRetitleRequest) => {
         const chapters = projectList("chapters");
         const wanted = new Set(request.targetIds.map(id => String(id)));
+        // 带上目录位置：模型回包按 index 配对、重编章号都以它为准，而不是标题里可能已经过时的旧章号
+        const indexed = chapters.map((item, index) => ({ item, ordinal: index + 1 }));
         const picked = wanted.size
-          ? chapters.filter(item => wanted.has(String(item.id)))
-          : chapters.filter(item => request.scope === "all" || isPlaceholderChapterTitle(String(item.title || "")));
+          ? indexed.filter(({ item }) => wanted.has(String(item.id)))
+          : indexed.filter(({ item }) => request.scope === "all" || isPlaceholderChapterTitle(String(item.title || "")));
         if (!picked.length) {
           throw new Error(wanted.size ? "指定的章节都不存在" : "没有需要补标题的章节，所有章节都已经有名字");
         }
-        emitProjectEvent({ type: "progress", data: { step: "chapter-retitle", progress: 40, message: `正在为 ${picked.length} 章补标题` } });
-        const result = await generateChapterTitles(client, picked.map(item => ({
+        // 重编章号时格式跟前文学：取待重编范围之前最近一条能解析的标题
+        const renumber = request.renumber
+          ? detectChapterNumberStyle(chapters.slice(0, picked[0].ordinal - 1).map(item => String(item.title || "")))
+          : undefined;
+        emitProjectEvent({ type: "progress", data: { step: "chapter-retitle", progress: 40, message: `正在为 ${picked.length} 章${renumber ? "重编章号并" : ""}补标题` } });
+        const result = await generateChapterTitles(client, picked.map(({ item, ordinal }) => ({
           targetId: Number(item.id),
           currentTitle: String(item.title || ""),
           content: String(item.content || ""),
+          ordinal,
         })), {
           instruction: request.instruction,
           projectTitle: String(projectRecord.title || "未命名小说"),
+          renumber,
           // 命名要跑好几批，每批几十秒；不推进度作者会以为卡死了
           onProgress: (done, total) => emitProjectEvent({
             type: "progress",
@@ -315,11 +323,14 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           }),
         });
         if (!result.entries.length) {
+          // 全部章节标题都已经是目标格式不算失败，但也没有东西可提案，如实说明
+          if (result.unchanged === picked.length) throw new Error(`${picked.length} 章的标题已经是目标格式，没有需要改动的`);
           throw new Error(result.failures[0] || "没能生成任何标题");
         }
         const detail = [
           result.recovered ? `${result.recovered} 章从正文开头找回` : "",
           result.named ? `${result.named} 章由模型命名` : "",
+          result.unchanged ? `${result.unchanged} 章标题未变` : "",
           ...result.failures,
         ].filter(Boolean).join("；");
         return {

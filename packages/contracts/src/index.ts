@@ -88,7 +88,8 @@ export const chapterCreateSchema = z.object({ type: z.literal('chapter.create'),
 // mode 决定交给 text.transform 的哪种口径：revise 可改情节、polish 只改文字、de-ai 拆机械感
 export const chapterReviseSchema = z.object({ type: z.literal('chapter.revise'), summary: z.string().min(1).max(200), targetId: requiredId, instruction: z.string().min(1).max(6000), mode: z.enum(chapterReviseModes).default('revise') });
 // 批量补标题的意图：targetIds 为空表示按 scope 自己挑章节，落地为一条 chapter.titles
-export const chapterRetitleSchema = z.object({ type: z.literal('chapter.retitle'), summary: z.string().min(1).max(200), targetIds: z.array(requiredId).max(400).default([]), scope: z.enum(chapterRetitleScopes).default('missing'), instruction: z.string().max(2000).optional() });
+// renumber 为 true 时章号按各章在目录里的当前位置重编，格式沿用前文章节；模型只负责名字，章号一律由应用生成
+export const chapterRetitleSchema = z.object({ type: z.literal('chapter.retitle'), summary: z.string().min(1).max(200), targetIds: z.array(requiredId).max(400).default([]), scope: z.enum(chapterRetitleScopes).default('missing'), renumber: z.boolean().default(false), instruction: z.string().max(2000).optional() });
 /**
  * 批量标题落地：一条变更带多章标题，不按章拆成几百条提案
  * stripHeading 表示这一章的标题原本写在正文开头（旧版本遗留），应用时要把那行从正文里移走

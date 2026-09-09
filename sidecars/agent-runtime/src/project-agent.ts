@@ -427,7 +427,7 @@ changes 里每一项只能是下列十一种之一，字段必须原样铺平，
 {"type":"graph.edge.upsert","summary":"补充关系","targetId":"entity:林舟->entity:沈砚:同盟","source":"entity:林舟","target":"entity:沈砚","label":"同盟","weight":0.8}
 {"type":"chapter.draft_next","summary":"起草下一章","title":"第 12 章 夜访","instruction":"承接上一章并推进线索","outlineId":3}
 {"type":"chapter.revise","summary":"修订第 8 章","targetId":8,"instruction":"去掉 AI 味，保留情节和人物口吻","mode":"de-ai"}
-{"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}
+{"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","renumber":false,"instruction":"标题贴合本章事件"}
 {"type":"chapter.split","summary":"把超长章拆开","targetIds":[150,151],"targetWords":2000,"targetParts":6,"instruction":"新段落标题贴合该段事件"}
 {"type":"chapter.delete","summary":"删除空稿章节","targetId":9,"title":"第 9 章"}
 
@@ -445,6 +445,9 @@ changes 里每一项只能是下列十一种之一，字段必须原样铺平，
 - 作者说“把缺标题的章节补上”时，targetIds 留空数组、scope 填 "missing"，应用会自己挑出还是占位标题的章节，你不用先把它们一个个列出来。
 - 只补指定章节时才填 targetIds（真实 id，不是序号）；作者明确要求连已有标题一起重拟时才把 scope 填 "all"。
 - 一条 chapter.retitle 就能覆盖几百章，应用会分批调用模型并合成一条待确认变更，所以不要拆成多条。
+- 作者要“重排章号”“按新位置重新编号”“把新插的章编进去”时把 renumber 填 true：应用会按各章在目录里的当前位置重编章号，
+  数字格式（中文还是阿拉伯、有没有空格）自动跟前文保持一致，模型只需要给名字。不要在 instruction 里让模型自己写“第一百五十一章”这种章号——章号一律由应用生成。
+- 只重排章号、名字不动时也用 renumber，scope 填 "all"，instruction 写“保留原有标题名字”。
 
 章节修订和删除的额外约束：
 - chapter.revise 和 chapter.delete 的 targetId 必须是项目索引里真实存在的章节 id，不是第几章的序号。

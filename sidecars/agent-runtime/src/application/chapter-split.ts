@@ -90,7 +90,7 @@ export async function planChapterSplits(
     })), {
       instruction: options.instruction,
       projectTitle: options.projectTitle,
-    }).catch(() => ({ entries: [] as Array<{ targetId: number; title: string }>, failures: [], recovered: 0, named: 0 }));
+    }).catch(() => ({ entries: [] as Array<{ targetId: number; title: string }>, failures: [], recovered: 0, named: 0, unchanged: 0 }));
     const byIndex = new Map(named.entries.map(item => [item.targetId, item.title]));
     const titles = [
       entry.source.title || base || "第一段",
