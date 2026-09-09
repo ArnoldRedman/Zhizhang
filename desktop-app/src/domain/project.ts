@@ -18,6 +18,8 @@ export interface Chapter {
   updatedAt: string;
   /** 覆盖正文前的历史版本，最新在前 */
   snapshots?: ChapterSnapshot[];
+  /** 作家的话 / 作家寄语 (PS)，不计入正文字数 */
+  authorNote?: string;
 }
 
 export interface OutlineNode {

@@ -2,7 +2,7 @@ import { invoke as nativeInvoke } from '@tauri-apps/api/core';
 import { allocateChapterParts, chapterCharacterCount, partsFromBreaks, planChapterBreaks, splitParagraphs, type AgentRpcCall } from '@zhizhang/contracts';
 import { anthropicText, anthropicThinkingBudget, authHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from '@zhizhang/model-protocol';
 import { fitMessagesToTokenBudget } from './utils/token-budget';
-import { applyDraftChapterTitle, cleanChapterTitleName, isPlaceholderChapterTitle, splitChapterTitleHeading } from './utils/text';
+import { applyDraftChapterTitle, cleanChapterTitleName, extractChapterNumber, isPlaceholderChapterTitle, parseChapterNumber, splitChapterTitleHeading } from './utils/text';
 import { mobileBaiduStatus, mobileBaiduLoginURL, mobileBaiduCompleteLogin, mobileBaiduBackup, mobileBaiduListBackups, mobileBaiduRestore } from './platform/mobile/cloud-sync';
 import { mobileFanqieSearch, mobileNovelCatchCategories, mobileRankingFetch, mobileQianyueSources, mobileSearchOneQianyueSource, mobileQianyueDownload, mobileQianyueDownloadChapter, mobileSearchAllQianyue } from './platform/mobile/book-sources';
 
@@ -604,7 +604,7 @@ const mobileChapterTitles = async (params: MobileParams, request: Record<string,
   const recovered = entries.length;
   const extra = stringValue(request.instruction).trim() ? `\n作者额外要求：${stringValue(request.instruction).trim()}` : '';
   /** 行的序号键 → 章号；与运行时同名判定保持一致 */
-  const chapterNumberOf = (row: Record<string, unknown>) => Number(/^第\s*([\d零一二三四五六七八九十百千两]+)\s*[章回节]/u.exec(stringValue(row.title).trim())?.[1] ?? Number.NaN);
+  const chapterNumberOf = (row: Record<string, unknown>) => extractChapterNumber(stringValue(row.title));
   for (let index = 0; index < pending.length; index += mobileTitleBatchSize) {
     const batch = pending.slice(index, index + mobileTitleBatchSize);
     emitProgress(runId, { type: 'progress', data: { step: 'chapter-titles', progress: Math.min(72, 40 + Math.round(index / Math.max(1, pending.length) * 32)), message: `正在为 ${batch.length} 章生成标题（已完成 ${recovered + index} / ${picked.length}）` } });
@@ -612,8 +612,12 @@ const mobileChapterTitles = async (params: MobileParams, request: Record<string,
     // 模型最常把章号当 id 返回（线上真实事故：只按十几位真实 id 硬配会把整批全丢）
     const missing: Array<Record<string, unknown>> = [];
     try {
-      const listing = batch.map(row => `### ${stringValue(row.title).trim() || '无标题'}（index=${chapterNumberOf(row) || '无章号'}）\n${mobileTitleExcerpt(stringValue(row.content))}`).join('\n\n');
-      const response = await mobileChat({ ...params, runId: runId ? `${runId}:titles-${index}` : '', maxOutputTokens: 1300 }, [
+      const listing = batch.map((row, i) => {
+        const num = chapterNumberOf(row);
+        const indexLabel = num !== null ? String(num) : String(i + 1);
+        return `### ${stringValue(row.title).trim() || '无标题'}（index=${indexLabel}）\n${mobileTitleExcerpt(stringValue(row.content))}`;
+      }).join('\n\n');
+      const response = await mobileChat({ ...params, runId: runId ? `${runId}:titles-${index}` : '', maxOutputTokens: 2000 }, [
         { role: 'system', content: mobileTitleSystemPrompt },
         { role: 'user', content: `《${projectTitle || '未命名小说'}》需要补标题的章节共 ${batch.length} 章。${extra}\n\n${listing}` },
       ], undefined, true);
@@ -627,37 +631,39 @@ const mobileChapterTitles = async (params: MobileParams, request: Record<string,
         if (!record) continue;
         const name = stringValue(record.title || record.chapterTitle || record.name || record['标题']).trim();
         if (!name) continue;
-        const rowIndex = Number(record.index ?? record['序号'] ?? record.number ?? record.order);
+        const rowIndex = parseChapterNumber(record.index ?? record['序号'] ?? record.number ?? record.order);
         const rawId = String(record.id ?? record.targetId ?? record.chapterId ?? '');
         let target: Record<string, unknown> | undefined;
-        if (Number.isFinite(rowIndex) && rowIndex > 0) {
+        if (rowIndex !== null) {
           target = batch.find(row => !used.has(row) && chapterNumberOf(row) === rowIndex) || batch.find(row => !used.has(row) && batch.indexOf(row) + 1 === rowIndex);
         }
         if (!target && rawId) {
           target = byId.get(rawId);
           if (!target) {
-            const idNumber = Number(rawId);
-            if (Number.isFinite(idNumber) && idNumber > 0) target = batch.find(row => !used.has(row) && chapterNumberOf(row) === idNumber);
+            const idNumber = parseChapterNumber(rawId);
+            if (idNumber !== null) target = batch.find(row => !used.has(row) && chapterNumberOf(row) === idNumber);
           }
         }
         if (!target) {
-          leftovers.push({ index: Number.isFinite(rowIndex) && rowIndex > 0 ? rowIndex : null, id: rawId, title: name });
+          leftovers.push({ index: rowIndex, id: rawId, title: name });
           continue;
         }
-        const title = applyDraftChapterTitle(stringValue(target.title), cleanChapterTitleName(name));
+        const title = applyDraftChapterTitle(stringValue(target.title), cleanChapterTitleName(name), { overwrite: true });
         if (title.trim() === stringValue(target.title).trim()) continue;
         used.add(target);
         entries.push({ targetId: Number(target.id), title: title.slice(0, 160) });
       }
-      // 回包不带键或键全写错时按位置兑底：数量对得上就一行配一章
+      // 回包不带键或键写错时按位置兑底：尽量配对未命中的章节
       const unmatched = batch.filter(row => !used.has(row));
-      if (leftovers.length === unmatched.length && unmatched.length > 0) {
-        unmatched.forEach((row, i) => {
-          const title = applyDraftChapterTitle(stringValue(row.title), cleanChapterTitleName(leftovers[i].title));
-          if (title.trim() === stringValue(row.title).trim()) return;
+      if (leftovers.length > 0 && unmatched.length > 0) {
+        const pairCount = Math.min(leftovers.length, unmatched.length);
+        for (let i = 0; i < pairCount; i += 1) {
+          const row = unmatched[i];
+          const title = applyDraftChapterTitle(stringValue(row.title), cleanChapterTitleName(leftovers[i].title), { overwrite: true });
+          if (title.trim() === stringValue(row.title).trim()) continue;
           used.add(row);
           entries.push({ targetId: Number(row.id), title: title.slice(0, 160) });
-        });
+        }
       }
       for (const row of batch) if (!used.has(row)) missing.push(row);
     } catch (error) {
@@ -665,16 +671,21 @@ const mobileChapterTitles = async (params: MobileParams, request: Record<string,
       failures.push(`一批 ${batch.length} 章命名失败：${error instanceof Error ? error.message : String(error)}`);
     }
     // 批后逐章兑底：单章回包只有 {"title":"名"} 一种形状，出错空间小，一次几十 token
-    for (const row of missing.slice(0, 12)) {
+    for (const row of missing.slice(0, 20)) {
       const named = await mobileChapterTitle(params, stringValue(row.content), projectTitle, stringValue(request.instruction));
       if (!named) continue;
-      const title = applyDraftChapterTitle(stringValue(row.title), named);
+      const title = applyDraftChapterTitle(stringValue(row.title), named, { overwrite: true });
       if (title.trim() === stringValue(row.title).trim()) continue;
       entries.push({ targetId: Number(row.id), title: title.slice(0, 160) });
       const at = missing.indexOf(row);
       if (at >= 0) missing.splice(at, 1);
     }
-    if (missing.length) failures.push(`${missing.map(row => stringValue(row.title).trim() || `id=${Number(row.id)}`).slice(0, 5).join('、')}${missing.length > 5 ? ` 等 ${missing.length} 章` : ''} 模型没给出可用标题，可以再说一次只处理这几章`);
+    if (missing.length) {
+      failures.push(`${missing.map(row => {
+        const num = extractChapterNumber(stringValue(row.title));
+        return num !== null ? `第 ${num} 章` : (stringValue(row.title).trim() || `id=${Number(row.id)}`);
+      }).slice(0, 5).join('、')}${missing.length > 5 ? ` 等 ${missing.length} 章` : ''} 模型没给出可用标题，可以再说一次只处理这几章`);
+    }
   }
   if (!entries.length) throw new Error(failures[0] || '没能生成任何标题');
   const detail = [recovered ? `${recovered} 章从正文开头找回` : '', entries.length - recovered ? `${entries.length - recovered} 章由模型命名` : '', ...failures].filter(Boolean).join('；');

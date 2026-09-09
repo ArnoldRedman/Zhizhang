@@ -20,8 +20,16 @@ import { PaneResizer } from './features/editor/pane-resizer';
 import { PlumBranch } from './features/editor/plum-branch';
 import { Icon } from './components/icon';
 import './App.css';
-import { countNovelCharacters, splitChapterTitleHeading, applyDraftChapterTitle } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
+import {
+  countNovelCharacters,
+  splitChapterTitleHeading,
+  applyDraftChapterTitle,
+  formatNovelForPlatform,
+  combineContentAndAuthorNote,
+  platformFormatPresetLabels,
+  type PlatformFormatPreset,
+} from './utils/text';
 
 
 
@@ -1303,8 +1311,19 @@ function App() {
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [copiedTitle, setCopiedTitle] = useState(false);
   const [copiedContent, setCopiedContent] = useState(false);
+  const [copiedAuthorNote, setCopiedAuthorNote] = useState(false);
+  const [copiedCombined, setCopiedCombined] = useState(false);
+  const [copyPreset, setCopyPreset] = useState<PlatformFormatPreset>(() => {
+    const saved = localStorage.getItem('novel_copy_preset');
+    return (saved === 'standard' || saved === 'clean' || saved === 'compact' || saved === 'raw') ? saved : 'standard';
+  });
+  const [showCopyDropdown, setShowCopyDropdown] = useState(false);
+  const [authorNoteExpanded, setAuthorNoteExpanded] = useState(false);
+  const copyMenuRef = useRef<HTMLDivElement | null>(null);
   const titleCopyTimerRef = useRef<number | null>(null);
   const contentCopyTimerRef = useRef<number | null>(null);
+  const authorNoteCopyTimerRef = useRef<number | null>(null);
+  const combinedCopyTimerRef = useRef<number | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
   const [activeCardId, setActiveCardId] = useState<number | null>(null);
   const [activeMemoryDocumentId, setActiveMemoryDocumentId] = useState<string>(memoryDocumentId('章节快照'));
@@ -3197,6 +3216,17 @@ function App() {
     }
   };
 
+  const handleUpdateChapterAuthorNote = (authorNote: string) => {
+    if (!activeChapter || !editingProject) return;
+    const updatedChapter = { ...activeChapter, authorNote, updatedAt: new Date().toISOString() };
+    const updatedChapters = editingProject.chapters.map(c => c.id === activeChapter.id ? updatedChapter : c);
+    const updated = { ...editingProject, chapters: updatedChapters, updatedAt: new Date().toISOString() };
+    setEditingProject(updated);
+    setActiveChapter(updatedChapter);
+    setProjects(current => current.map(p => p.id === updated.id ? updated : p));
+    setAutoSaveStatus('saving');
+  };
+
   // 保存项目到本地，所有需要立即落盘的操作共用这一条路径
   const persistProjects = async (nextProjects: Project[]) => {
     if ('__TAURI_INTERNALS__' in window) await nativeClient.saveProjects(nextProjects);
@@ -3499,17 +3529,49 @@ function App() {
     }
   };
 
+  const lastActiveChapterIdRef = useRef<number | null>(null);
   useEffect(() => {
-    setCopiedTitle(false);
-    setCopiedContent(false);
-  }, [activeChapter?.id]);
+    if (activeChapter?.id !== lastActiveChapterIdRef.current) {
+      lastActiveChapterIdRef.current = activeChapter?.id ?? null;
+      setCopiedTitle(false);
+      setCopiedContent(false);
+      setCopiedAuthorNote(false);
+      setCopiedCombined(false);
+      setShowCopyDropdown(false);
+      if (activeChapter?.authorNote?.trim()) {
+        setAuthorNoteExpanded(true);
+      }
+    }
+  }, [activeChapter]);
 
   useEffect(() => {
     return () => {
       if (titleCopyTimerRef.current) window.clearTimeout(titleCopyTimerRef.current);
       if (contentCopyTimerRef.current) window.clearTimeout(contentCopyTimerRef.current);
+      if (authorNoteCopyTimerRef.current) window.clearTimeout(authorNoteCopyTimerRef.current);
+      if (combinedCopyTimerRef.current) window.clearTimeout(combinedCopyTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (!showCopyDropdown) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (copyMenuRef.current && !copyMenuRef.current.contains(event.target as Node)) {
+        setShowCopyDropdown(false);
+      }
+    };
+    window.addEventListener('mousedown', handleClickOutside);
+    return () => window.removeEventListener('mousedown', handleClickOutside);
+  }, [showCopyDropdown]);
+
+  const selectCopyPreset = (preset: PlatformFormatPreset) => {
+    setCopyPreset(preset);
+    try {
+      localStorage.setItem('novel_copy_preset', preset);
+    } catch {
+      // 忽略本地存储异常
+    }
+  };
 
   const copyChapterTitle = async () => {
     if (!activeChapter || !activeChapter.title.trim()) {
@@ -3527,17 +3589,57 @@ function App() {
     }
   };
 
-  const copyChapterContent = async () => {
+  const copyChapterContent = async (presetOverride?: PlatformFormatPreset) => {
     if (!activeChapter || !activeChapter.content.trim()) {
       setNotice({ title: '正文为空', content: '当前章节暂无正文可复制。' });
       return;
     }
+    const preset = presetOverride || copyPreset;
+    const formatted = formatNovelForPlatform(activeChapter.content, preset);
     try {
-      await navigator.clipboard.writeText(activeChapter.content);
+      await navigator.clipboard.writeText(formatted);
       setCopiedContent(true);
+      setShowCopyDropdown(false);
       if (contentCopyTimerRef.current) window.clearTimeout(contentCopyTimerRef.current);
       contentCopyTimerRef.current = window.setTimeout(() => setCopiedContent(false), 2000);
-      setNotice({ title: '正文已复制', content: `当前章节正文（共 ${activeChapter.wordCount.toLocaleString()} 字）已复制到剪贴板，可直接粘贴到发布平台。` });
+      const label = platformFormatPresetLabels[preset].split('（')[0];
+      setNotice({ title: '正文已复制', content: `当前章节正文（${label}，共 ${activeChapter.wordCount.toLocaleString()} 字）已复制到剪贴板，可直接粘贴到发布平台。` });
+    } catch {
+      setNotice({ title: '复制失败', content: '当前系统未允许访问剪贴板，请手动选择文本复制。' });
+    }
+  };
+
+  const copyAuthorNote = async () => {
+    if (!activeChapter || !activeChapter.authorNote?.trim()) {
+      setNotice({ title: '作家的话为空', content: '当前章节暂无作家的话可复制。' });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(activeChapter.authorNote.trim());
+      setCopiedAuthorNote(true);
+      setShowCopyDropdown(false);
+      if (authorNoteCopyTimerRef.current) window.clearTimeout(authorNoteCopyTimerRef.current);
+      authorNoteCopyTimerRef.current = window.setTimeout(() => setCopiedAuthorNote(false), 2000);
+      setNotice({ title: '作家的话已复制', content: `作家的话（共 ${countNovelCharacters(activeChapter.authorNote).toLocaleString()} 字）已复制到剪贴板，可粘贴到发布平台的作者寄语区。` });
+    } catch {
+      setNotice({ title: '复制失败', content: '当前系统未允许访问剪贴板，请手动选择文本复制。' });
+    }
+  };
+
+  const copyCombinedContent = async (presetOverride?: PlatformFormatPreset) => {
+    if (!activeChapter || (!activeChapter.content.trim() && !activeChapter.authorNote?.trim())) {
+      setNotice({ title: '内容为空', content: '当前章节暂无正文或作家的话可复制。' });
+      return;
+    }
+    const preset = presetOverride || copyPreset;
+    const combined = combineContentAndAuthorNote(activeChapter.content, activeChapter.authorNote, preset);
+    try {
+      await navigator.clipboard.writeText(combined);
+      setCopiedCombined(true);
+      setShowCopyDropdown(false);
+      if (combinedCopyTimerRef.current) window.clearTimeout(combinedCopyTimerRef.current);
+      combinedCopyTimerRef.current = window.setTimeout(() => setCopiedCombined(false), 2000);
+      setNotice({ title: '正文与作话已合并复制', content: '正文及末尾附加的【作家的话】已合并复制到剪贴板。' });
     } catch {
       setNotice({ title: '复制失败', content: '当前系统未允许访问剪贴板，请手动选择文本复制。' });
     }
@@ -6508,20 +6610,150 @@ function App() {
                       placeholder="开始写作..."
                       spellCheck={false}
                     />
-                    <button
-                      type="button"
-                      className={`chapter-floating-copy-button ${copiedContent ? 'copied' : ''}`}
-                      title="快捷复制正文（用于发布平台）"
-                      aria-label="快捷复制正文"
-                      disabled={!activeChapter.content.trim()}
-                      onClick={() => void copyChapterContent()}
-                    >
-                      <Icon name={copiedContent ? 'check' : 'copy'} size={14} />
-                      <span>{copiedContent ? '已复制正文' : '复制正文'}</span>
-                    </button>
+                    <div ref={copyMenuRef} className="chapter-floating-copy-container">
+                      <div className="chapter-floating-copy-group">
+                        <button
+                          type="button"
+                          className={`chapter-floating-copy-main-btn ${copiedContent ? 'copied' : ''}`}
+                          title={`快捷复制正文（当前：${platformFormatPresetLabels[copyPreset]}）`}
+                          aria-label="快捷复制正文"
+                          disabled={!activeChapter.content.trim()}
+                          onClick={() => void copyChapterContent()}
+                        >
+                          <Icon name={copiedContent ? 'check' : 'copy'} size={14} />
+                          <span>{copiedContent ? '已复制正文' : '复制正文'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={`chapter-floating-copy-trigger-btn ${showCopyDropdown ? 'active' : ''}`}
+                          title="选择复制排版预设与作话选项"
+                          aria-label="复制选项"
+                          aria-expanded={showCopyDropdown}
+                          onClick={() => setShowCopyDropdown(prev => !prev)}
+                        >
+                          <Icon name="chevron-down" size={12} />
+                        </button>
+                      </div>
+                      {showCopyDropdown && (
+                        <div className="chapter-copy-dropdown-menu" role="menu">
+                          <div className="chapter-copy-menu-header">发布排版预设</div>
+                          {(['standard', 'clean', 'compact', 'raw'] as const).map(presetKey => (
+                            <button
+                              key={presetKey}
+                              type="button"
+                              className={`chapter-copy-menu-item ${copyPreset === presetKey ? 'selected' : ''}`}
+                              onClick={() => {
+                                selectCopyPreset(presetKey);
+                                void copyChapterContent(presetKey);
+                              }}
+                            >
+                              <span className="preset-radio">{copyPreset === presetKey ? '●' : '○'}</span>
+                              <span className="preset-name">{platformFormatPresetLabels[presetKey]}</span>
+                            </button>
+                          ))}
+                          {Boolean(activeChapter.authorNote?.trim()) && (
+                            <>
+                              <div className="chapter-copy-menu-divider" />
+                              <div className="chapter-copy-menu-header">作家的话 / 组合发布</div>
+                              <button
+                                type="button"
+                                className="chapter-copy-menu-item"
+                                onClick={() => void copyAuthorNote()}
+                              >
+                                <Icon name={copiedAuthorNote ? 'check' : 'copy'} size={13} />
+                                <span className="preset-name">{copiedAuthorNote ? '已复制作家的话' : `单独复制作家的话（${countNovelCharacters(activeChapter.authorNote || '').toLocaleString()} 字）`}</span>
+                              </button>
+                              <button
+                                type="button"
+                                className="chapter-copy-menu-item"
+                                onClick={() => void copyCombinedContent()}
+                              >
+                                <Icon name={copiedCombined ? 'check' : 'copy'} size={13} />
+                                <span className="preset-name">{copiedCombined ? '已合并复制' : '合并复制（正文 + 作家的话）'}</span>
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
+                  {authorNoteExpanded ? (
+                    <div className="chapter-author-note-card">
+                      <div className="chapter-author-note-header">
+                        <div className="chapter-author-note-title-wrap">
+                          <span className="chapter-author-note-title">作家的话 / 作家寄语 (PS)</span>
+                          <span className="chapter-author-note-badge">独立统计 · 不计入正文字数</span>
+                          <span className="chapter-author-note-count">
+                            {countNovelCharacters(activeChapter.authorNote || '').toLocaleString()} 字
+                          </span>
+                        </div>
+                        <div className="chapter-author-note-actions">
+                          <button
+                            type="button"
+                            className={`chapter-author-note-copy-btn ${copiedAuthorNote ? 'copied' : ''}`}
+                            title="单独复制作家的话"
+                            disabled={!activeChapter.authorNote?.trim()}
+                            onClick={() => void copyAuthorNote()}
+                          >
+                            <Icon name={copiedAuthorNote ? 'check' : 'copy'} size={13} />
+                            <span>{copiedAuthorNote ? '已复制作话' : '复制作话'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="chapter-author-note-toggle-btn"
+                            title="收起作家的话输入框"
+                            onClick={() => setAuthorNoteExpanded(false)}
+                          >
+                            <Icon name="chevron-up" size={13} />
+                            <span>收起</span>
+                          </button>
+                        </div>
+                      </div>
+                      <textarea
+                        className="chapter-author-note-input"
+                        value={activeChapter.authorNote || ''}
+                        onChange={(e) => handleUpdateChapterAuthorNote(e.target.value)}
+                        placeholder="在此输入作者有话说、更新通知、求票互动或剧情彩蛋（独立存储与统计，不计入正文字数，不影响签约与全勤）..."
+                        rows={3}
+                        spellCheck={false}
+                      />
+                    </div>
+                  ) : (
+                    <div className="chapter-author-note-bar">
+                      <button
+                        type="button"
+                        className="chapter-author-note-expand-trigger"
+                        onClick={() => setAuthorNoteExpanded(true)}
+                      >
+                        <Icon name="pen" size={13} />
+                        <span>
+                          {activeChapter.authorNote?.trim()
+                            ? `作家的话（已写 ${countNovelCharacters(activeChapter.authorNote).toLocaleString()} 字，点击展开）`
+                            : '+ 添加作家的话 / 作家寄语 (PS)'}
+                        </span>
+                      </button>
+                      {Boolean(activeChapter.authorNote?.trim()) && (
+                        <button
+                          type="button"
+                          className={`chapter-author-note-mini-copy-btn ${copiedAuthorNote ? 'copied' : ''}`}
+                          title="快捷复制作家的话"
+                          onClick={() => void copyAuthorNote()}
+                        >
+                          <Icon name={copiedAuthorNote ? 'check' : 'copy'} size={12} />
+                          <span>{copiedAuthorNote ? '已复制' : '复制作话'}</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <div className="chapter-live-footer">
-                    <span>本章实时字数 <strong>{activeChapter.wordCount.toLocaleString()}</strong></span>
+                    <span>
+                      本章实时字数 <strong>{activeChapter.wordCount.toLocaleString()}</strong>
+                      {Boolean(activeChapter.authorNote?.trim()) && (
+                        <span className="chapter-footer-author-note-tag">
+                          {' '}· 作话 <strong>{countNovelCharacters(activeChapter.authorNote || '').toLocaleString()}</strong> 字
+                        </span>
+                      )}
+                    </span>
                     <span>{currentSearchMatches ? `搜索到 ${currentSearchMatches} 处` : writingMarksEnabled ? `人物 ${characterNames.length} 个 · 禁词 ${bannedWords.length} 个` : '标记已关闭'}</span>
                     {activeChapter.wordCount >= (Number(editingProject.chapterTargetWords) || 3000) && <button className="link-button" onClick={handleAddChapter}>创建下一章</button>}
                   </div>

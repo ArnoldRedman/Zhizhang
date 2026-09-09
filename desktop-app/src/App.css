@@ -3224,6 +3224,154 @@ select.input {
   cursor: not-allowed;
 }
 
+.chapter-floating-copy-container {
+  position: absolute;
+  top: 16px;
+  right: 24px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.chapter-floating-copy-group {
+  display: inline-flex;
+  align-items: stretch;
+  height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  transition: all 0.15s ease;
+  overflow: hidden;
+}
+
+.chapter-floating-copy-group:hover {
+  border-color: var(--accent);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.chapter-floating-copy-main-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.chapter-floating-copy-main-btn:hover:not(:disabled) {
+  color: var(--accent-fg);
+  background: var(--accent-tint);
+}
+
+.chapter-floating-copy-main-btn.copied {
+  color: var(--ok-fg);
+  background: var(--ok-bg);
+}
+
+.chapter-floating-copy-main-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.chapter-floating-copy-trigger-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 100%;
+  border: none;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.chapter-floating-copy-trigger-btn:hover,
+.chapter-floating-copy-trigger-btn.active {
+  color: var(--accent-fg);
+  background: var(--surface-muted);
+}
+
+.chapter-copy-dropdown-menu {
+  margin-top: 6px;
+  min-width: 260px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: fadeIn 0.15s ease;
+}
+
+.chapter-copy-menu-header {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+  user-select: none;
+}
+
+.chapter-copy-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--r-xs);
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.chapter-copy-menu-item:hover {
+  background: var(--surface-muted);
+  color: var(--text-1);
+}
+
+.chapter-copy-menu-item.selected {
+  color: var(--accent-fg);
+  font-weight: 500;
+}
+
+.chapter-copy-menu-item .preset-radio {
+  font-size: 12px;
+  color: var(--accent);
+  width: 14px;
+  text-align: center;
+}
+
+.chapter-copy-menu-item .preset-name {
+  flex: 1;
+  white-space: nowrap;
+}
+
+.chapter-copy-menu-divider {
+  height: 1px;
+  background: var(--line);
+  margin: 4px 0;
+}
+
+/* 兼容原有样式 */
 .chapter-floating-copy-button {
   position: absolute;
   top: 16px;
@@ -3264,6 +3412,176 @@ select.input {
 .chapter-floating-copy-button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* 作家的话专属卡片与折叠条 */
+.chapter-author-note-card {
+  margin: 0;
+  padding: 10px 20px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: all 0.2s ease;
+}
+
+.chapter-author-note-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chapter-author-note-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chapter-author-note-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.chapter-author-note-badge {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--surface);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+}
+
+.chapter-author-note-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.chapter-author-note-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chapter-author-note-copy-btn,
+.chapter-author-note-toggle-btn {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-3);
+  font-family: inherit;
+  transition: all 0.15s ease;
+}
+
+.chapter-author-note-copy-btn:hover:not(:disabled),
+.chapter-author-note-toggle-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  background: var(--accent-tint);
+}
+
+.chapter-author-note-copy-btn.copied {
+  border-color: var(--ok-line);
+  color: var(--ok-fg);
+  background: var(--ok-bg);
+}
+
+.chapter-author-note-copy-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.chapter-author-note-input {
+  width: 100%;
+  min-height: 64px;
+  max-height: 200px;
+  resize: vertical;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--paper-ink);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.6;
+  outline: none;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.chapter-author-note-input:focus {
+  border-color: var(--accent);
+}
+
+.chapter-author-note-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 20px;
+  border-top: 1px dashed var(--line);
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+.chapter-author-note-expand-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+  padding: 4px 8px;
+  border-radius: var(--r-xs);
+  transition: all 0.15s ease;
+}
+
+.chapter-author-note-expand-trigger:hover {
+  color: var(--accent-fg);
+  background: var(--surface);
+}
+
+.chapter-author-note-mini-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 3px 8px;
+  border-radius: var(--r-xs);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.chapter-author-note-mini-copy-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.chapter-author-note-mini-copy-btn.copied {
+  border-color: var(--ok-line);
+  color: var(--ok-fg);
+  background: var(--ok-bg);
+}
+
+.chapter-footer-author-note-tag {
+  color: var(--text-muted);
 }
 
 .chapter-content-editor {
@@ -3685,6 +4003,11 @@ select.input {
   .chapter-highlight-layer, .chapter-editor-wrap .chapter-content-editor { padding: 20px; font-size: 15px; }
   .chapter-quick-copy-button { margin-right: 12px; padding: 5px 10px; font-size: 11px; }
   .chapter-floating-copy-button { top: 12px; right: 12px; padding: 5px 10px; font-size: 11px; }
+  .chapter-floating-copy-container { top: 12px; right: 12px; }
+  .chapter-floating-copy-main-btn { padding: 0 8px; font-size: 11px; }
+  .chapter-copy-dropdown-menu { min-width: 220px; font-size: 11px; }
+  .chapter-author-note-card { padding: 8px 12px 10px; }
+  .chapter-author-note-bar { padding: 4px 12px; }
   .chapter-live-footer { padding: 8px 12px; gap: 8px; flex-wrap: wrap; }
   .knowledge-graph-workspace { padding: 16px; }
 }

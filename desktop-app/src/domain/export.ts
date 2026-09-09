@@ -18,11 +18,11 @@ const separator = (format: ExportFormat) => format === 'md' ? '\n\n' : '\n\n\n';
 const heading = (format: ExportFormat, level: number, text: string) =>
   format === 'md' ? `${'#'.repeat(level)} ${text}` : text;
 
-/** 单章导出：标题 + 正文 */
 export function buildChapterExport(project: Project, chapterId: number, format: ExportFormat): string {
   const chapter = project.chapters.find(item => item.id === chapterId);
   if (!chapter) return '';
-  return `${heading(format, 2, chapter.title)}\n\n${chapter.content.trim()}\n`;
+  const note = chapter.authorNote?.trim() ? `\n\n【作家的话】\n${chapter.authorNote.trim()}` : '';
+  return `${heading(format, 2, chapter.title)}\n\n${chapter.content.trim()}${note}\n`;
 }
 
 /** 全书导出：书名、简介、可选设定，然后按当前章节顺序拼接正文 */
@@ -56,7 +56,8 @@ export function buildProjectExport(project: Project, options: ExportOptions): st
 
   blocks.push(heading(format, 2, '正文'));
   for (const chapter of project.chapters) {
-    blocks.push(`${heading(format, 3, chapter.title)}\n\n${chapter.content.trim()}`);
+    const note = chapter.authorNote?.trim() ? `\n\n【作家的话】\n${chapter.authorNote.trim()}` : '';
+    blocks.push(`${heading(format, 3, chapter.title)}\n\n${chapter.content.trim()}${note}`);
   }
 
   return `${blocks.join(separator(format))}\n`;

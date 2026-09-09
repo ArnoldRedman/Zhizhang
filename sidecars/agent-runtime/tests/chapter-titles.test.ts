@@ -240,3 +240,44 @@ describe("generateChapterTitle", () => {
       { targetId: 1756880000002, title: "第 10 章 旧仓库的账本" },
     ]);
   });
+
+  it("中文数字章号（如第 十三 章）无论模型回阿拉伯数字还是中文都能准确匹配", async () => {
+    const { client } = clientReturning([
+      JSON.stringify({
+        titles: [
+          { index: 13, title: "遗迹风云" },
+          { index: "十四", title: "夜色突袭" },
+        ],
+      }),
+    ]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 20001, currentTitle: "第 十三 章", content: "狂风卷着黄沙吹打在破旧的石碑上。" },
+      { targetId: 20002, currentTitle: "第 十四 章", content: "暗夜之中刀剑交错。" },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.entries).toEqual([
+      { targetId: 20001, title: "第 十三 章 遗迹风云" },
+      { targetId: 20002, title: "第 十四 章 夜色突袭" },
+    ]);
+  });
+
+  it("支持对已有标题统一重新定名", async () => {
+    const { client } = clientReturning([
+      JSON.stringify({
+        titles: [
+          { index: 15, title: "青云试炼" },
+        ],
+      }),
+    ]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 20003, currentTitle: "第 15 章 旧的临时标题", content: "少年踏上青云宗的天梯。" },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.entries).toEqual([
+      { targetId: 20003, title: "第 15 章 青云试炼" },
+    ]);
+  });
