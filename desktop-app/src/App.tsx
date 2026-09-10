@@ -23,6 +23,7 @@ import './App.css';
 import { builtinSkills } from './data/builtin-skills';
 import {
   countNovelCharacters,
+  stripChapterNumberPrefix,
   splitChapterTitleHeading,
   applyDraftChapterTitle,
   formatNovelForPlatform,
@@ -3578,12 +3579,14 @@ function App() {
       setNotice({ title: '标题为空', content: '当前章节暂无标题可复制。' });
       return;
     }
+    // 发布平台自己维护章号，这里只复制标题名，不带“第X章”前缀
+    const titleName = stripChapterNumberPrefix(activeChapter.title);
     try {
-      await navigator.clipboard.writeText(activeChapter.title.trim());
+      await navigator.clipboard.writeText(titleName);
       setCopiedTitle(true);
       if (titleCopyTimerRef.current) window.clearTimeout(titleCopyTimerRef.current);
       titleCopyTimerRef.current = window.setTimeout(() => setCopiedTitle(false), 2000);
-      setNotice({ title: '标题已复制', content: `《${activeChapter.title.trim()}》已复制到剪贴板，可直接粘贴到发布平台。` });
+      setNotice({ title: '标题已复制', content: `《${titleName}》已复制到剪贴板，可直接粘贴到发布平台。` });
     } catch {
       setNotice({ title: '复制失败', content: '当前系统未允许访问剪贴板，请手动选择文本复制。' });
     }
@@ -6643,8 +6646,9 @@ function App() {
                               type="button"
                               className={`chapter-copy-menu-item ${copyPreset === presetKey ? 'selected' : ''}`}
                               onClick={() => {
+                                // 只切换排版预设，复制由“复制正文”按钮显式触发
                                 selectCopyPreset(presetKey);
-                                void copyChapterContent(presetKey);
+                                setShowCopyDropdown(false);
                               }}
                             >
                               <span className="preset-radio">{copyPreset === presetKey ? '●' : '○'}</span>

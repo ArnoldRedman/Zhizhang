@@ -22,6 +22,16 @@ export const isPlaceholderChapterTitle = (value: string): boolean => {
 };
 
 /**
+ * 去掉标题前的章号，只留标题名本身：发布平台的章号栏由平台自己填，作者只需要粘贴标题名
+ * 整条标题就是“第X章”这种占位时，没有可保留的名字，原样返回
+ */
+export const stripChapterNumberPrefix = (value: string): string => {
+  const current = value.trim();
+  if (numberedPlaceholderTitle.test(current)) return current;
+  return current.replace(chapterNumberPrefix, '').trim() || current;
+};
+
+/**
  * 模型给的标题名里常带的多余包装：书名号、引号、句末标点
  * “《夜雨敲窗》。”这种套层要反复剥：单轮只能去掉最外一层
  */

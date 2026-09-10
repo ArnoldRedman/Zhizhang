@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   splitChapterTitleHeading,
+  stripChapterNumberPrefix,
   applyDraftChapterTitle,
   cleanChapterTitleName,
   isPlaceholderChapterTitle,
@@ -129,4 +130,13 @@ test('合并正文与作家的话：正确附带作家的话与降级兜底', ()
   assert.equal(combineContentAndAuthorNote('', note, 'standard'), '【作家的话】\n求月票！明天保底三更！');
 });
 
+test('复制标题：去掉章号前缀只留标题名', () => {
+  assert.equal(stripChapterNumberPrefix('第12章 夜雨敲窗'), '夜雨敲窗');
+  assert.equal(stripChapterNumberPrefix('第 3 章：入城'), '入城');
+  assert.equal(stripChapterNumberPrefix('第一百零三回·归途'), '归途');
+  assert.equal(stripChapterNumberPrefix('没有章号的标题'), '没有章号的标题');
+});
 
+test('复制标题：只有章号占位的标题原样保留', () => {
+  assert.equal(stripChapterNumberPrefix('第5章'), '第5章');
+});
