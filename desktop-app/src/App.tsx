@@ -9,7 +9,7 @@ import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, Ch
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, recentChapterMemories } from './domain/memory';
-import { chapterNumberFromText, resolveOutlineGenerationIntent } from './features/outline/model';
+import { chapterNumberFromText, outlineByChapterNumber, resolveOutlineGenerationIntent } from './features/outline/model';
 import { boundChapterOutlineFor, buildChapterWriteContext } from './features/chapter-agent/context';
 import { buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
@@ -4189,6 +4189,118 @@ function App() {
     if (activeOutlineId === id) setActiveOutlineId(editingProject.outlines.find(outline => outline.id !== id)?.id ?? null);
   };
 
+  /**
+   * 调大纲智能体生成章纲：手动生成和章节智能体自动补章纲共用这一份入参
+   * 返回生成的 Markdown 正文，空串表示模型没给内容
+   */
+  const requestOutlineWrite = async (options: {
+    runId: string;
+    project: Project;
+    targetOutline: OutlineDocument;
+    kind: OutlineKind;
+    instruction: string;
+    targetChapter?: Chapter;
+    sourceChapter?: Chapter;
+    sourceMode?: string;
+    formatOutline?: OutlineDocument;
+    formatMode?: string;
+  }) => {
+    const { runId, project, targetOutline, kind, instruction, targetChapter, sourceChapter, sourceMode, formatOutline, formatMode } = options;
+    const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
+    const result = await agentRpc<{ content?: string; title?: string }>('outline.write', {
+        runId,
+        sessionId: outlineSessionId,
+        previousSessionId: outlinePreviousSessionId,
+        outlineId: targetOutline.id,
+        projectId: String(project.id),
+        projectTitle: project.title,
+        kind,
+        existingContent: targetOutline.content,
+        targetChapter: targetChapter ? {
+          id: targetChapter.id,
+          number: chapterNumberFromText(targetChapter.title) || project.chapters.findIndex(chapter => chapter.id === targetChapter.id) + 1,
+          title: targetChapter.title,
+        } : undefined,
+        sourceChapter: sourceChapter ? {
+          id: sourceChapter.id,
+          number: chapterNumberFromText(sourceChapter.title) || project.chapters.findIndex(chapter => chapter.id === sourceChapter.id) + 1,
+          title: sourceChapter.title,
+          content: sourceChapter.content,
+          mode: sourceMode,
+        } : undefined,
+        formatOutline: formatOutline ? {
+          id: formatOutline.id,
+          title: formatOutline.title,
+          content: formatOutline.content,
+          mode: formatMode,
+        } : undefined,
+        instruction: activeStyle ? `${instruction}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : instruction,
+        synopsis: project.synopsis,
+        cards: project.cards.filter(card => selectedOutlineCardIds.includes(card.id)),
+        knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
+        worldSetting: project.outlines
+          .filter(item => item.kind === '世界观与作品设定' && item.content.trim())
+          .map(item => ({ id: item.id, title: item.title, content: item.content })),
+        // 总纲原文和目标章之前的记忆：章纲不能只看上一章正文，得知道本章在全书哪一段、前文写过什么
+        masterOutline: project.outlines.filter(item => item.kind === '总纲' && item.content.trim()).map(item => item.content).join('\n\n'),
+        recentMemories: recentChapterMemories(
+          project,
+          chapterNumberFromText(`${targetOutline.title}\n${targetOutline.content.slice(0, 500)}`) || project.chapters.length + 1,
+        ).map(memory => ({ chapterNumber: memory.chapterNumber, title: memory.chapterTitle, summary: memory.summary, endingHook: memory.endingHook, foreshadowingItems: memory.foreshadowingItems || [] })),
+        totalChapters: project.chapters.length,
+        authorPreferences: project.authorPreferences || [],
+        writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
+        skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+        preferredSkillNames: selectedAgentSkillNames,
+        apiKey: agentConfig.apiKey.trim(),
+        baseURL: agentConfig.baseURL.trim(),
+        model: agentConfig.model.trim() || 'gpt-4o-mini',
+        apiMode: agentConfig.apiMode,
+        reasoningMode: agentConfig.reasoningMode,
+        contextWindow: agentConfig.contextWindow,
+        ...agentNetworkParams(agentConfig),
+      });
+    return String(result.content || '');
+  };
+
+  /**
+   * 懒人流程：本章没有章纲时先自动生成一份并绑定到本章，再写正文
+   * 依据和手动生成完全一样：总纲骨架、故事账本、上一章正文、上一章章纲的格式，再加上作者这次给章节智能体的创作指令；
+   * 结果存进大纲页，作者随时可以改，不用为了写一章先去大纲页点一遍
+   */
+  const autoGenerateChapterOutline = async (project: Project, chapter: Chapter, instruction: string, runId: string): Promise<Project> => {
+    const index = project.chapters.findIndex(item => item.id === chapter.id);
+    const previous = index > 0 ? project.chapters[index - 1] : undefined;
+    const now = new Date().toISOString();
+    const draft: OutlineDocument = { id: Date.now(), kind: '章纲', chapterId: chapter.id, title: `章纲｜${chapter.title}`, content: `# 章纲｜${chapter.title}
+
+`, createdAt: now, updatedAt: now };
+    const content = await requestOutlineWrite({
+      runId: `${runId}:outline`,
+      project,
+      targetOutline: draft,
+      kind: '章纲',
+      instruction: `${outlineAgentInstruction.trim()}
+作者对本章的创作要求：${instruction.trim()}`,
+      targetChapter: chapter,
+      sourceChapter: previous,
+      sourceMode: previous ? '默认上一章正文' : undefined,
+      formatOutline: index > 0 ? outlineByChapterNumber(project, index) : undefined,
+      formatMode: index > 0 ? '默认参考上一章章纲格式' : undefined,
+    });
+    if (!content.trim()) throw new Error('大纲智能体没有返回章纲内容，无法自动补齐本章章纲');
+    const outline: OutlineDocument = { ...draft, content, updatedAt: new Date().toISOString() };
+    const attach = (current: Project): Project => ({
+      ...current,
+      outlines: [...current.outlines, outline],
+      graphNodes: [...current.graphNodes, { id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: '章纲' }],
+      updatedAt: outline.updatedAt,
+    });
+    // 等模型这段时间作者可能改了别处，按最新状态追加而不是拿旧快照覆盖
+    setEditingProject(current => current && current.id === project.id ? attach(current) : current);
+    return attach(project);
+  };
+
   const generateOutline = async () => {
     if (!editingProject || activeOutlineId === null || outlineGenerating) return;
     const outline = editingProject.outlines.find(item => item.id === activeOutlineId);
@@ -4204,7 +4316,6 @@ function App() {
     setOutlineChatMessages(current => [...current, { role: 'user', content: outlineAgentInstruction.trim(), createdAt: new Date().toISOString() }]);
     try {
       await invoke<string>('start_agent_runtime');
-      const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
       const intent = outline.kind === '章纲' ? resolveOutlineGenerationIntent(editingProject, outline, outlineAgentInstruction) : undefined;
       const targetOutline = intent?.targetOutline || outline;
       const targetChapter = intent?.targetChapter;
@@ -4222,59 +4333,7 @@ function App() {
           outlines: project.outlines.map(item => item.id === targetOutline.id ? { ...item, chapterId: targetChapter.id, updatedAt: new Date().toISOString() } : item),
         }));
       }
-      const result = await agentRpc<{ content?: string; title?: string }>('outline.write', {
-          runId,
-          sessionId: outlineSessionId,
-          previousSessionId: outlinePreviousSessionId,
-          outlineId: targetOutline.id,
-          projectId: String(editingProject.id),
-          projectTitle: editingProject.title,
-          kind: outline.kind,
-          existingContent: targetOutline.content,
-          targetChapter: targetChapter ? {
-            id: targetChapter.id,
-            number: chapterNumberFromText(targetChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === targetChapter.id) + 1,
-            title: targetChapter.title,
-          } : undefined,
-          sourceChapter: sourceChapter ? {
-            id: sourceChapter.id,
-            number: chapterNumberFromText(sourceChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === sourceChapter.id) + 1,
-            title: sourceChapter.title,
-            content: sourceChapter.content,
-            mode: intent?.sourceMode,
-          } : undefined,
-          formatOutline: formatOutline ? {
-            id: formatOutline.id,
-            title: formatOutline.title,
-            content: formatOutline.content,
-            mode: intent?.formatMode,
-          } : undefined,
-          instruction: activeStyle ? `${outlineAgentInstruction.trim()}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : outlineAgentInstruction.trim(),
-          synopsis: editingProject.synopsis,
-          cards: editingProject.cards.filter(card => selectedOutlineCardIds.includes(card.id)),
-          knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
-          worldSetting: editingProject.outlines
-            .filter(item => item.kind === '世界观与作品设定' && item.content.trim())
-            .map(item => ({ id: item.id, title: item.title, content: item.content })),
-          // 总纲原文和目标章之前的记忆：章纲不能只看上一章正文，得知道本章在全书哪一段、前文写过什么
-          masterOutline: editingProject.outlines.filter(item => item.kind === '总纲' && item.content.trim()).map(item => item.content).join('\n\n'),
-          recentMemories: recentChapterMemories(
-            editingProject,
-            chapterNumberFromText(`${targetOutline.title}\n${targetOutline.content.slice(0, 500)}`) || editingProject.chapters.length + 1,
-          ).map(memory => ({ chapterNumber: memory.chapterNumber, title: memory.chapterTitle, summary: memory.summary, endingHook: memory.endingHook, foreshadowingItems: memory.foreshadowingItems || [] })),
-          totalChapters: editingProject.chapters.length,
-          authorPreferences: editingProject.authorPreferences || [],
-          writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
-          skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
-          preferredSkillNames: selectedAgentSkillNames,
-          apiKey: agentConfig.apiKey.trim(),
-          baseURL: agentConfig.baseURL.trim(),
-          model: agentConfig.model.trim() || 'gpt-4o-mini',
-          apiMode: agentConfig.apiMode,
-          reasoningMode: agentConfig.reasoningMode,
-          contextWindow: agentConfig.contextWindow,
-          ...agentNetworkParams(agentConfig),
-        });
+      const result = { content: await requestOutlineWrite({ runId, project: editingProject, targetOutline, kind: outline.kind, instruction: outlineAgentInstruction.trim(), targetChapter, sourceChapter, sourceMode: intent?.sourceMode, formatOutline, formatMode: intent?.formatMode }) };
       const generatedContent = result.content || targetOutline.content;
       updateEditorProject(project => ({
         ...project,
@@ -4440,26 +4499,32 @@ function App() {
       }
     }
     const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
-    // 章节智能体能看到哪些资料，统一由 buildChapterWriteContext 决定；这里只补会话与模型配置
-    const chapterContext = buildChapterWriteContext({
-      project: editingProject,
-      chapter: activeChapter,
-      instruction: agentInstruction,
-      skills: agentSkills,
-      preferredSkillNames: selectedAgentSkillNames,
-      extraOutlineIds: selectedOutlineIds,
-      selectedCardIds,
-      writingStyle: activeStyle,
-    });
-    if (!chapterContext.boundOutline) {
-      setNotice({ title: '本章没有章纲', content: '智能体只能依据总纲、故事账本和上一章推进，容易写得笼统。建议先在大纲页为本章生成章纲。' });
-    }
     try {
       await invoke<string>('start_agent_runtime');
+      // 懒人流程：本章没有章纲就先自动生成并绑定，作者只管点一次运行，不用先去大纲页
+      let project = editingProject;
+      if (!boundChapterOutlineFor(project, activeChapter)) {
+        const message = '本章还没有章纲，正在按总纲、故事账本和上一章自动生成';
+        setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
+        setAgentProgressPercent(current => Math.max(current, 2));
+        setAgentProgressMessage(message);
+        project = await autoGenerateChapterOutline(project, activeChapter, agentInstruction, runId);
+      }
+      // 章节智能体能看到哪些资料，统一由 buildChapterWriteContext 决定；这里只补会话与模型配置
+      const chapterContext = buildChapterWriteContext({
+        project,
+        chapter: activeChapter,
+        instruction: agentInstruction,
+        skills: agentSkills,
+        preferredSkillNames: selectedAgentSkillNames,
+        extraOutlineIds: selectedOutlineIds,
+        selectedCardIds,
+        writingStyle: activeStyle,
+      });
       setAgentProgress(items => items.map(item => item.id === 'starting'
-        ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message: '运行环境已就绪，正在发送创作任务' }
+        ? { ...item, status: 'active', progress: Math.max(item.progress, 3), message: '运行环境已就绪，正在发送创作任务' }
         : item));
-      setAgentProgressPercent(current => Math.max(current, 2));
+      setAgentProgressPercent(current => Math.max(current, 3));
       setAgentProgressMessage('运行环境已就绪，正在发送创作任务');
       const result = await agentRpc<AgentDraftResult>('chapter.write', {
           runId,
@@ -6532,7 +6597,7 @@ function App() {
                     <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{selectedOutlineIds.filter(id => editingProject.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length} 份</small></div>
                     <button type="button" className={`agent-context-select ${showChapterOutlinePicker ? 'active' : ''}`} onClick={() => setShowChapterOutlinePicker(current => !current)}>选择章纲</button>
                     {showChapterOutlinePicker && <div className="agent-context-dropdown">{editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => <label key={outline.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} /><span><strong>{outline.title || '未命名章纲'}</strong><small>{String(outline.chapterId ?? '') === String(activeChapter?.id ?? '') ? '当前章节' : '其他章节'}</small></span></label>)}</div>}
-                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行时只能依据总纲与前文推进；'; })()}世界观、总纲骨架与最近六章记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
+                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行章节智能体时会先按总纲与前文自动生成一份并绑定到本章；'; })()}世界观、总纲骨架与最近六章记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
                   </div>
                   <div className="agent-card-picker">
                     <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length} 张</small></div>
