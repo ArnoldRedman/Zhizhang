@@ -9,6 +9,7 @@ import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, Ch
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSource, aiDetectionSegmentsMatch } from './domain/chapter';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, recentChapterMemories } from './domain/memory';
+import { chapterNumberFromText, chapterBoundToOutline, resolveOutlineGenerationIntent } from './features/outline/model';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
 import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
@@ -4201,104 +4202,6 @@ function App() {
       changes: current.changes.map(change => change.status === 'pending' && (!selected || selected.has(change.id)) ? { ...change, status: 'dismissed' } : change),
       updatedAt: new Date().toISOString(),
     } : current);
-  };
-
-  const parseChineseChapterNumber = (value: string): number | undefined => {
-    const normalized = value.replace(/\s+/gu, '');
-    if (/^\d+$/u.test(normalized)) return Number(normalized);
-    const digits: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
-    let total = 0;
-    let pendingDigit = 0;
-    let hasDigit = false;
-    for (const char of normalized) {
-      if (digits[char] !== undefined) {
-        pendingDigit = digits[char];
-        hasDigit = true;
-        continue;
-      }
-      const unit = char === '十' ? 10 : char === '百' ? 100 : char === '千' ? 1000 : 0;
-      if (!unit) return undefined;
-      total += (pendingDigit || 1) * unit;
-      pendingDigit = 0;
-    }
-    return hasDigit || total ? total + pendingDigit : undefined;
-  };
-
-  const chapterNumberFromText = (value: string) => {
-    const match = value.match(/第\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章/u);
-    return match ? parseChineseChapterNumber(match[1]) : undefined;
-  };
-
-  /** Old chapter outlines may not have a chapterId. Recover it from their title
-   * before an agent run, rather than letting the model infer a chapter from
-   * unrelated outline history. */
-  const chapterBoundToOutline = (project: Project, outline: OutlineDocument): Chapter | undefined => {
-    const byId = typeof outline.chapterId === 'number'
-      ? project.chapters.find(chapter => chapter.id === outline.chapterId)
-      : undefined;
-    if (byId) return byId;
-    const chapterNumber = chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`);
-    if (!chapterNumber) return undefined;
-    return project.chapters.find(chapter => chapterNumberFromText(chapter.title) === chapterNumber)
-      || project.chapters[chapterNumber - 1];
-  };
-
-  const chapterByNumber = (project: Project, number: number | undefined): Chapter | undefined => {
-    if (!number || number < 1) return undefined;
-    return project.chapters.find(chapter => chapterNumberFromText(chapter.title) === number)
-      || project.chapters[number - 1];
-  };
-
-  const outlineByChapterNumber = (project: Project, number: number | undefined): OutlineDocument | undefined => {
-    if (!number || number < 1) return undefined;
-    return project.outlines.find(outline => outline.kind === '章纲'
-      && chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`) === number)
-      || project.outlines.find(outline => outline.kind === '章纲'
-        && String(outline.chapterId ?? '') === String(project.chapters[number - 1]?.id ?? ''));
-  };
-
-  const instructionChapterNumber = (instruction: string, pattern: RegExp): number | undefined => {
-    const matched = instruction.match(pattern)?.slice(1).find(Boolean);
-    return matched ? parseChineseChapterNumber(matched) : undefined;
-  };
-
-  const resolveOutlineGenerationIntent = (project: Project, activeOutline: OutlineDocument, instruction: string) => {
-    const sourcePattern = /(?:根据|基于|参考|按|以)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:正文|内容)|第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:正文|内容)\s*(?:生成|编写|补全|整理|反推|制作)/u;
-    const sourceMatched = instruction.match(sourcePattern);
-    const explicitSourceNumber = sourceMatched
-      ? parseChineseChapterNumber(sourceMatched[1] || sourceMatched[2])
-      : undefined;
-    const targetNumber = chapterNumberFromText(`${activeOutline.title}\n${activeOutline.content.slice(0, 500)}`);
-    const explicitTargetNumber = instructionChapterNumber(instruction, /(?:生成|编写|补全|制作|整理|反推)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)|(?:为|给)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)/u)
-      || instructionChapterNumber(instruction, /第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)\s*(?:生成|编写|补全|制作|整理|反推)/u);
-    const redirectedOutline = explicitTargetNumber && explicitTargetNumber !== targetNumber
-      ? project.outlines.find(outline => outline.kind === '章纲' && chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`) === explicitTargetNumber)
-      : undefined;
-    const targetOutline = redirectedOutline || activeOutline;
-    const targetChapter = chapterBoundToOutline(project, targetOutline);
-    const targetIndex = targetChapter ? project.chapters.findIndex(chapter => chapter.id === targetChapter.id) : -1;
-    const explicitFormatNumber = instructionChapterNumber(instruction, /(?:参考|按照|依照|沿用|模仿)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)(?:格式|结构|模板)/u);
-    const formatOutline = explicitFormatNumber
-      ? outlineByChapterNumber(project, explicitFormatNumber)
-      : targetIndex > 0 ? outlineByChapterNumber(project, targetIndex) : undefined;
-    const formatMode = explicitFormatNumber
-      ? (formatOutline ? `作者指定参考第 ${explicitFormatNumber} 章章纲格式` : `未找到第 ${explicitFormatNumber} 章章纲格式`)
-      : formatOutline ? '默认参考上一章章纲格式' : '无可用格式参考';
-    const useCurrent = /(?:本章|当前章)(?:的)?(?:正文|内容)/u.test(instruction);
-    const usePrevious = /(?:上一章|前一章)(?:的)?(?:正文|内容)/u.test(instruction);
-    const sourceChapter = explicitSourceNumber ? chapterByNumber(project, explicitSourceNumber)
-      : useCurrent ? targetChapter
-        : (usePrevious || targetIndex > 0) ? project.chapters[targetIndex - 1]
-          : undefined;
-    const isFirstChapter = !explicitSourceNumber && !useCurrent && !usePrevious
-      && (targetNumber === 1 || targetIndex === 0);
-    const sourceMode = explicitSourceNumber
-      ? `作者指定第 ${explicitSourceNumber} 章正文`
-      : useCurrent ? '作者指定本章正文'
-        : sourceChapter ? '默认上一章正文'
-          : isFirstChapter ? '首章：根据世界观、作品简介与作者指令生成'
-          : '未找到可用正文';
-    return { targetOutline, targetChapter, sourceChapter, sourceMode, isFirstChapter, formatOutline, formatMode, explicitTargetNumber, targetRedirectFound: Boolean(redirectedOutline) };
   };
 
   const handleCreateOutline = (kind: OutlineKind) => {
