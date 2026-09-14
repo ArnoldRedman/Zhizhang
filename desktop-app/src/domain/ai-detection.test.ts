@@ -34,9 +34,11 @@ test('analyzeAIChapter 给出 0 到 100 的比率，人工率与 AI 率互补，
   assert.ok(result.aiRate >= 0 && result.aiRate <= 100);
   assert.equal(Number((result.aiRate + result.humanRate).toFixed(1)), 100);
   assert.equal(result.wordCount > 0, true);
-  // 分段是按原文切的：高亮层铺的就是编辑器里的原文，拼回去必须逐字相同
+  // 分段是按原文切的：高亮层铺的就是编辑器里的原文，拼回去必须逐字相同，带章节头和末尾换行时也要能对上
   assert.equal(result.segments.map(segment => segment.text).join(''), raw);
-  assert.equal(aiDetectionSegmentsMatch(analyzeAIChapter(chapter(2, humanText)).segments, humanText), true);
+  assert.equal(aiDetectionSegmentsMatch(result.segments, raw), true);
+  assert.equal(aiDetectionSegmentsMatch(analyzeAIChapter(chapter(2, `${humanText}\n`)).segments, `${humanText}\n`), true);
+  assert.equal(aiDetectionSegmentsMatch(result.segments, `${raw}后来又写了一句。`), false);
   assert.ok(analyzeAIChapter(chapter(3, templatedText)).aiRate > result.aiRate);
 });
 

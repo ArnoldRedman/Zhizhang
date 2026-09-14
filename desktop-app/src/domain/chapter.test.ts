@@ -165,13 +165,16 @@ test('单章导出只含该章，文件名去掉非法字符', () => {
   assert.equal(exportFileName(project, { ...defaultExportOptions, format: 'md' }), '城南夜雨.md');
 });
 
-test('AI 检测分段：正文没变时仍然对得上，章节头和首尾空白不影响判定', () => {
+test('AI 检测分段：正文没变时逐字对得上，章节头和末尾换行也是原文的一部分', () => {
   const segments = [
     { order: 1, text: '上半段。\n\n', confidence: 0, label: '人工' as const },
     { order: 2, text: '下半段。', confidence: 0, label: '人工' as const },
   ];
   assert.equal(aiDetectionSegmentsMatch(segments, '上半段。\n\n下半段。'), true);
-  assert.equal(aiDetectionSegmentsMatch(segments, '【第1章 起】上半段。\n\n下半段。（本章完）\n'), true);
+  // 分段是按原文切的：原文带章节头或末尾换行时，分段里也带着，去掉再比就永远对不上
+  assert.equal(aiDetectionSegmentsMatch(segments, '【第1章 起】上半段。\n\n下半段。（本章完）\n'), false);
+  const withHeader = [{ order: 1, text: '【第1章 起】上半段。\n\n', confidence: 0, label: '人工' as const }, { order: 2, text: '下半段。（本章完）\n', confidence: 0, label: '人工' as const }];
+  assert.equal(aiDetectionSegmentsMatch(withHeader, '【第1章 起】上半段。\n\n下半段。（本章完）\n'), true);
 });
 
 test('AI 检测分段：正文改过之后判定为失配，高亮层退回纯文本', () => {

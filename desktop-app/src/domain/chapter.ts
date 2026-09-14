@@ -132,7 +132,7 @@ export const restoreDeletedChapter = (project: Project, chapterId: number): { pr
   };
 };
 
-/** 检测分析用的正文：去掉章节头和（本章完）再去空白。判定分段是否还对得上必须用同一套规则 */
+/** 检测统计用的正文：去掉章节头和（本章完）再去空白，只影响句长、逻辑词这些指标 */
 export const aiDetectionSource = (content: string) => content
   .replace(/^【第\d+章[^】]*】\s*/u, '')
   .replace(/（本章完）\s*$/u, '')
@@ -141,7 +141,9 @@ export const aiDetectionSource = (content: string) => content
 /**
  * 检测报告里的分段是否还对应当前正文。
  * 编辑器的高亮层铺的是分段文字、上面那层透明 textarea 铺的是真正文；正文改过之后旧分段就废了，
- * 不判定的话屏幕会停在旧正文，滚动条却按新正文的长度走——看起来就是"改了但没刷新"
+ * 不判定的话屏幕会停在旧正文，滚动条却按新正文的长度走——看起来就是"改了但没刷新"。
+ * 分段是按原文切的（含章节头和首尾空白），所以必须逐字比原文；曾经拿它和 aiDetectionSource 的结果比，
+ * 正文只要末尾多一个换行就永远对不上，高亮从来显示不出来
  */
 export const aiDetectionSegmentsMatch = (segments: AIDetectionSegment[] | undefined, content: string) =>
-  !!segments?.length && segments.map(segment => segment.text).join('') === aiDetectionSource(content);
+  !!segments?.length && segments.map(segment => segment.text).join('') === content;
