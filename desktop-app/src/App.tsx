@@ -9,7 +9,8 @@ import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, Ch
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, recentChapterMemories } from './domain/memory';
-import { chapterNumberFromText, chapterBoundToOutline, resolveOutlineGenerationIntent } from './features/outline/model';
+import { chapterNumberFromText, resolveOutlineGenerationIntent } from './features/outline/model';
+import { boundChapterOutlineFor, buildChapterWriteContext } from './features/chapter-agent/context';
 import { buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
@@ -4438,20 +4439,19 @@ function App() {
         agentSkills = builtinSkills;
       }
     }
-    const prioritizedSkillNames = selectedAgentSkillNames.filter(name => agentSkills.some(skill => skill.name === name));
-    const activeChapterIndex = editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id);
-    const continuityChapter = activeChapterIndex > 0 ? editingProject.chapters[activeChapterIndex - 1] : null;
     const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
-    // 当前章的章纲按绑定关系自动带入（chapterId 或标题里的章号），勾选框只用来追加别章章纲做参考；
-    // 世界观是固定资料，总纲由运行时压成骨架加当前阶段段落，让模型知道全书写到哪、下一节点是什么
-    const boundChapterOutline = editingProject.outlines.find(outline => outline.kind === '章纲'
-      && (String(outline.chapterId ?? '') === String(activeChapter.id) || chapterBoundToOutline(editingProject, outline)?.id === activeChapter.id));
-    const currentChapterOutline = boundChapterOutline;
-    const selectedOutlines = editingProject.outlines.filter(outline => outline.kind === '世界观与作品设定' || outline.kind === '总纲'
-      || outline.id === boundChapterOutline?.id || selectedOutlineIds.includes(outline.id));
-    // 记忆按章序排、只取当前章之前的最近六章：故事账本靠它列出"已发生事件"
-    const recentMemories = recentChapterMemories(editingProject, activeChapterIndex + 1);
-    if (!boundChapterOutline) {
+    // 章节智能体能看到哪些资料，统一由 buildChapterWriteContext 决定；这里只补会话与模型配置
+    const chapterContext = buildChapterWriteContext({
+      project: editingProject,
+      chapter: activeChapter,
+      instruction: agentInstruction,
+      skills: agentSkills,
+      preferredSkillNames: selectedAgentSkillNames,
+      extraOutlineIds: selectedOutlineIds,
+      selectedCardIds,
+      writingStyle: activeStyle,
+    });
+    if (!chapterContext.boundOutline) {
       setNotice({ title: '本章没有章纲', content: '智能体只能依据总纲、故事账本和上一章推进，容易写得笼统。建议先在大纲页为本章生成章纲。' });
     }
     try {
@@ -4465,42 +4465,7 @@ function App() {
           runId,
           sessionId: chapterSessionId,
           previousSessionId: chapterPreviousSessionId,
-          projectId: String(editingProject.id),
-          projectTitle: editingProject.title,
-          chapterId: String(activeChapter.id),
-          chapterNumber: activeChapterIndex + 1,
-          totalChapters: editingProject.chapters.length,
-          targetWords: Number(editingProject.chapterTargetWords) || 3000,
-          instruction: activeStyle ? `${agentInstruction}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : agentInstruction,
-          outlines: selectedOutlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content })),
-          activeOutlineId: currentChapterOutline?.id,
-          outline: currentChapterOutline?.content || '',
-          cards: editingProject.cards.filter(card => selectedCardIds.includes(card.id)),
-          knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
-          skills: [...agentSkills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])]
-            .map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
-          preferredSkillNames: prioritizedSkillNames,
-          // 章节承接只传入紧邻上一章正文；更早章节通过最近六章的结构化记忆和聚合文档进入。
-          previousChapters: continuityChapter ? [{ id: continuityChapter.id, title: continuityChapter.title, content: continuityChapter.content }] : [],
-          memories: recentMemories.map(memory => ({
-            id: memory.id,
-            chapterNumber: memory.chapterNumber,
-            title: memory.chapterTitle,
-            summary: memory.summary,
-            keywords: memory.keywords,
-            characterStateChanges: memory.characterStateChanges,
-            knowledgeChanges: memory.knowledgeChanges,
-            foreshadowingChanges: memory.foreshadowingChanges,
-            foreshadowingItems: memory.foreshadowingItems || [],
-            timelineEvents: memory.timelineEvents,
-            canonFacts: memory.canonFacts,
-            conflicts: memory.conflicts,
-            endingHook: memory.endingHook,
-          })),
-          // 人物状态、伏笔追踪、时间线、设定事实是全书聚合文档，进运行时的检索库供计划与正文阶段取用
-          memoryDocuments: editingProject.memoryDocuments
-            .filter(document => document.kind === '人物状态' || document.kind === '伏笔追踪' || document.kind === '时间线' || document.kind === '设定事实')
-            .map(document => ({ kind: document.kind, title: document.title, content: document.content })),
+          ...chapterContext.params,
           apiKey: agentConfig.apiKey.trim(),
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || 'gpt-4o-mini',
@@ -6567,7 +6532,7 @@ function App() {
                     <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{selectedOutlineIds.filter(id => editingProject.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length} 份</small></div>
                     <button type="button" className={`agent-context-select ${showChapterOutlinePicker ? 'active' : ''}`} onClick={() => setShowChapterOutlinePicker(current => !current)}>选择章纲</button>
                     {showChapterOutlinePicker && <div className="agent-context-dropdown">{editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => <label key={outline.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} /><span><strong>{outline.title || '未命名章纲'}</strong><small>{String(outline.chapterId ?? '') === String(activeChapter?.id ?? '') ? '当前章节' : '其他章节'}</small></span></label>)}</div>}
-                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? editingProject.outlines.find(outline => outline.kind === '章纲' && (String(outline.chapterId ?? '') === String(activeChapter.id) || chapterBoundToOutline(editingProject, outline)?.id === activeChapter.id)) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行时只能依据总纲与前文推进；'; })()}世界观、总纲骨架与最近六章记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
+                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行时只能依据总纲与前文推进；'; })()}世界观、总纲骨架与最近六章记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
                   </div>
                   <div className="agent-card-picker">
                     <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length} 张</small></div>
