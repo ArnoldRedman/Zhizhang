@@ -1,0 +1,32 @@
+# 日常提交的质量门禁
+# 发布工作流（cross-platform-build.yml）只在打 tag 或手动触发时才跑检查，
+# 平时 push 到 main 和提 PR 都没有任何静态检查，类型错误只能等到发布或运行时才暴露。
+# 这里让每次 push 与 PR 都跑同一套 npm run check：共享包构建、运行时测试与类型检查、
+# 前端 lint/测试/类型检查/构建、Rust check 与测试。
+name: 质量门禁
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    name: 类型检查、lint 与测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop-app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev
+      - run: npm ci
+      - run: npm ci --prefix desktop-app
+      - run: npm run check

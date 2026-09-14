@@ -7,6 +7,8 @@
     "predev": "npm --prefix .. run build:shared",
     "dev": "vite",
     "build": "npm --prefix .. run build:shared && tsc -b && vite build",
+    "pretypecheck": "npm --prefix .. run build:shared",
+    "typecheck": "tsc -b",
     "prepare:agent-runtime": "node ./scripts/prepare-agent-runtime.mjs",
     "agent:gateway": "npm --prefix ../sidecars/agent-runtime run gateway",
     "mobile:init": "node ./scripts/mobile-targets.mjs",

@@ -104,6 +104,10 @@ try {
         Write-Step '运行 Agent Runtime 类型检查'
         Invoke-Checked $npmCommand @('--workspace', '@zhizhang/agent-runtime', 'run', 'typecheck')
 
+        # 前端检查放在 Rust 测试和 tauri build 之前：类型错误几秒就能报出来，不用等十几分钟的编译跑完才知道
+        Write-Step '运行前端类型检查、lint 与测试'
+        Invoke-Checked $npmCommand @('run', 'check:desktop')
+
         Write-Step '运行项目 Agent 回归测试'
         Invoke-Checked $npmCommand @('--workspace', '@zhizhang/agent-runtime', 'test', '--', '--run', 'tests/project-agent.test.ts')
 
