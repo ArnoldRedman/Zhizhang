@@ -160,3 +160,63 @@ describe("chapter continuity context", () => {
     store.close();
   });
 });
+
+describe("chapter graph degrades instead of failing the whole chapter", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  // 推理模型把输出上限全花在推理上时，中转会返回空内容加 finish_reason=length，客户端据此抛截断错误
+  const truncated = () => new Response(JSON.stringify({ model: "test-model", choices: [{ finish_reason: "length", message: { content: "" } }] }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+  const ok = (content: string) => new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+  const messagesOf = (init?: RequestInit) => JSON.stringify((JSON.parse(String(init?.body || "{}")) as Record<string, unknown>).messages || "");
+
+  it("计划阶段被截断时改用默认计划继续写正文，并把原因记进 errors", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const messages = messagesOf(init);
+      if (messages.includes("五段写作任务书")) return truncated();
+      if (messages.includes("待审查章节")) return ok(JSON.stringify({ consistent: true, issues: [], suggestions: [] }));
+      return ok(JSON.stringify({ content: "林砚推开门。", title: "推门", summary: "承接。" }));
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "plan-truncated", title: "计划截断测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "plan-truncated",
+      chapterId: "5",
+      instruction: "继续写本章",
+      previousChapters: [{ id: "4", title: "第 4 章", content: "门外三声敲门。" }],
+    });
+    expect(result.draftContent).toBe("林砚推开门。");
+    expect(result.chapterPlan).toContain("本章推进");
+    expect(result.errors.some(item => item.includes("计划阶段失败"))).toBe(true);
+    store.close();
+  });
+
+  it("审查阶段失败时保留正文，并如实标注审查未完成", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const messages = messagesOf(init);
+      if (messages.includes("五段写作任务书")) return ok(JSON.stringify({ plan: "1. 本章推进：进城。", handoff: "抵达城门。" }));
+      if (messages.includes("待审查章节")) return truncated();
+      return ok(JSON.stringify({ content: "林砚进了城。", title: "进城", summary: "进城。" }));
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "review-failed", title: "审查失败测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "review-failed",
+      chapterId: "6",
+      instruction: "继续写本章",
+      previousChapters: [{ id: "5", title: "第 5 章", content: "林砚推开门。" }],
+    });
+    expect(result.draftContent).toBe("林砚进了城。");
+    expect(result.reviewResult?.consistent).toBe(true);
+    expect(result.reviewResult?.suggestions[0]).toContain("审查未完成");
+    expect(result.errors.some(item => item.includes("审查阶段失败"))).toBe(true);
+    store.close();
+  });
+});

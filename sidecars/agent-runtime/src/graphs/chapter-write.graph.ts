@@ -455,14 +455,24 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         state.prewriteCheck?.warnings.length ? `## 写前提醒\n${state.prewriteCheck.warnings.map(item => `- ${item}`).join("\n")}` : "",
       ].filter(Boolean).join("\n\n");
       const planInstruction = `${chapterPlanSystemPrompt}\n\n## 本章任务\n${state.instruction}\n\n请输出一份 600 字以内的五段写作任务书，计划是正文生成的硬约束。格式固定为：1. 本章推进（对照总纲与故事账本，本章新增的推进是什么、不得重复的前文是什么）；2. 开篇承接；3. 这章的故事与人物；4. 怎么写更顺（节奏、文风、禁区）；5. 收在哪里（章末钩子）。`;
-      const response = await client.chat([
-        { role: "system", content: chapterAgentSystemPrompt },
-        { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
-        ...(session.summary ? [{ role: "user" as const, content: session.summary }] : []),
-        { role: "user", content: planPrompt },
-        ...(session.recent ? [{ role: "user" as const, content: session.recent }] : []),
-        { role: "user", content: planInstruction },
-      ], { response_format: { type: "json_object" }, temperature: 0.25, max_tokens: 900, retryAttempts: 2 });
+      const fallbackPlan = "1. 本章推进：对照总纲与故事账本，写出前文没有发生过的新事件。\n2. 开篇承接：确认上一章人物位置与情绪。\n3. 这章的故事与人物：推进当前目标并制造有效阻力，每人按动机行动。\n4. 怎么写更顺：用动作、因果和对话推进，避免解释。\n5. 收在哪里：以有因果依据的未解行动或风险收尾。";
+      let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
+      try {
+        response = await client.chat([
+          { role: "system", content: chapterAgentSystemPrompt },
+          { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
+          ...(session.summary ? [{ role: "user" as const, content: session.summary }] : []),
+          { role: "user", content: planPrompt },
+          ...(session.recent ? [{ role: "user" as const, content: session.recent }] : []),
+          { role: "user", content: planInstruction },
+        ], { response_format: { type: "json_object" }, temperature: 0.25, max_tokens: 3000, retryAttempts: 2 });
+      } catch (error) {
+        // 计划只是正文的脚手架：推理模型把输出上限吃光、JSON 被截断时，改用默认计划继续写，不让整章白跑；
+        // 原因写进进度条，作者能看见这一章是按默认计划推进的
+        const message = error instanceof Error ? error.message : String(error);
+        emitter?.progress("plan", 42, `计划阶段失败，改用默认计划继续：${message}`);
+        return { chapterPlan: fallbackPlan, errors: [`计划阶段失败：${message}`] };
+      }
       let chapterPlan = "";
       try {
         const result = JSON.parse(response.content) as Record<string, unknown>;
@@ -470,7 +480,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       } catch {
         chapterPlan = normalizeChapterPlan(response.content);
       }
-      if (!chapterPlan) chapterPlan = "1. 本章推进：对照总纲与故事账本，写出前文没有发生过的新事件。\n2. 开篇承接：确认上一章人物位置与情绪。\n3. 这章的故事与人物：推进当前目标并制造有效阻力，每人按动机行动。\n4. 怎么写更顺：用动作、因果和对话推进，避免解释。\n5. 收在哪里：以有因果依据的未解行动或风险收尾。";
+      if (!chapterPlan) chapterPlan = fallbackPlan;
       emitter?.progress("plan", 42, `模型规划完成（${chapterPlan.length.toLocaleString()} 字）；已交给正文节点执行`);
       return { chapterPlan, upstreamUsage: addUsage(state.upstreamUsage, response.usage) };
     })
@@ -588,14 +598,26 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         reviewInputBytes,
       } : undefined;
 
-      const response = await client.chat([
-        { role: "system", content: chapterAgentSystemPrompt },
-        { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
-        ...(session.summary ? [{ role: "user" as const, content: session.summary }] : []),
-        { role: "user", content: reviewPrompt },
-        ...(session.recent ? [{ role: "user" as const, content: session.recent }] : []),
-        { role: "user", content: reviewInstruction },
-      ], { response_format: { type: "json_object" }, max_tokens: 650 });
+      let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
+      try {
+        response = await client.chat([
+          { role: "system", content: chapterAgentSystemPrompt },
+          { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
+          ...(session.summary ? [{ role: "user" as const, content: session.summary }] : []),
+          { role: "user", content: reviewPrompt },
+          ...(session.recent ? [{ role: "user" as const, content: session.recent }] : []),
+          { role: "user", content: reviewInstruction },
+        ], { response_format: { type: "json_object" }, max_tokens: 2000 });
+      } catch (error) {
+        // 审查失败不能拖垮已经写好的整章正文：如实标注审查未完成，正文照常交给作者
+        const message = error instanceof Error ? error.message : String(error);
+        emitter?.progress("review", 95, `审查未完成：${message}`);
+        return {
+          reviewResult: { consistent: true, issues: [], suggestions: [`审查未完成：${message}`], advances: true, progress: "", repeatedEvents: [] },
+          contextReport,
+          errors: [`审查阶段失败：${message}`],
+        };
+      }
 
       emitter?.progress("review", 95, "审查完成");
 
