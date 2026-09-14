@@ -50,6 +50,8 @@
   - 一个 `App()` 从 `App.tsx:1148` 到文件末尾：101 个 useState、25 处 agentRpc、33 处 invoke、JSX 从 6069 行到 7890 行。首页、编辑器、书库、拆书、扫榜、技能、文风、设置、记忆中心、图谱的界面和状态全在一个函数里；记忆归一化、图谱合并、章纲意图解析、AI 检测启发式、章节写作入参组装这些纯逻辑都写在组件闭包里，既不能单测也无法复用。ARCHITECTURE.md 写着"App.tsx 当前组合根，逐步收敛为页面组合器"，但 features/ 下只有 5 个模型文件。
   - 注：`desktop-app/src-tauri/src/main.rs` 只有 5 行，Rust 已拆成 lib.rs、project_store.rs、resource_store.rs、github_backup.rs、runtime.rs；"全挤在 main.rs"不成立，前后端目录也是分开的。真正的单体是 App.tsx。
   - 拆法（按依赖从里到外）：先把纯函数抽到 domain/ 与 features/*/model.ts 并补测试（记忆、章号解析与章纲意图、章节写作上下文组装、AI 检测），再按页面拆组件（编辑器、书库、设置、记忆中心、图谱），最后 App.tsx 只剩路由和顶层状态。
+  - 进度（2026-09-14）：第一阶段的四块纯逻辑已抽出并补测试，App.tsx 从 7890 行降到 7567 行。`domain/memory.ts`（记忆归一化、聚合文档、本地结构化记忆、最近几章记忆）；`features/outline/model.ts`（章号解析、章纲绑定与"根据第 N 章正文生成"意图解析，并把与 `utils/text.ts` 重复的中文章号解析合并成一份）；`domain/ai-detection.ts`（AI 检测启发式）；`features/chapter-agent/context.ts`（章节智能体入参组装，界面与运行时项目 Agent 两条路径日后共用这一份）。
+  - 仍待做：图谱合并与项目 Agent 变更落地（`applyProjectAgentChangeBatch` 一族）、书库/拆书/扫榜的数据流、备份与同步，然后按页面拆组件。
 - [ ] **运行时 main.ts 把五个核心 handler 内联在一个函数里**
   - `sidecars/agent-runtime/src/main.ts:20-797` 的 handleLegacyRequest 里塞着 memory.write、project.agent.chat、card.write、outline.write、chapter.write，提示词、缓存、会话、委派全混在一起，共 844 行。ARCHITECTURE.md 说"RPC 处理已按职责拆分"只拆了外围四个。
   - 拆法：按 rpc/chapter-handlers.ts、outline-handlers.ts、card-handlers.ts、memory-handlers.ts、project-agent-handlers.ts 注册到 RpcRegistry，main.ts 只剩组合根。
@@ -65,6 +67,10 @@
   - 已改：desktop-app 加 `typecheck` 脚本并纳入根 `typecheck`；新增根 `check:desktop`（类型检查 + lint + 测试）；tsconfig 显式 `strict: true`（当前代码 0 报错）；本地构建脚本在 Rust 测试之前先跑前端检查；新增 `.github/workflows/quality.yml`，push 到 main 与 PR 都跑 `npm run check`。
   - 仍待做：统一 TS 大版本与 lockfile；oxlint 规则收紧。
 - [ ] **前端 52 个测试全部落在 domain/utils/features，App.tsx 零覆盖**
+  - 进度：抽出的四个模块各自带测试，前端测试从 52 个增加到 71 个。组件层（App.tsx 本身）仍然没有测试，要等页面拆出来之后才有下手处。
+- [x] **AI 检测高亮永远显示不出来**
+  - 拆 AI 检测模块补测试时发现：`analyzeAIChapter` 按原文切分段，`aiDetectionSegmentsMatch` 却拿分段和去掉章节头、去掉首尾空白后的正文比。正文末尾只要有一个换行，或带 `【第N章】` 头，匹配就永远失败，高亮层一直退回纯文本。
+  - 已改：匹配改为逐字比原文，`aiDetectionSource` 只用于统计指标；`domain/chapter.test.ts` 与 `domain/ai-detection.test.ts` 覆盖了带章节头和末尾换行的情况。
 - [ ] **OutlineNode/project.outline 是死代码**
   - `domain/project.ts:25-32` 定义了 arc/chapter/scene 树与 planned/writing/completed 状态，全仓库只在读写时原样透传，从未使用。它正是"故事进度板"需要的结构。
 
