@@ -4,7 +4,7 @@ import { StoryStore } from "../storage/story-store.js";
 import { ModelApiClient, type ApiUsage, type ApiWireMode } from "../models/model-api.js";
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { StreamAccumulator } from "../streaming/stream-handler.js";
-import { byteLength, compactText, formatContextReport, type ContextReport } from "../context/context-optimizer.js";
+import { byteLength, compactText, formatContextReport, tailText, type ContextReport } from "../context/context-optimizer.js";
 // 标题拆分与补全是纯文本处理，批量补标题也要用同一套判定，统一放在 application 层
 import { applyDraftChapterTitle, cleanChapterTitleName, splitChapterTitleHeading } from "../application/chapter-titles.js";
 
@@ -112,15 +112,18 @@ function chapterTitleFromEnvelope(value: unknown, depth = 0): string {
   }
 }
 
-const chapterReviewSystemPrompt = `你是长篇小说一致性编辑。审查时只依据给出的约束与章节正文，不做文风重写，也不虚构问题。
+const chapterReviewSystemPrompt = `你是长篇小说一致性编辑。审查时只依据给出的约束、故事账本与章节正文，不做文风重写，也不虚构问题。
 
-重点检查：人物状态、已知信息、时间线、实体关系、物品归属和剧情因果。返回严格 JSON 对象，不要代码围栏或解释：{"consistent":true,"issues":["明确矛盾"],"suggestions":["可执行修订建议"]}。没有明确问题时 issues 和 suggestions 返回空数组。`;
+重点检查两件事。一是一致性：人物状态、已知信息、时间线、实体关系、物品归属和剧情因果。二是推进：本章相对故事账本里的前文是否推进了新的事件或节点，有没有把账本里已发生的事件重新写了一遍。
+返回严格 JSON 对象，不要代码围栏或解释：{"consistent":true,"issues":["明确矛盾"],"suggestions":["可执行修订建议"],"advances":true,"progress":"一句话说明本章把故事推进到了哪里","repeatedEvents":["与前文重复的事件"]}。没有明确问题时 issues、suggestions 和 repeatedEvents 返回空数组。`;
 
 const chapterPlanSystemPrompt = `你是长篇网络小说主编。先为下一章制作一份短小、可执行的写作计划，不写正文，不输出隐藏思考。
-只依据给定资料，优先处理上一章结尾。返回严格 JSON 对象：{"plan":"人类可读的 Markdown 计划","handoff":"下一章交接"}。plan 字段必须直接是普通 Markdown 文字，绝不能在 plan 字段中再次嵌套 JSON、JSON 字符串、代码围栏或字段对象。
-计划必须包含：承接锚点（人物位置、情绪、未解决事件、道具/线索、时间线、伏笔、章末钩子）、人物目标与动机、核心事件链、冲突升级、四段节奏（开场/发展/转折/收束）、本章新增信息、伏笔推进、结尾钩子、下一章交接。未知项标为待确认，不能凭空补设定。`;
+只依据给定资料。先对照总纲与故事账本判断本章处在全书哪一段、必须把主线推进到哪个节点，再承接上一章结尾；承接只是开头几段的衔接，不是本章的全部内容。返回严格 JSON 对象：{"plan":"人类可读的 Markdown 计划","handoff":"下一章交接"}。plan 字段必须直接是普通 Markdown 文字，绝不能在 plan 字段中再次嵌套 JSON、JSON 字符串、代码围栏或字段对象。
+计划必须包含：本章推进的节点（相对总纲与前文，本章新增的推进是什么）、承接锚点（人物位置、情绪、未解决事件、道具/线索、时间线、伏笔、章末钩子）、人物目标与动机、核心事件链、冲突升级、四段节奏（开场/发展/转折/收束）、本章新增信息、伏笔推进或回收、结尾钩子、下一章交接。
+硬性禁止：故事账本里"已发生事件"不得作为本章主事件再写一遍；上一章已经完成的行动、发现、对峙、交易不得重新发生；本章核心事件必须是前文没有出现过的新推进。未知项标为待确认，不能凭空补设定。`;
 
 const planFieldLabels: Record<string, string> = {
+  progress: "本章推进", advance: "本章推进", milestone: "本章推进", node: "本章推进",
   opening: "开篇承接", openingAnchor: "开篇承接", handoff: "下一章交接", continuity: "承接锚点", continuityAnchor: "承接锚点",
   story: "这章的故事", plot: "核心事件链", events: "核心事件链", characters: "这章的人物", characterGoals: "人物目标与动机",
   conflict: "冲突升级", pacing: "节奏安排", rhythm: "节奏安排", newInformation: "本章新增信息", foreshadowing: "伏笔推进",
@@ -183,7 +186,11 @@ export function normalizeChapterPlan(value: unknown): string {
 function buildPrewriteCheck(state: ChapterStateType): { blockers: string[]; warnings: string[]; summary: string } {
   const blockers: string[] = [];
   const warnings: string[] = [];
-  if (!state.outline?.trim()) blockers.push("缺少当前章纲或可执行大纲");
+  // 没有章纲时不再硬报阻断：有总纲与故事账本时仍能按方向推进，只是精度下降；两者都没有才是真阻断
+  if (!state.outline?.trim()) {
+    if (state.masterOutline?.trim() || state.storyLedger?.trim()) warnings.push("本章没有章纲，只能依据总纲、故事账本和上一章推进，建议先生成本章章纲");
+    else blockers.push("缺少当前章纲或可执行大纲");
+  }
   if (!state.instruction.trim()) blockers.push("缺少本章创作指令");
   if (/(待定|待补|todo|\{.+?\}|\[待.+?\])/iu.test(`${state.outline || ""}\n${state.instruction}`)) warnings.push("章纲或指令含待补占位信息，正文将标记为待确认而不自行补设定");
   if (!state.previousChapters?.length) warnings.push("没有上一章正文，无法执行跨章承接检查");
@@ -196,6 +203,14 @@ function stableProjectPacket(state: ChapterStateType): string {
   return [
     state.worldSetting ? `## 世界观与作品设定（作者确认的只读固定规则；只可引用，不得自动改写或推断变化）\n${state.worldSetting}` : "",
     state.writingStyle ? `## 绑定文风（作品固定约束）\n名称：${state.writingStyle.name}\n${state.writingStyle.content}` : "",
+  ].filter(Boolean).join("\n\n");
+}
+
+/** 总纲与故事账本：全书级的推进依据，计划、正文、审查三个阶段都要看到同一份 */
+function storyDirectionPacket(state: ChapterStateType): string {
+  return [
+    state.masterOutline ? `## 总纲（结构骨架与当前相关段落；只用于判断本章位置与推进方向，后续节点不得提前兑现）\n${compactText(state.masterOutline, 3600)}` : "",
+    state.storyLedger ? `## 故事账本（前文已发生事件与未回收伏笔；已发生的事不得再写一遍）\n${compactText(state.storyLedger, 2400)}` : "",
   ].filter(Boolean).join("\n\n");
 }
 
@@ -240,8 +255,14 @@ export const ChapterState = Annotation.Root({
   instruction: Annotation<string>,
   worldSetting: Annotation<string | undefined>,
   writingStyle: Annotation<{ name: string; content: string } | undefined>,
+  /** 总纲骨架与当前相关段落，见 compactMasterOutline */
+  masterOutline: Annotation<string | undefined>,
+  /** 前文已发生事件与未回收伏笔，见 buildStoryLedger */
+  storyLedger: Annotation<string | undefined>,
+  /** 项目设置的单章目标字数，缺省 3000 */
+  targetWords: Annotation<number | undefined>,
   outline: Annotation<string | undefined>,
-  previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string }> | undefined>,
+  previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string; ending?: string }> | undefined>,
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
@@ -267,6 +288,10 @@ export const ChapterState = Annotation.Root({
     consistent: boolean;
     issues: string[];
     suggestions: string[];
+    /** 本章相对前文是否有新推进；false 就是又把上一章写了一遍 */
+    advances?: boolean;
+    progress?: string;
+    repeatedEvents?: string[];
   } | undefined>,
   errors: Annotation<string[]>({
     reducer: (prev, next) => [...prev, ...next],
@@ -402,8 +427,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         return { continuityContext: "（没有上一章正文；本章负责建立新的场景、人物位置和冲突。）" };
       }
       const relatedMemory = state.retrievedContext.find(item => item.includes(previous.title));
-      const tail = compactText(previous.content, 2600);
-      const continuityContext = `上一章：${previous.title}\n上一章结尾（最高优先级）：\n${tail}${relatedMemory ? `\n\n上一章结构记忆：\n${compactText(relatedMemory, 900)}` : ""}\n\n承接清单：开头先确认人物位置和情绪，处理未完成事件与章末钩子；场景或时间跳跃必须给出因果过渡。`;
+      // 承接锚点只能用真正的章尾；prepareChapterInput 已截好 ending，直接调图时退回从原文截尾
+      const tail = previous.ending || tailText(previous.content, 2600);
+      const continuityContext = `上一章：${previous.title}\n上一章结尾（最高优先级）：\n${tail}${relatedMemory ? `\n\n上一章结构记忆：\n${compactText(relatedMemory, 900)}` : ""}\n\n承接清单：开头先确认人物位置和情绪，处理未完成事件与章末钩子；场景或时间跳跃必须给出因果过渡。承接只负责开头几段的衔接，上一章已经完成的事不得重演，本章主体按计划推进新的节点。`;
       emitter?.progress("retrieve", 29, `已锁定${previous.title}结尾，生成阶段将优先承接`);
       emitter?.context("retrieve", "锁定上一章结尾作为承接锚点", { source: previous.title, status: "selected", bytes: byteLength(tail), items: 1 });
       return { continuityContext };
@@ -418,7 +444,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         .join("\n\n");
       const stablePacket = stableProjectPacket(state);
       const session = splitSessionContext(state.sessionContext);
+      const direction = storyDirectionPacket(state);
       const planPrompt = [
+        direction,
         state.outline ? "## 章节细纲\n" + compactText(state.outline, 1800) : "",
         state.continuityContext ? "## 上一章承接（最高优先级）\n" + compactText(state.continuityContext, 3200) : "",
         state.retrievedContext.length ? "## 结构化记忆\n" + compactText(state.retrievedContext.join("\n\n"), 2600) : "",
@@ -426,7 +454,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         skillSection ? "## 执行技能\n" + skillSection : "",
         state.prewriteCheck?.warnings.length ? `## 写前提醒\n${state.prewriteCheck.warnings.map(item => `- ${item}`).join("\n")}` : "",
       ].filter(Boolean).join("\n\n");
-      const planInstruction = `${chapterPlanSystemPrompt}\n\n## 本章任务\n${state.instruction}\n\n请输出一份 600 字以内的五段写作任务书，计划是正文生成的硬约束。格式固定为：1. 开篇承接；2. 这章的故事；3. 这章的人物；4. 怎么写更顺（节奏、文风、禁区）；5. 收在哪里（章末钩子）。`;
+      const planInstruction = `${chapterPlanSystemPrompt}\n\n## 本章任务\n${state.instruction}\n\n请输出一份 600 字以内的五段写作任务书，计划是正文生成的硬约束。格式固定为：1. 本章推进（对照总纲与故事账本，本章新增的推进是什么、不得重复的前文是什么）；2. 开篇承接；3. 这章的故事与人物；4. 怎么写更顺（节奏、文风、禁区）；5. 收在哪里（章末钩子）。`;
       const response = await client.chat([
         { role: "system", content: chapterAgentSystemPrompt },
         { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
@@ -442,7 +470,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       } catch {
         chapterPlan = normalizeChapterPlan(response.content);
       }
-      if (!chapterPlan) chapterPlan = "1. 开篇承接：确认上一章人物位置与情绪。\n2. 这章的故事：推进当前目标并制造有效阻力。\n3. 这章的人物：每人按动机行动。\n4. 怎么写更顺：用动作、因果和对话推进，避免解释。\n5. 收在哪里：以有因果依据的未解行动或风险收尾。";
+      if (!chapterPlan) chapterPlan = "1. 本章推进：对照总纲与故事账本，写出前文没有发生过的新事件。\n2. 开篇承接：确认上一章人物位置与情绪。\n3. 这章的故事与人物：推进当前目标并制造有效阻力，每人按动机行动。\n4. 怎么写更顺：用动作、因果和对话推进，避免解释。\n5. 收在哪里：以有因果依据的未解行动或风险收尾。";
       emitter?.progress("plan", 42, `模型规划完成（${chapterPlan.length.toLocaleString()} 字）；已交给正文节点执行`);
       return { chapterPlan, upstreamUsage: addUsage(state.upstreamUsage, response.usage) };
     })
@@ -471,21 +499,25 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         ? `\n## 章节承接（最高优先级）\n${state.continuityContext}\n`
         : "";
       const planSection = state.chapterPlan ? `\n## 下一章计划（必须执行）\n${state.chapterPlan}\n` : "";
+      const directionSection = storyDirectionPacket(state);
       // Keep project facts first and byte-stable; only the dynamic turn changes after it.
       const stablePacket = stableProjectPacket(state);
       const session = splitSessionContext(state.sessionContext);
       // Skill routing is the first dynamic section so the model sees the task
       // method before chapter-specific material; stable canon remains above it.
-      const mutableProjectContext = [skillsSection, outlineSection, cardsSection, graphSection].filter(Boolean).join("");
+      // 总纲与故事账本紧跟技能之后：模型要先知道全书写到哪，再看本章细纲和上一章结尾
+      const mutableProjectContext = [skillsSection, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, graphSection].filter(Boolean).join("");
       // Keep the stable project facts first, then the durable session handoff;
       // chapter-specific material follows so upstream prefix caches remain stable.
       const dynamicPacket = [mutableProjectContext, continuitySection, planSection, contextSection].filter(Boolean).join("");
       emitter?.context("draft", "组装稳定设定与动态上下文", { source: "ContextAssembler", status: "loaded", bytes: byteLength(dynamicPacket), items: state.selectedSkills.length + (state.cards?.length || 0) });
       const hasPreviousChapter = Boolean(state.previousChapters?.some(chapter => chapter?.content?.trim()));
       const continuityInstruction = hasPreviousChapter
-        ? "先承接上一章最后的动作、位置和情绪，再推进计划中的事件"
+        ? "开头先承接上一章最后的动作、位置和情绪，随后立刻转入计划中的新推进"
         : "这是第一章，没有上一章正文；先依据世界观、章纲和作者指令建立场景、人物与初始冲突";
-      const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：${continuityInstruction}；不要复述计划或解释过程；content 直接从正文第一句开始，不要以“我会”“我将”“接下来会”等承诺性语句开头。`;
+      // 字数读项目设置，写死两三千字会让作者设的目标形同虚设
+      const targetWords = state.targetWords && state.targetWords > 0 ? Math.round(state.targetWords) : 3000;
+      const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作约 ${targetWords} 字正文（不少于 ${Math.round(targetWords * 0.8)} 字，不超过 ${Math.round(targetWords * 1.2)} 字）：${continuityInstruction}；本章主体必须是计划里的新推进，故事账本中已发生的事件不得再写一遍；不要复述计划或解释过程；content 直接从正文第一句开始，不要以“我会”“我将”“接下来会”等承诺性语句开头。`;
       const draftInputBytes = byteLength(chapterAgentSystemPrompt) + byteLength(stablePacket) + byteLength(dynamicPacket) + byteLength(taskPrompt);
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes } : undefined;
       if (contextReport?.cache === "hit") emitter?.context("draft", "命中本地资料指纹缓存", { source: "持久化上下文缓存", status: "cached", bytes: draftInputBytes });
@@ -538,8 +570,12 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const graphSection = state.knowledgeGraph
         ? `\n## 知识图谱约束\n${state.knowledgeGraph}\n`
         : "";
+      // 审查也要看到账本：没有前文事件清单，"是否重复上一章"就只能靠猜
+      const ledgerSection = state.storyLedger
+        ? `\n## 故事账本（前文已发生事件；用于判断本章是否推进、是否重复）\n${compactText(state.storyLedger, 2400)}\n`
+        : "";
 
-      const reviewConstraints = `${cardsSection}${graphSection}${contextSection}`;
+      const reviewConstraints = `${cardsSection}${graphSection}${ledgerSection}${contextSection}`;
       const reviewDraft = compactText(state.draftContent, 10000);
       const reviewPrompt = `## 约束摘要\n${reviewConstraints || "（暂无额外约束）"}\n\n## 待审查章节\n${reviewDraft}`;
       const stablePacket = stableProjectPacket(state);
@@ -570,6 +606,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
             consistent: result.consistent ?? true,
             issues: result.issues || [],
             suggestions: result.suggestions || [],
+            advances: typeof result.advances === "boolean" ? result.advances : true,
+            progress: typeof result.progress === "string" ? result.progress.trim() : "",
+            repeatedEvents: Array.isArray(result.repeatedEvents) ? result.repeatedEvents.filter((item: unknown): item is string => typeof item === "string" && item.trim().length > 0) : [],
           },
           contextReport,
           upstreamUsage: addUsage(state.upstreamUsage, response.usage),
@@ -580,6 +619,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
             consistent: true,
             issues: [],
             suggestions: ["无法解析审查结果"],
+            advances: true,
+            progress: "",
+            repeatedEvents: [],
           },
           contextReport,
           upstreamUsage: addUsage(state.upstreamUsage, response.usage),

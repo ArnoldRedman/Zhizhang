@@ -369,7 +369,8 @@ function compactMemories(memories: unknown, maxBytes: number): Array<Record<stri
     const value: Record<string, unknown> = {
       id: memory.id,
       chapterNumber: memoryChapterNumber(memory),
-      title: compactText(memory.title || "章节记忆", 100),
+      // 界面路径传 title，项目 Agent 路径直接传项目里的记忆对象（chapterTitle），两边都要认
+      title: compactText(memory.title || memory.chapterTitle || "章节记忆", 100),
       summary: compactText(memory.summary || "", 480),
       keywords: compactList(memory.keywords, 8, 70),
       characterStateChanges: compactList(memory.characterStateChanges, 4, 180),

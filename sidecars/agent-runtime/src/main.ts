@@ -216,9 +216,18 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           : outlines.find(item => String(item.kind || "") === "章纲" && !chapters.some(chapter => String(chapter.id) === String(item.chapterId)))
             || [...outlines].reverse().find(item => String(item.kind || "") === "章纲");
         const previousChapter = chapters.at(-1);
-        const previousMemory = previousChapter
-          ? memories.find(item => String(item.chapterId) === String(previousChapter.id))
-          : undefined;
+        // 最近几章的记忆按章序排好一起交给章节图，只给上一章一条会让账本退化成"只看上一章"
+        const chapterOrdinal = (memory: Record<string, unknown>) => {
+          const explicit = Number(memory.sourceChapterNumber);
+          if (Number.isFinite(explicit) && explicit > 0) return explicit;
+          const index = chapters.findIndex(chapter => String(chapter.id) === String(memory.chapterId));
+          return index >= 0 ? index + 1 : 0;
+        };
+        const recentMemories = memories
+          .map(memory => ({ ...memory, chapterNumber: chapterOrdinal(memory) }))
+          .filter(memory => memory.chapterNumber > 0)
+          .sort((left, right) => left.chapterNumber - right.chapterNumber)
+          .slice(-6);
         const delegated = await rpcRegistry.dispatch({
           id: `${String(req.id)}:chapter`,
           method: "chapter.write",
@@ -230,13 +239,16 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
             projectId: String(projectRecord.id || "project"),
             projectTitle: String(projectRecord.title || "未命名小说"),
             chapterId: `project-agent-next-${Date.now()}`,
+            chapterNumber: nextNumber,
+            totalChapters: chapters.length,
+            targetWords: Number(projectRecord.chapterTargetWords) || undefined,
             instruction: request.instruction,
             outline: String(targetOutline?.content || ""),
             outlines,
             activeOutlineId: targetOutline?.id,
             cards: Array.isArray(projectRecord.cards) ? projectRecord.cards : [],
             previousChapters: previousChapter ? [previousChapter] : [],
-            memories: previousMemory ? [previousMemory] : [],
+            memories: recentMemories,
             memoryDocuments: Array.isArray(projectRecord.memoryDocuments) ? projectRecord.memoryDocuments : [],
             knowledgeGraph: {
               nodes: Array.isArray(projectRecord.graphNodes) ? projectRecord.graphNodes : [],
@@ -585,6 +597,9 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         projectId,
         projectTitle,
         chapterId,
+        chapterNumber,
+        totalChapters,
+        targetWords,
         instruction,
         outline,
         outlines,
@@ -616,9 +631,15 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n");
       });
       streamEmitter.progress("starting", 3, "运行环境已就绪，正在整理本章资料");
+      // 章序进入故事账本的抬头，也进入缓存指纹：同一份资料写第 3 章和写第 4 章不能命中同一份准备结果
+      const chapterPosition = {
+        number: Number(chapterNumber) > 0 ? Number(chapterNumber) : undefined,
+        total: Number(totalChapters) >= 0 ? Number(totalChapters) : undefined,
+      };
       const preparationKey = stableHash({
         projectId, chapterId, instruction, outline, outlines, activeOutlineId, cards,
         previousChapters, memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills, preferredSkillNames,
+        chapterPosition,
         contextWindow: Number(contextWindow) || 128,
       });
       const cachedPreparation = chapterPreparationCache.get(preparationKey)
@@ -627,6 +648,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         instruction: String(instruction), outline, outlines, activeOutlineId, cards, previousChapters,
         memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills,
         contextWindowKTokens: Number(contextWindow) || undefined,
+        chapterPosition,
       });
       chapterPreparationCache.set(preparationKey, prepared);
       if (!cachedPreparation) void writePersistentContext(`chapter-prep-${preparationKey}`, prepared);
@@ -736,6 +758,9 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           chapterId: String(chapterId),
           instruction: String(instruction),
           worldSetting: prepared.worldSetting,
+          masterOutline: prepared.masterOutline,
+          storyLedger: prepared.storyLedger,
+          targetWords: Number(targetWords) > 0 ? Number(targetWords) : undefined,
           writingStyle: writingStyle && typeof writingStyle === "object" ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) } : undefined,
           outline: prepared.outline,
           previousChapters: prepared.previousChapters,
