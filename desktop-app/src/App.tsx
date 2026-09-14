@@ -4403,6 +4403,22 @@ function App() {
         && String(outline.chapterId ?? '') === String(project.chapters[number - 1]?.id ?? ''));
   };
 
+  /**
+   * 目标章之前的最近几章记忆，按章序排好并带上章号
+   * 故事账本靠它列出"已发生事件"；重写中间章时不能把后面章的记忆当前文
+   */
+  const recentChapterMemories = (project: Project, beforeChapterNumber: number, limit = 6) => {
+    const ordinal = (memory: ChapterMemory) => {
+      const index = project.chapters.findIndex(chapter => chapter.id === memory.chapterId);
+      return index >= 0 ? index + 1 : (memory.sourceChapterNumber ?? 0);
+    };
+    return project.memories
+      .map(memory => ({ ...memory, chapterNumber: ordinal(memory) }))
+      .filter(memory => memory.chapterNumber > 0 && memory.chapterNumber < beforeChapterNumber)
+      .sort((left, right) => left.chapterNumber - right.chapterNumber)
+      .slice(-limit);
+  };
+
   const instructionChapterNumber = (instruction: string, pattern: RegExp): number | undefined => {
     const matched = instruction.match(pattern)?.slice(1).find(Boolean);
     return matched ? parseChineseChapterNumber(matched) : undefined;
@@ -4572,6 +4588,13 @@ function App() {
           worldSetting: editingProject.outlines
             .filter(item => item.kind === '世界观与作品设定' && item.content.trim())
             .map(item => ({ id: item.id, title: item.title, content: item.content })),
+          // 总纲原文和目标章之前的记忆：章纲不能只看上一章正文，得知道本章在全书哪一段、前文写过什么
+          masterOutline: editingProject.outlines.filter(item => item.kind === '总纲' && item.content.trim()).map(item => item.content).join('\n\n'),
+          recentMemories: recentChapterMemories(
+            editingProject,
+            chapterNumberFromText(`${targetOutline.title}\n${targetOutline.content.slice(0, 500)}`) || editingProject.chapters.length + 1,
+          ).map(memory => ({ chapterNumber: memory.chapterNumber, title: memory.chapterTitle, summary: memory.summary, endingHook: memory.endingHook, foreshadowingItems: memory.foreshadowingItems || [] })),
+          totalChapters: editingProject.chapters.length,
           authorPreferences: editingProject.authorPreferences || [],
           writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
           skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
@@ -4759,16 +4782,8 @@ function App() {
     const currentChapterOutline = boundChapterOutline;
     const selectedOutlines = editingProject.outlines.filter(outline => outline.kind === '世界观与作品设定' || outline.kind === '总纲'
       || outline.id === boundChapterOutline?.id || selectedOutlineIds.includes(outline.id));
-    // 记忆按章序排、只取当前章之前的最近六章：故事账本靠它列出"已发生事件"；重写中间章时不能把后面章的记忆当前文
-    const memoryOrdinal = (memory: ChapterMemory) => {
-      const index = editingProject.chapters.findIndex(chapter => chapter.id === memory.chapterId);
-      return index >= 0 ? index + 1 : (memory.sourceChapterNumber ?? 0);
-    };
-    const recentMemories = editingProject.memories
-      .map(memory => ({ ...memory, chapterNumber: memoryOrdinal(memory) }))
-      .filter(memory => memory.chapterNumber > 0 && memory.chapterNumber <= activeChapterIndex)
-      .sort((left, right) => left.chapterNumber - right.chapterNumber)
-      .slice(-6);
+    // 记忆按章序排、只取当前章之前的最近六章：故事账本靠它列出"已发生事件"
+    const recentMemories = recentChapterMemories(editingProject, activeChapterIndex + 1);
     if (!boundChapterOutline) {
       setNotice({ title: '本章没有章纲', content: '智能体只能依据总纲、故事账本和上一章推进，容易写得笼统。建议先在大纲页为本章生成章纲。' });
     }
