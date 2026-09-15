@@ -386,7 +386,7 @@ export async function generateChapterTitle(
     const response = await client.chat([
       { role: "system", content: singleTitleSystemPrompt },
       { role: "user", content: `《${options.projectTitle || "未命名小说"}》刚写完一章。${options.instruction?.trim() ? `\n作者本章要求：${options.instruction.trim().slice(0, 400)}` : ""}\n\n${excerpt}` },
-    ], { response_format: { type: "json_object" }, temperature: 0.5, max_tokens: 200, retryAttempts: 2 });
+    ], { response_format: { type: "json_object" }, temperature: 0.5, max_tokens: 800, retryAttempts: 2 });
     const cleaned = response.content.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "").trim();
     const parsed = JSON.parse(cleaned) as Record<string, unknown>;
     const name = [parsed.title, parsed.chapterTitle, parsed["标题"]].find(value => typeof value === "string" && value.trim());

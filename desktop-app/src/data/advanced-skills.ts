@@ -36,7 +36,7 @@ export const advancedBuiltinSkills: Skill[] = [
     id: 'builtin-next-chapter-plan', name: 'next-chapter-plan', category: 'write',
     description: '先编写可确认的下一章计划，再据此生成正文，明确承接、事件链、节奏和交接信息。',
     tags: ['下一章计划', '章节规划', '事件链', '四拍节奏'], rating: 5, usageCount: 0, builtin: true,
-    content: '# next-chapter-plan\n\n先输出短计划，不直接写正文。计划必须包含上一章交接、人物目标与动机、核心事件链、冲突升级、四段节奏（开场/发展/转折/收束）、本章新增信息、伏笔推进、结尾钩子和下一章交接。每一项都引用已有资料，未知项标为待确认；正文生成必须逐项兑现计划。',
+    content: '# next-chapter-plan\n\n先输出短计划，不直接写正文。计划必须包含本章推进的总纲节点与时间地点位移（相对上一章是紧接、数小时后还是数天后、换不换地点）、上一章交接、人物目标与动机、核心事件链、冲突升级、四段节奏（开场/发展/转折/收束）、本章新增信息、伏笔推进、结尾钩子和下一章交接。上一章没结束的事件先在本章收束再推进新节点。每一项都引用已有资料，未知项标为待确认；正文生成必须逐项兑现计划。',
   },
   {
     id: 'builtin-mainline-check', name: 'mainline-check', category: 'review',

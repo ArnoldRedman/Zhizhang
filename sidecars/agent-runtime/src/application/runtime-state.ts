@@ -8,6 +8,8 @@ export type AgentSessionTurn = {
   instruction: string;
   conclusion: string;
   createdAt: string;
+  /** 这一轮写的是哪一章（如 chapter:12）。同一章重跑时用它替换旧轮次，不把废稿堆进会话 */
+  turnKey?: string;
 };
 
 export type AgentSessionState = {
@@ -38,17 +40,20 @@ export function normalizeAgentSession(value: unknown): AgentSessionState {
         const item = turn as Record<string, unknown>;
         const instruction = compactText(item.instruction || "", 2200);
         const conclusion = compactText(item.conclusion || "", 6000);
-        return instruction || conclusion ? [{ instruction, conclusion, createdAt: String(item.createdAt || "") }] : [];
+        return instruction || conclusion ? [{ instruction, conclusion, createdAt: String(item.createdAt || ""), turnKey: typeof item.turnKey === "string" ? item.turnKey : undefined }] : [];
       })
       : [],
     compressedAt: typeof source.compressedAt === "string" ? source.compressedAt : undefined,
   };
 }
 
+/** 会话轮次里的“结论”是模型自己的产物，作者未必采用；标明这一点，免得模型把它当成已确认事实 */
+const conclusionLabel = "上一轮结果（作者未必采用，与前文冲突时以故事账本和正文为准）";
+
 export function renderAgentSession(state: AgentSessionState): string {
   const parts = [
     state.summary ? `## 已压缩的会话摘要\n${state.summary}` : "",
-    state.recentTurns.length ? `## 最近会话轮次\n${state.recentTurns.map((turn, index) => `### 轮次 ${index + 1}\n作者请求：${turn.instruction || "延续上一轮"}\n已确认结论：${turn.conclusion || "暂无"}`).join("\n\n")}` : "",
+    state.recentTurns.length ? `## 最近会话轮次\n${state.recentTurns.map((turn, index) => `### 轮次 ${index + 1}\n作者请求：${turn.instruction || "延续上一轮"}\n${conclusionLabel}：${turn.conclusion || "暂无"}`).join("\n\n")}` : "",
   ].filter(Boolean);
   return parts.join("\n\n");
 }
@@ -59,7 +64,7 @@ export function renderSessionSummary(state: AgentSessionState): string {
 
 export function renderRecentTurns(state: AgentSessionState): string {
   return state.recentTurns.length
-    ? `## 最近两轮请求与结论\n${state.recentTurns.map((turn, index) => `### 轮次 ${index + 1}\n作者请求：${turn.instruction || "延续上一轮"}\n已确认结论：${turn.conclusion || "暂无"}`).join("\n\n")}`
+    ? `## 最近两轮请求与结论\n${state.recentTurns.map((turn, index) => `### 轮次 ${index + 1}\n作者请求：${turn.instruction || "延续上一轮"}\n${conclusionLabel}：${turn.conclusion || "暂无"}`).join("\n\n")}`
     : "";
 }
 
@@ -69,7 +74,9 @@ export function compactAgentSession(state: AgentSessionState, contextWindowKToke
   if (baseBytes + byteLength(rendered) < threshold) return { state, compressed: false };
 
   const historicTurns = state.recentTurns.slice(0, -SESSION_KEEP_TURNS);
-  const historicDigest = historicTurns.map(turn => `请求：${compactText(turn.instruction, 500)}\n结论：${compactText(turn.conclusion, 1200)}`).join("\n\n");
+  // 历史轮次从新到旧拼：摘要按头 62%/尾 38% 截，最新的内容必须排在前面，
+  // 否则被钉住的是最早那几轮的废稿，模型越写越被旧内容牵着走
+  const historicDigest = [...historicTurns].reverse().map(turn => `请求：${compactText(turn.instruction, 500)}\n结论：${compactText(turn.conclusion, 1200)}`).join("\n\n");
   const availableBytes = Math.max(4096, threshold - baseBytes);
   const recentTurnBudget = Math.max(1000, Math.floor(availableBytes * 0.32));
   const recentTurns = state.recentTurns.slice(-SESSION_KEEP_TURNS).map(turn => ({
@@ -79,7 +86,7 @@ export function compactAgentSession(state: AgentSessionState, contextWindowKToke
   }));
   // The response itself already contains a model-produced plan/conclusion. Keep
   // that semantic material while collapsing older turns into one durable handoff.
-  const summary = compactText([state.summary, historicDigest].filter(Boolean).join("\n\n"), Math.max(1200, Math.floor(availableBytes * 0.3)));
+  const summary = compactText([historicDigest, state.summary].filter(Boolean).join("\n\n"), Math.max(1200, Math.floor(availableBytes * 0.3)));
   return {
     compressed: true,
     state: {
@@ -91,14 +98,18 @@ export function compactAgentSession(state: AgentSessionState, contextWindowKToke
   };
 }
 
-export function appendAgentSession(state: AgentSessionState, instruction: string, conclusion: string, contextWindowKTokens: unknown, baseBytes: number): { state: AgentSessionState; compressed: boolean } {
+export function appendAgentSession(state: AgentSessionState, instruction: string, conclusion: string, contextWindowKTokens: unknown, baseBytes: number, turnKey?: string): { state: AgentSessionState; compressed: boolean } {
+  // 同一章重跑（写偏了、被弃用重来）只保留最新一轮：把废稿当历史记下去，模型下一轮就会被自己的废稿带偏
+  const previous = state.recentTurns[state.recentTurns.length - 1];
+  const keepTurns = turnKey && previous?.turnKey === turnKey ? state.recentTurns.slice(0, -1) : state.recentTurns;
   const next: AgentSessionState = {
     version: 1,
     summary: state.summary,
-    recentTurns: [...state.recentTurns, {
+    recentTurns: [...keepTurns, {
       instruction: compactText(instruction, 2200),
       conclusion: compactText(conclusion, 6500),
       createdAt: new Date().toISOString(),
+      turnKey,
     }],
     compressedAt: state.compressedAt,
   };

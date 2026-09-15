@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createChapterGraph } from "../src/graphs/chapter-write.graph.js";
+import { createChapterGraph, chapterDraftMaxTokens } from "../src/graphs/chapter-write.graph.js";
 import { StoryStore } from "../src/storage/story-store.js";
 
 describe("chapter continuity context", () => {
@@ -98,6 +98,54 @@ describe("chapter continuity context", () => {
     // 全段都是承诺语时返回空串，让上层报“没有生成正文”而不是把承诺语当正文展示
     expect(result.draftContent).toBe("");
     store.close();
+  });
+
+  it("审查判定本章没推进时按下一节点重写一次，不再把重复前文的稿子直接交给作者", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const messagesOf = (init?: RequestInit) => JSON.stringify((JSON.parse(String(init?.body || "{}")) as Record<string, unknown>).messages || "");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = messagesOf(init);
+      const content = messages.includes("五段写作任务书")
+        ? JSON.stringify({ plan: "1. 本章推进：离开值班室，第二天到城门口。", handoff: "城门。" })
+        : messages.includes("待审查章节")
+          ? JSON.stringify({ consistent: true, issues: [], suggestions: [], advances: false, progress: "仍停在值班室门前", repeatedEvents: ["门内第三声敲击"] })
+          // 重写请求靠任务里的“本次是重写”认出来
+          : messages.includes("本次是重写")
+            ? JSON.stringify({ content: "第二天清晨，林砚已经站在城门口。", title: "出城", summary: "推进到出城。" })
+            : JSON.stringify({ content: "门外又响起了第三声敲击。", title: "第三声", summary: "又把门前戏写了一遍。" });
+      return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "repair-project", title: "重写测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "repair-project",
+      chapterId: "13",
+      instruction: "继续写下一章",
+      masterOutline: "结构骨架：\n## 第一卷 交付失控\n## 第二卷 验证与转移",
+      previousChapters: [{ id: "12", title: "第 12 章", content: "白光锁住了林砚的右肩。" }],
+    });
+
+    expect(result.draftContent).toBe("第二天清晨，林砚已经站在城门口。");
+    expect(requests.some(body => JSON.stringify(body.messages || "").includes("本次是重写"))).toBe(true);
+    // 正文请求必须带上按目标字数算的输出预算，不能再用客户端那个按短回复定的 4000
+    expect(requests.some(body => Number(body.max_tokens) > 4000)).toBe(true);
+    // 重写后的稿子不该还挂着“没有推进”的旧结论
+    expect(result.reviewResult?.repeatedEvents).toEqual([]);
+    expect(result.reviewResult?.suggestions.join("")).toContain("重写");
+    store.close();
+  });
+
+  it("正文输出预算按目标字数算，不再用 4000 这个按短回复定的默认值", () => {
+    expect(chapterDraftMaxTokens(3000)).toBe(6300);
+    // 窗口小的时候输出最多占六成，不能把输入挤没了
+    expect(chapterDraftMaxTokens(3000, 8)).toBeLessThanOrEqual(Math.floor(8 * 1024 * 0.6));
+    expect(chapterDraftMaxTokens(200)).toBe(2000);
   });
 
   it("puts the immediate previous chapter ending ahead of ordinary context", async () => {

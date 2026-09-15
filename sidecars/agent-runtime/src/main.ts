@@ -3,7 +3,7 @@ import { createChapterGraph, selectSkillsByIntent, type SkillDefinition } from "
 import { StoryStore } from "./storage/story-store.js";
 import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
-import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
+import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, masterOutlineBytes, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
@@ -16,6 +16,10 @@ import { registerLibraryHandlers } from "./rpc/library-handlers.js";
 import { registerContentHandlers } from "./rpc/content-handlers.js";
 import { registerTextHandlers } from "./rpc/text-handlers.js";
 import type { RpcResponse } from "@zhizhang/contracts";
+
+/** 资料组装规则版本：改了预算或裁剪策略就加一
+ * 准备结果的缓存 key 只由入参算出，代码变了 key 不变，旧缓存会一直命中、优化完全看不出效果 */
+const contextPipelineVersion = 4;
 
 async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse> {
   try {
@@ -98,7 +102,9 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const optimizedResponse = await client.chat([
         { role: "system", content: memoryEditorSystemPrompt },
         { role: "user", content: compactMemoryPrompt },
-      ], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 1300, retryAttempts: 4 });
+              // 8000 是给记忆 JSON 本身的额度（摘要/人物状态/伏笔/时间线/实体/关系/卡片变更很长）；
+      // 推理模型的思考额度由 model-api 按推理强度另外预留，两者相加才是真正的上限
+      ], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 8000, retryAttempts: 4 });
         const contextReport: ContextReport = {
         cache: "miss",
         sourceBytes: byteLength(JSON.stringify({ content, cards: rawCards, knowledgeGraph })),
@@ -585,11 +591,11 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const ledgerPosition = { number: targetChapterNumber || (chapterTotal !== undefined ? chapterTotal + 1 : undefined), total: chapterTotal };
       const memoryList = Array.isArray(recentMemories) ? recentMemories.filter(item => item && typeof item === "object") as Array<Record<string, unknown>> : [];
       const directionQuery = [String(instruction || ""), sourceHandoff, String(existingContent || ""), ...memoryList.map(item => String(item.summary || ""))].join("\n").toLowerCase();
-      const masterOutlineSection = kind === "章纲" ? compactMasterOutline(masterOutline, directionQuery, 3600) : "";
-      const ledgerSection = kind === "章纲" ? buildStoryLedger(memoryList, ledgerPosition, 2400) : "";
+      const masterOutlineSection = kind === "章纲" ? compactMasterOutline(masterOutline, directionQuery, masterOutlineBytes, Number(ledgerPosition.number) || undefined) : "";
+      const ledgerSection = kind === "章纲" ? buildStoryLedger(memoryList, ledgerPosition, 3600) : "";
       const directionSection = masterOutlineSection || ledgerSection
         ? `## 总纲与故事账本（本章必须沿总纲推进一个新节点；账本里已发生的事不得再作为本章主事件）\n${[
-          masterOutlineSection ? `### 总纲骨架与当前相关段落（后续节点只用于判断方向，不得提前兑现）\n${masterOutlineSection}` : "",
+          masterOutlineSection ? `### 总纲（含推进路线、当前节点与“接下来必须推进”的节点；本章章纲必须推进到那里，更后面的节点不得提前兑现）\n${masterOutlineSection}` : "",
           ledgerSection ? `### 故事账本\n${ledgerSection}` : "",
         ].filter(Boolean).join("\n\n")}\n\n`
         : "";
@@ -671,6 +677,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         previousChapters, memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills, preferredSkillNames,
         chapterPosition,
         contextWindow: Number(contextWindow) || 128,
+        pipelineVersion: contextPipelineVersion,
       });
       const cachedPreparation = chapterPreparationCache.get(preparationKey)
         || await readPersistentContext<PreparedChapterInput>(`chapter-prep-${preparationKey}`);
@@ -818,10 +825,16 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           } catch {
             // 标题缺失时作者仍可在接受草稿前自己填，不报错中断本次写作
           }
+          // 兜底也失败就不要再默默无声：否则章节只能叫“第 N 章”，作者很难发现
+          if (!String(resultRecord.chapterTitle || "").trim()) streamEmitter.progress("review", 98, "本章标题没生成出来：接受草稿前请手动填写标题");
         }
-        const handoff = [resultRecord.chapterPlan, resultRecord.summary, resultRecord.reviewResult && JSON.stringify(resultRecord.reviewResult)].filter(Boolean).join("\n");
+        // 会话只记“这一章写成了什么 + 审查还指出什么问题”，不把计划全文当结论：
+        // 计划是一次性产物，下一章会重新生成，把它当“已确认结论”回喂只会把模型拉回上一章的写法
+        const reviewRecord = resultRecord.reviewResult as Record<string, unknown> | undefined;
+        const reviewIssues = Array.isArray(reviewRecord?.issues) ? reviewRecord.issues.map(item => String(item)).filter(Boolean).join("；") : "";
+        const handoff = [resultRecord.summary, reviewIssues ? `待修正：${reviewIssues}` : ""].filter(Boolean).join("\n");
         if (handoff) {
-          const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes);
+          const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes, `chapter:${String(chapterId)}`);
           novelSessionCache.set(sessionKey, nextChapterSession.state);
           void writePersistentContext(`chapter-session-${sessionKey}`, nextChapterSession.state);
           void writePersistentDocument(`chapter-session-${sessionKey}`, `# 章节会话摘要\n\n${nextChapterSession.state.summary || "暂无压缩摘要"}`);

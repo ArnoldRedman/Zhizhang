@@ -211,13 +211,21 @@ export class LruCache<Value> {
 }
 
 /** 总纲和故事账本不占各资料区的加权预算：它们是全书级资料，不该被上一章正文挤掉 */
-const masterOutlineBytes = 3600;
-const storyLedgerBytes = 2400;
+export const masterOutlineBytes = 5600;
+const storyLedgerBytes = 3600;
 
-export function contextBudgetBytes(contextWindowKTokens?: number, capKB = 18, minimumKB = 6): number {
+/** 资料区预算占比：按 1 token ≈ 3 字节的汉字估算，给各资料区留窗口的 16% */
+const contextBudgetShare = 0.16;
+/** 绝对上限：窗口再大也不把整部书塞进去，否则单次请求又慢又贵 */
+const contextBudgetCeilingKB = 256;
+
+export function contextBudgetBytes(contextWindowKTokens?: number, capKB?: number, minimumKB = 6): number {
   // 这里只分配各资料区的预打包空间；最终硬上限由模型 tokenizer 执行
   const configuredTokens = Math.max(16, Number(contextWindowKTokens) || 128) * 1024;
-  return Math.min(capKB * 1024, Math.max(minimumKB * 1024, Math.floor(configuredTokens * 3 * 0.16)));
+  // 预算要跟着窗口走：老代码把上限写死 18KB，128K 窗口也只装 18KB，剩下的 180 多 KB 全被裁掉
+  const windowKB = Math.min(contextBudgetCeilingKB, Math.floor(configuredTokens * 3 * contextBudgetShare / 1024));
+  const limitKB = capKB === undefined ? windowKB : Math.min(capKB, windowKB);
+  return Math.max(minimumKB * 1024, limitKB * 1024);
 }
 
 function compactList(value: unknown, maxItems: number, itemBytes: number): string[] {
@@ -363,7 +371,8 @@ function compactMemories(memories: unknown, maxBytes: number): Array<Record<stri
   const source = Array.isArray(memories) ? memories.filter(item => item && typeof item === "object") : [];
   let remaining = maxBytes;
   const packed: Array<Record<string, unknown>> = [];
-  for (const item of source.slice(-6).reverse()) {
+  // 不写死只带 6 章：能带多少由预算决定，长篇小说不该因为一个常量永远只能看见最近六章
+  for (const item of [...source].reverse()) {
     if (remaining < 180) break;
     const memory = item as Record<string, unknown>;
     const value: Record<string, unknown> = {
@@ -371,16 +380,16 @@ function compactMemories(memories: unknown, maxBytes: number): Array<Record<stri
       chapterNumber: memoryChapterNumber(memory),
       // 界面路径传 title，项目 Agent 路径直接传项目里的记忆对象（chapterTitle），两边都要认
       title: compactText(memory.title || memory.chapterTitle || "章节记忆", 100),
-      summary: compactText(memory.summary || "", 480),
+      summary: compactText(memory.summary || "", 600),
       keywords: compactList(memory.keywords, 8, 70),
       characterStateChanges: compactList(memory.characterStateChanges, 4, 180),
       knowledgeChanges: compactList(memory.knowledgeChanges, 3, 180),
-      foreshadowingChanges: compactList(memory.foreshadowingChanges, 3, 180),
-      foreshadowingItems: compactForeshadowingItems(memory.foreshadowingItems, 6),
+      foreshadowingChanges: compactList(memory.foreshadowingChanges, 5, 200),
+      foreshadowingItems: compactForeshadowingItems(memory.foreshadowingItems, 8),
       timelineEvents: compactList(memory.timelineEvents, 3, 180),
       canonFacts: compactList(memory.canonFacts, 3, 180),
       conflicts: compactList(memory.conflicts, 2, 180),
-      endingHook: compactText(memory.endingHook || "", 220),
+      endingHook: compactText(memory.endingHook || "", 260),
     };
     const size = byteLength(JSON.stringify(value));
     if (size > remaining && packed.length) break;
@@ -390,8 +399,9 @@ function compactMemories(memories: unknown, maxBytes: number): Array<Record<stri
   return packed.reverse();
 }
 
-/** 承接锚点的章尾长度：约八九百个汉字，够看清最后一个场景怎么收的 */
-const previousChapterEndingBytes = 2600;
+/** 承接锚点的章尾长度：约四五百个汉字，够看清最后一个场景怎么收的；
+ * 再长就不是“承接”而是“上一章正文”，模型会顺着它把上一章最后一场戏再写一遍 */
+const previousChapterEndingBytes = 1400;
 
 function compactPreviousChapters(chapters: unknown, maxBytes: number): PreparedChapterInput["previousChapters"] {
   const source = Array.isArray(chapters) ? chapters.filter(item => item && typeof item === "object") : [];
@@ -425,51 +435,139 @@ function bigramOverlap(value: string, text: string): number {
   return score;
 }
 
-/**
- * 总纲只给结构骨架和当前相关的段落
- * 整份塞进去会连结局一起泄露，普通头尾截断则只剩开头和结局；
- * 骨架（全部标题行）让模型知道全书结构和本章大致处在哪一段，
- * 正文只取主线段与本章资料词面最相关的段落，结局段永远只留标题
- */
-export function compactMasterOutline(content: unknown, text: string, maxBytes: number): string {
-  const normalized = normalizePromptWhitespace(content);
-  if (!normalized || maxBytes <= 0) return "";
-  const sections: Array<{ heading: string; body: string }> = [];
+interface OutlineSection {
+  heading: string;
+  level: number;
+  body: string;
+  index: number;
+}
+
+/** 总纲按标题切段，保留层级与原始顺序：找“下一步”只能靠顺序，不能靠词面打分 */
+function splitOutlineSections(normalized: string): OutlineSection[] {
+  const sections: OutlineSection[] = [];
   let heading = "";
+  let level = 0;
   let body: string[] = [];
+  const flush = () => {
+    if (heading || body.join("").trim()) sections.push({ heading, level, body: body.join("\n").trim(), index: sections.length });
+  };
   for (const line of normalized.split("\n")) {
-    if (/^#{1,6}\s+\S/u.test(line)) {
-      if (heading || body.join("").trim()) sections.push({ heading, body: body.join("\n").trim() });
+    const marked = /^(#{1,6})\s+\S/u.exec(line);
+    if (marked) {
+      flush();
       heading = line.trim();
+      level = marked[1].length;
       body = [];
       continue;
     }
     body.push(line);
   }
-  if (heading || body.join("").trim()) sections.push({ heading, body: body.join("\n").trim() });
-  const headings = sections.map(section => section.heading).filter(Boolean);
-  // 没有标题结构的总纲无法按段挑选，只能整体截断
-  if (headings.length < 2) return compactText(normalized, maxBytes);
-  const skeleton = `结构骨架：\n${headings.join("\n")}`;
-  let remaining = maxBytes - byteLength(skeleton) - 12;
-  const candidates = sections
-    .map((section, index) => ({ section, index }))
-    .filter(({ section }) => section.body && !/结局|大结局|终章|完结/u.test(section.heading))
-    .map(entry => ({
-      ...entry,
-      score: (/主线|目标|总览|核心/u.test(entry.section.heading) ? 24 : 0) + bigramOverlap(`${entry.section.heading}\n${entry.section.body}`, text),
-    }))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, 3)
-    .sort((left, right) => left.index - right.index);
-  const picked: string[] = [];
-  for (const { section } of candidates) {
-    if (remaining < 200) break;
-    const chunk = `${section.heading}\n${compactText(section.body, Math.max(160, Math.min(1800, remaining)))}`;
-    picked.push(chunk);
-    remaining -= byteLength(chunk) + 2;
+  flush();
+  return sections;
+}
+
+/** 总纲里写“后面还要交付什么”的段落：分卷与阶段规划，是模型唯一能拿到的未来节点 */
+const forwardOutlineHeading = /(分卷|卷规划|卷纲|第[一二三四五六七八九十\d]+卷|阶段规划|阶段推进|主线推进|剧情推进|推进路线|节点规划)/u;
+const endingOutlineHeading = /(结局|大结局|终章|完结|尾声)/u;
+/** 核对清单、格式说明这类流程性段落：占着“下一步”的位置却没写任何剧情 */
+const metaOutlineHeading = /(核对|待确认|说明|格式|清单|检查|附录|流程|方法|边界)/u;
+/** 卷标题里手写的章号区间（第156～205章）：有它就能按当前章号精确定位，不用猜 */
+const chapterRangeHeading = /第\s*(\d{1,4})\s*[～~\-—至]\s*(\d{1,4})\s*章/u;
+
+/** 取某个标题及其子标题正文；同级或更浅的标题就是下一段了 */
+function outlineSubtreeText(sections: OutlineSection[], startIndex: number, used?: Set<number>): string {
+  const level = sections[startIndex].level;
+  const picked: OutlineSection[] = [];
+  for (const section of sections.slice(startIndex)) {
+    if (section.index > startIndex && section.heading && section.level <= level) break;
+    picked.push(section);
+    used?.add(section.index);
   }
-  return [skeleton, picked.length ? `当前相关段落：\n${picked.join("\n\n")}` : ""].filter(Boolean).join("\n\n");
+  return picked.map(section => [section.heading, section.body].filter(Boolean).join("\n")).join("\n\n");
+}
+
+/**
+ * 总纲只给三样东西：全书结构骨架、当前卷与下一卷、以及本章所处的当前节点
+ * 老做法按词面相关度挑段落，挑中的永远是“已经写过的部分”——后续节点用的词和正文本来就不重合，
+ * 词面打分天然把未来排掉，模型只能看见过去，于是把上一章换个说法再写一遍
+ */
+export function compactMasterOutline(content: unknown, text: string, maxBytes: number, chapterNumber?: number): string {
+  const normalized = normalizePromptWhitespace(content);
+  if (!normalized || maxBytes <= 0) return "";
+  const sections = splitOutlineSections(normalized);
+  // 没有标题结构的总纲无法按段挑选，只能整体截断
+  if (sections.filter(section => section.heading).length < 2) return compactText(normalized, maxBytes);
+  // 骨架只列到二级标题：三级标题是细节，全列出来会占掉一半预算、还被位置截断把中间几卷的标题切掉
+  const headingSections = sections.filter(section => section.heading);
+  const topSections = headingSections.filter(section => section.level <= 2);
+  const skeletonSource = topSections.length >= 3 ? topSections : headingSections;
+  const skeleton = compactText(
+    `结构骨架：\n${skeletonSource.map(section => section.heading).join("\n")}`,
+    Math.max(320, Math.floor(maxBytes * 0.2)),
+  );
+  let remaining = maxBytes - byteLength(skeleton) - 12;
+
+  // 卷/阶段段落：标题里写了章号区间的能按当前章号精确定位（长篇小说基本都这么列卷），
+  // 没写区间才退回词面匹配
+  const volumeLike = sections
+    .filter(section => section.heading)
+    .map(section => ({ section, range: chapterRangeHeading.exec(section.heading) }))
+    .filter(entry => entry.range || forwardOutlineHeading.test(entry.section.heading));
+  const routeIndexes = new Set<number>();
+  let route = "";
+  if (volumeLike.length > 0) {
+    const located = chapterNumber === undefined ? undefined : volumeLike.find(entry => {
+      if (!entry.range) return false;
+      const from = Number(entry.range[1]);
+      const to = Number(entry.range[2]);
+      return chapterNumber >= from && chapterNumber <= to;
+    });
+    const scored = volumeLike
+      .map(entry => ({ entry, score: bigramOverlap(`${entry.section.heading}\n${entry.section.body}`, text) }))
+      .sort((left, right) => right.score - left.score || left.entry.section.index - right.entry.section.index);
+    const anchor = located ?? scored[0]?.entry;
+    // 定位到“分卷规划”这种只有标题没有正文的父级时，往下取紧随其后的那一卷
+    const current = anchor && !anchor.section.body && !anchor.range
+      ? volumeLike.find(entry => entry.section.index > anchor.section.index) ?? anchor
+      : anchor;
+    const next = current ? volumeLike.find(entry => entry.section.index > current.section.index) : undefined;
+    const blocks: string[] = [];
+    if (current) {
+      blocks.push(`【当前卷】\n${compactText(outlineSubtreeText(sections, current.section.index, routeIndexes), Math.max(240, Math.floor(remaining * 0.6)))}`);
+    }
+    if (next) {
+      const left = remaining - byteLength(blocks.join("\n\n")) - 8;
+      if (left > 200) blocks.push(`【下一卷】\n${compactText(outlineSubtreeText(sections, next.section.index, routeIndexes), left)}`);
+    }
+    route = blocks.join("\n\n");
+    remaining -= byteLength(route) + 2;
+  }
+
+  const usable = sections.filter(section => section.body
+    && !endingOutlineHeading.test(section.heading)
+    && !metaOutlineHeading.test(section.heading)
+    && !routeIndexes.has(section.index));
+
+  // 当前节点：与本章资料词面最合的段落，正文里已经写出来的东西就在这一段
+  const current = usable
+    .map(section => ({
+      section,
+      score: (/主线|目标|总览|核心|当前/u.test(section.heading) ? 24 : 0) + bigramOverlap(`${section.heading}\n${section.body}`, text),
+    }))
+    .sort((left, right) => right.score - left.score || left.section.index - right.section.index)[0]?.section;
+  const currentText = current && remaining > 200 ? compactText(`${current.heading}\n${current.body}`, Math.max(160, Math.floor(remaining * 0.6))) : "";
+  if (currentText) remaining -= byteLength(currentText) + 2;
+
+  // 接下来必须推进：当前节点之后的第一段正文，本章的终点就落在这里
+  const next = usable.find(section => section.index > (current?.index ?? 0));
+  const nextText = next && remaining > 200 ? compactText(`${next.heading}\n${next.body}`, remaining) : "";
+
+  return [
+    skeleton,
+    route ? `推进路线（【当前卷】是本章的出发点，必须推进到本卷的下一步；【下一卷】只在卷末交接时用，不得提前兑现）：\n${route}` : "",
+    currentText ? `当前节点（本章的出发点）：\n${currentText}` : "",
+    nextText ? `接下来必须推进（本章的终点：正文推进到这里就收笔，允许用一到两段过渡跨越时间或地点；再后面的节点不得提前兑现）：\n${nextText}` : "",
+  ].filter(Boolean).join("\n\n");
 }
 
 /**
@@ -483,15 +581,36 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
   const header = position?.number
     ? `当前正在写第 ${position.number} 章${position.total ? `，全书已有 ${position.total} 章` : ""}。`
     : "";
+  // 中间大段章节没有记忆（导入的书、旧版本写的章节都可能没有）：
+  // 不显式说出来，模型会以为“前文就只有这几章”，然后凭空补写一段从未发生过的历史
+  const knownNumbers = ordered.map(memoryChapterNumber).filter((value): value is number => typeof value === "number");
+  const gaps = knownNumbers.slice(1)
+    .map((number, index) => [knownNumbers[index] + 1, number - 1] as const)
+    .filter(([from, to]) => to - from >= 2)
+    .sort((left, right) => (right[1] - right[0]) - (left[1] - left[0]));
+  const gapNote = knownNumbers.length > 0 && gaps.length > 0
+    ? `注意：第 ${gaps[0][0]}–${gaps[0][1]} 章没有章节记忆，这段剧情不在下面的清单里，只能以总纲、章纲和记忆文档为准，不得凭空补写这一段发生过什么。`
+    : "";
   const seen = new Set<string>();
   const foreshadowing = ordered
-    .flatMap(memory => compactForeshadowingItems(memory.foreshadowingItems, 8))
+    .flatMap(memory => {
+      const items = compactForeshadowingItems(memory.foreshadowingItems, 8);
+      if (items.length) return items;
+      // 结构化伏笔要模型额外填一个带 status 的字段，实际几乎总是空的（整个项目 12 章一条都没写）
+      // 退回到每章都有的伏笔文字，否则“未回收伏笔”永远为空，模型就永远不知道有线索要回收
+      const number = memoryChapterNumber(memory);
+      const changes = Array.isArray(memory.foreshadowingChanges) ? memory.foreshadowingChanges : [];
+      return changes.map(text => compactText(text, 150)).filter(Boolean)
+        // 启发式猜出来的伏笔经常是对话残句（以引号开头），列进账本只会干扰
+        .filter(text => text.length >= 6 && !/^["“”‘’]/u.test(text))
+        .map(text => `第 ${number || "?"} 章：${text}`);
+    })
     .filter(item => (seen.has(item) ? false : (seen.add(item), true)))
     .slice(-10);
   const foreshadowingBlock = foreshadowing.length
     ? `未回收伏笔（推进或回收它们，不要再埋同类线）：\n${foreshadowing.map(item => `- ${item}`).join("\n")}`
     : "";
-  let remaining = maxBytes - byteLength(header) - byteLength(foreshadowingBlock) - 80;
+  let remaining = maxBytes - byteLength(header) - byteLength(gapNote) - byteLength(foreshadowingBlock) - 80;
   const events: string[] = [];
   for (const memory of [...ordered].reverse()) {
     const summary = compactText(memory.summary || "", 220);
@@ -505,7 +624,7 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
     remaining -= byteLength(line) + 1;
   }
   const eventsBlock = events.length ? `已发生事件（一章一行，本章不得再写一遍）：\n${events.join("\n")}` : "";
-  return [header, eventsBlock, foreshadowingBlock].filter(Boolean).join("\n\n");
+  return [header, gapNote, eventsBlock, foreshadowingBlock].filter(Boolean).join("\n\n");
 }
 
 function compactSkills(skills: unknown, instruction: string, maxBytes: number): Array<{ name: string; displayName?: string; category: string; description: string; tags: string[]; content: string }> {
@@ -586,7 +705,7 @@ export function prepareChapterInput(input: {
   };
   const sourceBytes = byteLength(JSON.stringify(raw));
   const text = queryText(input.instruction, outlines, Array.isArray(input.memories) ? input.memories as Array<Record<string, unknown>> : [], cards);
-  const masterOutline = compactMasterOutline(masterOutlineSource, text, masterOutlineBytes);
+  const masterOutline = compactMasterOutline(masterOutlineSource, text, masterOutlineBytes, input.chapterPosition?.number);
   const storyLedger = buildStoryLedger(input.memories, input.chapterPosition, storyLedgerBytes);
   const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * weights.outline));
   const packedCards = compactCards(cards, text, Math.floor(budgetBytes * weights.cards));
@@ -594,10 +713,13 @@ export function prepareChapterInput(input: {
   const previousChapters = compactPreviousChapters(input.previousChapters, Math.floor(budgetBytes * weights.previousChapters));
   const knowledgeGraph = compactKnowledgeGraph(input.knowledgeGraph, text, Math.floor(budgetBytes * weights.knowledgeGraph));
   const skills = compactSkills(input.skills, input.instruction, Math.floor(budgetBytes * weights.skills));
+  // 记忆文档是逐章累计的（第 1 章在最前），所以留尾部而不是头尾都留：
+  // 头尾都留会把最老的几章当宝贝带进来，最新的反而被挤掉；额度也跟着窗口走
+  const memoryDocumentBytes = Math.max(1600, Math.min(4000, Math.floor(budgetBytes * 0.06)));
   const memoryDocuments = Array.isArray(input.memoryDocuments)
-    ? input.memoryDocuments.filter(item => item && typeof item === "object").slice(0, 4).map(item => {
+    ? input.memoryDocuments.filter(item => item && typeof item === "object").slice(0, 5).map(item => {
       const document = item as Record<string, unknown>;
-      return { kind: compactText(document.kind || "记忆文档", 80), title: compactText(document.title || "", 100), content: compactText(document.content || "", 900) };
+      return { kind: compactText(document.kind || "记忆文档", 80), title: compactText(document.title || "", 100), content: tailText(document.content || "", memoryDocumentBytes) };
     })
     : [];
   const sections = {

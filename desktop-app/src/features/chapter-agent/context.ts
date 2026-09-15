@@ -13,8 +13,8 @@ import { chapterBoundToOutline } from '../outline/model.ts';
  * - 前文只传紧邻上一章正文；更早的章节通过最近六章记忆和四份聚合文档进入
  */
 
-/** 进入运行时检索库的聚合文档：章节快照和角色认知/冲突由逐章记忆覆盖，不再重复传 */
-const contextDocumentKinds = new Set(['人物状态', '伏笔追踪', '时间线', '设定事实']);
+/** 进入运行时检索库的聚合文档：角色认知/冲突/章节快照靠逐章记忆覆盖，任务书只带这四份 */
+const contextDocumentKinds = new Set(['章节快照', '人物状态', '伏笔追踪', '时间线', '设定事实']);
 
 export interface ChapterWriteContextInput {
   project: Project;

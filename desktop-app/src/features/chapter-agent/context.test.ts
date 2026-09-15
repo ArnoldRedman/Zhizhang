@@ -48,12 +48,13 @@ test('章纲、总纲、世界观自动带入，其他章纲只在作者勾选�
   assert.deepEqual((context.params.cards as Array<{ id: number }>).map(item => item.id), [1]);
 });
 
-test('前文只传紧邻上一章，记忆只取本章之前的章并带章号，文档只传四种', () => {
+test('前文只传紧邻上一章，记忆只取本章之前的章并带章号，文档带进度基准与四份聚合文档', () => {
   const context = buildChapterWriteContext({ project: project(), chapter: chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
   assert.deepEqual((context.params.previousChapters as Array<{ id: number }>).map(item => item.id), [2]);
   assert.deepEqual((context.params.memories as Array<{ chapterNumber: number }>).map(item => item.chapterNumber), [1, 2]);
   assert.deepEqual((context.params.memories as Array<{ foreshadowingItems: unknown[] }>)[0].foreshadowingItems.length, 1);
-  assert.deepEqual((context.params.memoryDocuments as Array<{ kind: string }>).map(item => item.kind), ['人物状态', '伏笔追踪', '时间线', '设定事实']);
+  // 章节快照是作者手写的“进度基准”，逐章记忆缺失时它是唯一能说明全书走到哪儿的东西
+  assert.deepEqual((context.params.memoryDocuments as Array<{ kind: string }>).map(item => item.kind), ['章节快照', '人物状态', '伏笔追踪', '时间线', '设定事实']);
   const first = buildChapterWriteContext({ project: project(), chapter: chapters[0], instruction: '开书', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
   assert.deepEqual(first.params.previousChapters, []);
   assert.deepEqual(first.params.memories, []);
