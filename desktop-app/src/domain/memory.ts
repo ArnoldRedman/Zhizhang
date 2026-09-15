@@ -12,6 +12,63 @@ export const memoryTextList = (value: string) => value.split(/\r?\n|、/).map(it
 export const chapterOrder = (memory: ChapterMemory) => memory.sourceChapterNumber ?? memory.chapterId;
 export const memoryListMarkdown = (items: string[]) => items.length ? items.map(item => `- ${item}`).join('\n') : '- 暂无';
 
+/** 模型记忆提炼的返回字段（只取记忆相关部分，图谱和卡片变更走别的路） */
+export type MemoryExtractionResult = {
+  summary?: string;
+  keywords?: string[];
+  characterStateChanges?: string[];
+  knowledgeChanges?: string[];
+  foreshadowingChanges?: string[];
+  foreshadowingItems?: ChapterMemory['foreshadowingItems'];
+  timelineEvents?: string[];
+  canonFacts?: string[];
+  conflicts?: string[];
+  endingHook?: string;
+};
+
+/**
+ * 把模型返回的记忆字段合并成一条章节记忆
+ * 单章保存和批量补全共用这一份规则：分开写迟早会漂移，两边的记忆就会不一样
+ */
+export const buildChapterMemoryPatch = (options: {
+  result: MemoryExtractionResult;
+  local: ReturnType<typeof buildLocalStructuredMemory>;
+  /** 关键词优先用卡片标题，没有才回落本地启发式 */
+  keywords: string[];
+  existing?: ChapterMemory;
+}): Partial<ChapterMemory> => {
+  const { result, local, keywords, existing } = options;
+  const summary = result.summary?.trim() || local.summary;
+  const aiStructuredFieldCount = [
+    result.characterStateChanges,
+    result.knowledgeChanges,
+    result.foreshadowingChanges,
+    result.timelineEvents,
+    result.canonFacts,
+    result.conflicts,
+  ].filter(value => asTextList(value).length > 0).length + (result.endingHook?.trim() ? 1 : 0);
+  // 模型给出的是一整套成体系的判断，单独掺一两个本地启发式字段反而会让记忆变糊
+  const useCoherentAIResult = aiStructuredFieldCount >= 3;
+  const preferAIList = (value: unknown, fallback: string[], fallbackExisting: string[] | undefined) => {
+    const extracted = asTextList(value);
+    if (useCoherentAIResult) return extracted;
+    return extracted.length ? extracted : (fallback.length ? fallback : (fallbackExisting || []));
+  };
+  return {
+    summary,
+    keywords: Array.isArray(result.keywords) && result.keywords.length ? asTextList(result.keywords, 8) : keywords,
+    characterStateChanges: preferAIList(result.characterStateChanges, local.characterStateChanges, existing?.characterStateChanges),
+    knowledgeChanges: preferAIList(result.knowledgeChanges, local.knowledgeChanges, existing?.knowledgeChanges),
+    foreshadowingChanges: preferAIList(result.foreshadowingChanges, local.foreshadowingChanges, existing?.foreshadowingChanges),
+    // 结构化伏笔没返回时保留原值，别把已经记下的伏笔抹掉
+    foreshadowingItems: Array.isArray(result.foreshadowingItems) && result.foreshadowingItems.length ? result.foreshadowingItems : (existing?.foreshadowingItems || []),
+    timelineEvents: preferAIList(result.timelineEvents, local.timelineEvents, existing?.timelineEvents),
+    canonFacts: preferAIList(result.canonFacts, local.canonFacts, existing?.canonFacts),
+    conflicts: preferAIList(result.conflicts, local.conflicts, existing?.conflicts),
+    endingHook: typeof result.endingHook === 'string' && result.endingHook.trim() ? result.endingHook.trim() : (local.endingHook || existing?.endingHook || ''),
+  };
+};
+
 export const buildMemoryDocuments = (memories: ChapterMemory[], existingDocuments: MemoryDocument[] = [], force = false): MemoryDocument[] => {
   const ordered = [...memories].sort((left, right) => chapterOrder(left) - chapterOrder(right));
   const sections = (title: string, entries: Array<{ memory: ChapterMemory; items: string[] }>) => `# ${title}\n\n${entries.length
@@ -152,8 +209,9 @@ export const buildLocalStructuredMemory = (chapter: Chapter, project: Project) =
 /**
  * 目标章之前的最近几章记忆，按章序排好并带上章号
  * 故事账本靠它列出"已发生事件"；重写中间章时不能把后面章的记忆当前文
+ * 带多少由运行时的上下文预算决定，这里只给一个足够长的候选串
  */
-export const recentChapterMemories = (project: Project, beforeChapterNumber: number, limit = 6) => {
+export const recentChapterMemories = (project: Project, beforeChapterNumber: number, limit = 24) => {
   const ordinal = (memory: ChapterMemory) => {
     const index = project.chapters.findIndex(chapter => chapter.id === memory.chapterId);
     return index >= 0 ? index + 1 : (memory.sourceChapterNumber ?? 0);

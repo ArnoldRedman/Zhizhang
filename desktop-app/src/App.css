@@ -2415,6 +2415,22 @@ select.input {
   font-size: 12px;
 }
 .knowledge-rebuild-button:hover { border-color: var(--accent); background: var(--accent-2-bg); }
+/* 批量补章节记忆：进程内可能会跑很久，所以进度与停止按钮跟起始章号排在一起 */
+.knowledge-backfill { display: grid; gap: 8px; }
+.knowledge-backfill label { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 11px; }
+.knowledge-backfill input {
+  width: 64px;
+  min-height: 28px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11px;
+}
+.knowledge-backfill-actions { display: flex; align-items: center; gap: 8px; }
+.knowledge-backfill-progress { color: var(--text-4); font-size: 11px; }
 .memory-kind-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .memory-kind-button {
   min-width: 0;

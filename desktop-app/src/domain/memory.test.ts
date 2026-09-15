@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { asTextList, buildLocalStructuredMemory, buildMemoryDocuments, hydrateMemoryDocuments, memoryDocumentKinds, memoryTextList, normalizeChapterMemory, recentChapterMemories } from './memory.ts';
+import { asTextList, buildChapterMemoryPatch, buildLocalStructuredMemory, buildMemoryDocuments, hydrateMemoryDocuments, memoryDocumentKinds, memoryTextList, normalizeChapterMemory, recentChapterMemories } from './memory.ts';
 import type { Chapter, ChapterMemory, Project } from './project.ts';
 
 const now = '2026-01-01T00:00:00.000Z';
@@ -96,11 +96,44 @@ test('buildLocalStructuredMemory 从正文里按人物名提取状态，并把�
   assert.ok(result.summary.length > 0);
 });
 
+// 单章保存与批量补全共用这一份合并规则：分开写就会两边不一样
+// （规则本身是从 App.tsx 的保存流程里抽出来的，行为必须一致）
+test('buildChapterMemoryPatch 用成体系的模型结果覆盖启发式，不完整时回落到启发式与原值', () => {
+  const local = buildLocalStructuredMemory(chapter(1, '沈砚守在阁楼。随后电台亮起。沈砚得知母亲留下过录音。'), project());
+  // 模型给出三个以上字段：整份当成一套判断采用，宁可空着也不用启发式凑
+  const coherent = buildChapterMemoryPatch({
+    result: { characterStateChanges: ['沈砚：戒备'], knowledgeChanges: ['沈砚：得知录音'], timelineEvents: ['当晚电台亮起'] },
+    local,
+    keywords: ['旧电台'],
+    existing: memory(1),
+  });
+  assert.deepEqual(coherent.foreshadowingChanges, []);
+  assert.deepEqual(coherent.conflicts, []);
+  assert.equal(coherent.summary, local.summary);
+  assert.deepEqual(coherent.keywords, ['旧电台']);
+  // 模型只给一两个字段（或整个失败）：逐字段回落启发式，再回落已有值
+  const partial = buildChapterMemoryPatch({ result: {}, local, keywords: [], existing: memory(1) });
+  assert.ok((partial.characterStateChanges || []).length > 0);
+  assert.equal(partial.endingHook, local.endingHook);
+  // 结构化伏笔没返回时保留已有的，不能抹掉
+  const kept = buildChapterMemoryPatch({
+    result: { summary: '新摘要' },
+    local,
+    keywords: [],
+    existing: { ...memory(1), foreshadowingItems: [{ text: '钥匙能开地下室', status: 'active', priority: 'normal' }] },
+  });
+  assert.equal(kept.foreshadowingItems?.length, 1);
+  assert.equal(kept.summary, '新摘要');
+});
+
 test('recentChapterMemories 只取目标章之前的记忆，按目录顺序排并限制条数', () => {
   const chapters = [1, 2, 3, 4, 5, 6, 7, 8, 9].map(id => chapter(id));
   const memories = [9, 3, 7, 1, 8, 5, 2, 6, 4].map(id => memory(id));
-  const result = recentChapterMemories(project({ chapters, memories }), 8);
+  const result = recentChapterMemories(project({ chapters, memories }), 8, 6);
   assert.deepEqual(result.map(item => item.chapterNumber), [2, 3, 4, 5, 6, 7]);
+  // 默认不再卡 6 章：候选给足够长，能带几章由运行时的上下文预算决定
+  const wide = recentChapterMemories(project({ chapters, memories }), 8);
+  assert.deepEqual(wide.map(item => item.chapterNumber), [1, 2, 3, 4, 5, 6, 7]);
   // 章节已不在目录里时退回记忆自带的章号；没有任何章号的记忆不进账本
   const orphan = recentChapterMemories(project({ chapters: [], memories: [memory(99, { sourceChapterNumber: 2 }), memory(98)] }), 5);
   assert.deepEqual(orphan.map(item => item.chapterNumber), [2]);

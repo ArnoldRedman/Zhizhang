@@ -6,9 +6,11 @@ import { partsFromBreaks, splitParagraphs, type AgentProgressEvent, type Runtime
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
-import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
+import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
-import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, recentChapterMemories } from './domain/memory';
+import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories } from './domain/memory';
+import { cardSearchTerms, refreshCardStatesForProject } from './domain/cards';
+import { mergeKnowledgeGraph } from './domain/graph-merge';
 import { chapterNumberFromText, outlineByChapterNumber, resolveOutlineGenerationIntent } from './features/outline/model';
 import { boundChapterOutlineFor, buildChapterWriteContext } from './features/chapter-agent/context';
 import { buildAIDetectionReport } from './domain/ai-detection';
@@ -931,6 +933,28 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
   };
 };
 
+/**
+ * 智能体会话 id
+ * 会话默认就该是"一直复用"：同一段对话跨章节、跨重启都接着用，写得好时上下文不会断
+ * id 存 localStorage 就是为此；不存的话每次重启应用都换新 id，磁盘上的会话文件再也读不到
+ */
+const sessionStorageKey = (kind: string) => `zhizhang.${kind}-session-id`;
+const createSessionId = (kind: string) => `${kind}-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+/** 读回上次的会话；只认自己写过的格式，脏数据（旧版本、手改、同步过来的值）一律当没有 */
+const loadSessionId = (kind: string) => {
+  const stored = localStorage.getItem(sessionStorageKey(kind));
+  if (stored && stored.startsWith(`${kind}-session-`)) return stored;
+  const created = createSessionId(kind);
+  localStorage.setItem(sessionStorageKey(kind), created);
+  return created;
+};
+/** 开新对话：换一个 id，旧会话不再参与（小说资料不受影响） */
+const rotateSessionId = (kind: string) => {
+  const created = createSessionId(kind);
+  localStorage.setItem(sessionStorageKey(kind), created);
+  return created;
+};
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabType>('projects');
   const [projects, setProjects] = useState<Project[]>(() => {
@@ -1194,13 +1218,13 @@ function App() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [showProjectAgent, projectAgentMessageCount, projectAgentChangeCount, projectAgentRunning, projectAgentProgress, projectAgentActivity]);
-  const [chapterSessionId, setChapterSessionId] = useState(() => `chapter-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-  const [outlineSessionId, setOutlineSessionId] = useState(() => `outline-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-  const [cardSessionId, setCardSessionId] = useState(() => `card-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-  const [chapterPreviousSessionId, setChapterPreviousSessionId] = useState('');
-  const [outlinePreviousSessionId, setOutlinePreviousSessionId] = useState('');
-  const [cardPreviousSessionId, setCardPreviousSessionId] = useState('');
-  const newAgentSessionId = (kind: string) => `${kind}-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const [chapterSessionId, setChapterSessionId] = useState(() => loadSessionId('chapter'));
+  /** 批量补全章节记忆：起始章号 + 进行中的进度（null 表示没在跑） */
+  const [memoryBackfillFrom, setMemoryBackfillFrom] = useState(1);
+  const [memoryBackfillProgress, setMemoryBackfillProgress] = useState<{ done: number; total: number } | null>(null);
+  const memoryBackfillAbortRef = useRef(false);
+  const [outlineSessionId, setOutlineSessionId] = useState(() => loadSessionId('outline'));
+  const [cardSessionId, setCardSessionId] = useState(() => loadSessionId('card'));
   const [outlineStreamContent, setOutlineStreamContent] = useState('');
   const [outlineAgentActivity, setOutlineAgentActivity] = useState<Array<{ id: string; step: string; message: string; status: 'active' | 'complete' | 'error'; source?: string }>>([]);
   const [cardStreamContent, setCardStreamContent] = useState('');
@@ -3596,101 +3620,6 @@ function App() {
     setNotice({ title: '章节目标已更新', content: `当前章节目标设为 ${target} 字，续写上限为 ${Math.floor(target * 1.2)} 字。` });
   };
 
-  const cardSearchTerms = (card: KnowledgeCard) => {
-    const generic = new Set([
-      '角色', '角色卡', '人物', '人物卡', '物品', '物品卡', '地点', '地点卡', '势力', '势力卡',
-      '金手指', '金手指卡', '手指', '身份', '性格', '目标', '能力', '天赋', '关系', '当前状态',
-      '详细信息', '暂无', '设定', '限制', '代价', '升级路径', '触发条件', '核心能力',
-    ]);
-    const primaryTerms: string[] = [];
-    const secondaryTerms = new Set<string>();
-    const addPrimary = (value: string) => {
-      const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').replace(/[“”"']/gu, '').trim();
-      if (normalized.length >= 2 && normalized.length <= 24 && !generic.has(normalized) && !primaryTerms.includes(normalized)) primaryTerms.push(normalized);
-    };
-    const addSecondary = (value: string) => {
-      const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').trim();
-      if (normalized.length >= 2 && normalized.length <= 12 && !generic.has(normalized) && !primaryTerms.includes(normalized)) secondaryTerms.add(normalized);
-    };
-    if (!generic.has(card.title.trim())) addPrimary(card.title);
-    const canonicalTitle = card.title.replace(/^(主角|角色|人物|本命|关键|核心)/u, '').trim();
-    if (!generic.has(canonicalTitle)) addPrimary(canonicalTitle);
-    if (!generic.has(canonicalTitle) && /^[\u3400-\u9fff]{3,}$/u.test(canonicalTitle)) {
-      addPrimary(canonicalTitle.slice(-2));
-      if (canonicalTitle.length > 3) addPrimary(canonicalTitle.slice(-3));
-    }
-    const identityPattern = /^\s*(?:[-*]\s*)?(?:姓名|名称|本名|别名|称号|代号|简称|天赋名称|能力名称)\s*[：:]\s*(.+)$/gmu;
-    for (const match of card.content.matchAll(identityPattern)) {
-      for (const value of match[1].split(/[、,，;；/]/u)) addPrimary(value.replace(/[（(].*$/u, '').trim());
-    }
-    const abilityHeadingPattern = /^\s*#{2,6}\s*(?:[^\n：:]{0,24}[：:])\s*([^\n]+)$/gmu;
-    for (const match of card.content.matchAll(abilityHeadingPattern)) {
-      for (const value of match[1].split(/[、,，;；/]/u)) addPrimary(value.replace(/[（(].*$/u, '').trim());
-    }
-    for (const segment of `${card.title}\n${card.content}`.match(/[\u3400-\u9fff]{2,10}|[A-Za-z][A-Za-z0-9_-]{1,24}/g) || []) {
-      addSecondary(segment);
-    }
-    return [...primaryTerms, ...[...secondaryTerms].sort((left, right) => right.length - left.length)].slice(0, 40);
-  };
-
-  const findCardRecentMentions = (project: Project, card: KnowledgeCard, limit = 3) => {
-    const terms = cardSearchTerms(card);
-    const mentions: Array<{ chapter: Chapter; matchedTerm: string; snippet: string; position: number }> = [];
-    for (const chapter of [...project.chapters].reverse()) {
-      const positions = terms.flatMap(term => {
-        const found: Array<{ term: string; position: number }> = [];
-        let position = chapter.content.indexOf(term);
-        while (position >= 0 && found.length < 8) {
-          found.push({ term, position });
-          position = chapter.content.indexOf(term, position + term.length);
-        }
-        return found;
-      }).sort((left, right) => right.position - left.position);
-      for (const match of positions.slice(0, limit)) {
-        const { position, term: matchedTerm } = match;
-        const start = Math.max(0, position - 70);
-        const end = Math.min(chapter.content.length, position + matchedTerm.length + 150);
-        mentions.push({ chapter, matchedTerm, position, snippet: chapter.content.slice(start, end).replace(/\s+/gu, ' ').trim() });
-      }
-    }
-    return mentions.slice(0, limit);
-  };
-
-  const refreshCardStatesForProject = (project: Project, cardIds?: Set<number>) => {
-    const now = new Date().toISOString();
-    const targetCards = cardIds ? project.cards.filter(card => cardIds.has(card.id)) : project.cards;
-    if (!targetCards.length) return project;
-    const graphNodes = [...project.graphNodes];
-    const graphEdges = [...project.graphEdges];
-    project.cards.forEach(card => {
-      if (!graphNodes.some(node => node.id === `card:${card.id}`)) {
-        graphNodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type });
-      }
-    });
-    const cards = project.cards.map(card => {
-      if (!targetCards.some(target => target.id === card.id)) return card;
-      const recentMentions = findCardRecentMentions(project, card, 3);
-      const mention = recentMentions[0] ?? null;
-      const status = mention ? '最近出现' : '未在正文中定位';
-      const changes = mention
-        ? recentMentions.map(item => `第 ${project.chapters.findIndex(chapter => chapter.id === item.chapter.id) + 1} 章《${item.chapter.title}》出现“${item.matchedTerm}”：${item.snippet}`).join('\n')
-        : '当前全文未检索到可定位的卡片名称或关键词。';
-      const lastEntry = card.stateHistory?.[card.stateHistory.length - 1];
-      const stateHistory = lastEntry?.changes === changes ? (card.stateHistory || []) : [
-        ...(card.stateHistory || []),
-        { chapterId: mention?.chapter.id ?? 0, chapterTitle: mention?.chapter.title ?? '全文检索', status, changes, updatedAt: now },
-      ].slice(-30);
-      for (const item of recentMentions) {
-        const chapterNodeId = `chapter:${item.chapter.id}`;
-        if (!graphNodes.some(node => node.id === chapterNodeId)) graphNodes.push({ id: chapterNodeId, label: item.chapter.title, type: 'chapter' });
-        const edgeId = `${chapterNodeId}->card:${card.id}:状态引用`;
-        upsertKnowledgeGraphEdge(graphEdges, { id: edgeId, source: chapterNodeId, target: `card:${card.id}`, label: '状态引用', weight: 0.88, updatedAt: now });
-      }
-      return { ...card, currentState: changes, stateHistory, updatedAt: now };
-    });
-    return { ...project, cards, graphNodes, graphEdges, updatedAt: now };
-  };
-
   const updateCardStatesFromBook = async (cardId?: number) => {
     if (!editingProject) return;
     let searchProject = editingProject;
@@ -3786,63 +3715,6 @@ function App() {
   };
 
   // 将章节记忆 Agent 抽取的实体和关系增量合并到本地知识图谱。
-  const mergeKnowledgeGraph = (project: Project, chapter: Chapter, result: AgentMemoryResult): Project => {
-    const chapterNodeId = `chapter:${chapter.id}`;
-    const nodes = [...project.graphNodes];
-    const edges = normalizeKnowledgeGraphEdges(project.graphEdges);
-    const now = new Date().toISOString();
-    let cards = project.cards;
-    const findNodeId = (label: string) => nodes.find(node => node.label === label)?.id
-      || project.cards.find(card => cardSearchTerms(card).includes(label))?.id.toString().replace(/^/, 'card:');
-    const ensureEntity = (label: string, category = '实体') => {
-      const normalized = label.trim().slice(0, 80);
-      if (!normalized) return null;
-      const existingId = findNodeId(normalized);
-      if (existingId) return existingId;
-      const id = `entity:${normalized}`;
-      nodes.push({ id, label: normalized, type: 'entity', category, content: createGraphNodeProfile('entity', category), updatedAt: new Date().toISOString() });
-      return id;
-    };
-    const chapterNode = nodes.find(node => node.id === chapterNodeId);
-    if (!chapterNode && chapter.content.trim()) nodes.push({ id: chapterNodeId, label: chapter.title, type: 'chapter', content: createGraphNodeProfile('chapter'), updatedAt: now });
-    project.cards.forEach(card => {
-      if (!nodes.some(node => node.id === `card:${card.id}`)) nodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type, content: createGraphNodeProfile('card', card.type), updatedAt: now });
-    });
-    project.outlines.forEach(outline => {
-      if (!nodes.some(node => node.id === `outline:${outline.id}`)) nodes.push({ id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: outline.kind, content: createGraphNodeProfile('outline', outline.kind), updatedAt: now });
-    });
-    for (const entity of result.entities || []) {
-      const id = ensureEntity(String(entity.name || ''), String(entity.type || '实体'));
-      if (!id) continue;
-      const edgeId = `${chapterNodeId}->${id}`;
-      upsertKnowledgeGraphEdge(edges, { id: edgeId, source: chapterNodeId, target: id, label: '章节提及', weight: 0.7, sourceChapterId: chapter.id, updatedAt: now });
-    }
-    for (const relation of result.relations || []) {
-      const sourceLabel = String(relation.source || '').trim();
-      const targetLabel = String(relation.target || '').trim();
-      if (!sourceLabel || !targetLabel) continue;
-      const source = findNodeId(sourceLabel) || ensureEntity(sourceLabel);
-      const target = findNodeId(targetLabel) || ensureEntity(targetLabel);
-      if (!source || !target || source === target) continue;
-      const label = String(relation.label || '关联').trim().slice(0, 40) || '关联';
-      const edgeId = `${source}->${target}:${label}`;
-      upsertKnowledgeGraphEdge(edges, { id: edgeId, source, target, label, weight: normalizeKnowledgeGraphWeight(relation.weight, label), sourceChapterId: chapter.id, updatedAt: now });
-    }
-    for (const update of result.cardUpdates || []) {
-      const card = cards.find(item => (update.cardId !== undefined && String(item.id) === String(update.cardId)) || (update.cardTitle && item.title === update.cardTitle));
-      const changes = String(update.changes || '').trim();
-      if (!card || !changes) continue;
-      const status = String(update.status || 'updated').trim();
-      const lastEntry = card.stateHistory?.[card.stateHistory.length - 1];
-      const stateHistory = lastEntry?.changes === changes ? (card.stateHistory || []) : [...(card.stateHistory || []), { chapterId: chapter.id, chapterTitle: chapter.title, status, changes, updatedAt: now }].slice(-30);
-      cards = cards.map(item => item.id === card.id ? { ...item, currentState: changes, stateHistory, updatedAt: now } : item);
-      const cardNodeId = `card:${card.id}`;
-      const edgeId = `${chapterNodeId}->${cardNodeId}:状态更新`;
-      upsertKnowledgeGraphEdge(edges, { id: edgeId, source: chapterNodeId, target: cardNodeId, label: '状态更新', weight: 0.95, sourceChapterId: chapter.id, updatedAt: now });
-    }
-    return { ...project, cards, graphNodes: nodes, graphEdges: edges, updatedAt: now };
-  };
-
   const persistCurrentChapter = async () => {
     if (!editingProject || !activeChapter || chapterSaving) return;
     setChapterSaving(true);
@@ -3918,37 +3790,12 @@ function App() {
             knowledgeGraph: { nodes: localProject.graphNodes, edges: localProject.graphEdges },
             ...agentNetworkParams(agentConfig),
           });
-        const summary = result.summary?.trim() || localStructuredMemory.summary;
-        const aiKeywords = Array.isArray(result.keywords) && result.keywords.length ? asTextList(result.keywords, 8) : keywords;
-        const aiStructuredFieldCount = [
-          result.characterStateChanges,
-          result.knowledgeChanges,
-          result.foreshadowingChanges,
-          result.timelineEvents,
-          result.canonFacts,
-          result.conflicts,
-        ].filter(value => asTextList(value).length > 0).length + (result.endingHook?.trim() ? 1 : 0);
-        // A complete model response is used as one coherent classification.
-        // Mixing individual local heuristic fields into it made iOS memories
-        // noticeably less precise than desktop memories.
-        const useCoherentAIResult = aiStructuredFieldCount >= 3;
-        const preferAIList = (value: unknown, fallback: string[], existing: string[] | undefined) => {
-          const extracted = asTextList(value);
-          if (useCoherentAIResult) return extracted;
-          return extracted.length ? extracted : (fallback.length ? fallback : (existing || []));
-        };
-        const memoryPatch = {
-          summary,
-          keywords: aiKeywords,
-          characterStateChanges: preferAIList(result.characterStateChanges, localStructuredMemory.characterStateChanges, currentMemory?.characterStateChanges),
-          knowledgeChanges: preferAIList(result.knowledgeChanges, localStructuredMemory.knowledgeChanges, currentMemory?.knowledgeChanges),
-          foreshadowingChanges: preferAIList(result.foreshadowingChanges, localStructuredMemory.foreshadowingChanges, currentMemory?.foreshadowingChanges),
-          foreshadowingItems: Array.isArray(result.foreshadowingItems) ? result.foreshadowingItems : [],
-          timelineEvents: preferAIList(result.timelineEvents, localStructuredMemory.timelineEvents, currentMemory?.timelineEvents),
-          canonFacts: preferAIList(result.canonFacts, localStructuredMemory.canonFacts, currentMemory?.canonFacts),
-          conflicts: preferAIList(result.conflicts, localStructuredMemory.conflicts, currentMemory?.conflicts),
-          endingHook: typeof result.endingHook === 'string' && result.endingHook.trim() ? result.endingHook.trim() : (localStructuredMemory.endingHook || currentMemory?.endingHook || ''),
-        };
+        const memoryPatch = buildChapterMemoryPatch({
+          result,
+          local: localStructuredMemory,
+          keywords,
+          existing: currentMemory,
+        });
         // 如果用户在等待期间又编辑了本章，丢弃过期摘要，避免覆盖新正文。
         setProjects(currentProjects => {
           const latestProject = currentProjects.find(project => project.id === localProject.id);
@@ -3983,7 +3830,9 @@ function App() {
           setNotice({ title: '章节已保存', content: '正文和本地章节记忆已更新；API 中转额度已用尽，本章智能摘要会在额度恢复后再更新。' });
           return;
         }
-        setNotice({ title: '章节已保存', content: `本章记忆暂未更新：${String(error)}。正文和本地快照不受影响。` });
+        // 标成“本章记忆未更新”而不是“章节已保存”：记忆提炼失败会让这本书的伏笔/时间线永远停住，
+        // 混在一句“已保存”里作者根本注意不到（实测某本书就是这样丢了 170 章的记忆）
+        setNotice({ title: '本章记忆未更新', content: `${String(error)}。正文和本地快照不受影响；可以稍后在知识面板里从本章补全记忆。` });
       }
     })();
   };
@@ -4210,7 +4059,6 @@ function App() {
     const result = await agentRpc<{ content?: string; title?: string }>('outline.write', {
         runId,
         sessionId: outlineSessionId,
-        previousSessionId: outlinePreviousSessionId,
         outlineId: targetOutline.id,
         projectId: String(project.id),
         projectTitle: project.title,
@@ -4375,7 +4223,6 @@ function App() {
       const result = await agentRpc<{ title?: string; content?: string }>('card.write', {
           runId,
           sessionId: cardSessionId,
-          previousSessionId: cardPreviousSessionId,
           projectTitle: editingProject.title,
           synopsis: editingProject.synopsis,
           cardType: cardDraft.type,
@@ -4529,7 +4376,6 @@ function App() {
       const result = await agentRpc<AgentDraftResult>('chapter.write', {
           runId,
           sessionId: chapterSessionId,
-          previousSessionId: chapterPreviousSessionId,
           ...chapterContext.params,
           apiKey: agentConfig.apiKey.trim(),
           baseURL: agentConfig.baseURL.trim(),
@@ -5493,6 +5339,82 @@ function App() {
     setNotice({ title: '记忆已重新整理', content: '已按正文回填空的认知、伏笔和冲突，并重建全部记忆文档。' });
   };
 
+  /**
+   * 批量补全章节记忆
+   * 导入的书、旧版本写的章节往往一条记忆都没有，而章节智能体的“前文”就靠这些记忆；
+   * 缺一段就断一段（实测某本书 175 章只剩 6 条记忆），所以给一个从指定章往后补齐的入口
+   */
+  const runMemoryBackfill = async () => {
+    const project = editingProjectRef.current;
+    if (!project) return;
+    if (!agentConfig.apiKey.trim()) {
+      setNotice({ title: '无法补全记忆', content: '请先在设置里填写模型 API Key。' });
+      return;
+    }
+    const total = project.chapters.length;
+    const from = Math.min(Math.max(1, Math.round(memoryBackfillFrom) || 1), total);
+    // 只有兜底记忆的章也算待补：摘要就是正文开头、结构化字段全空，等于没提炼过
+    const hasRealMemory = new Set(project.memories
+      .filter(memory => (memory.summary || '').trim()
+        && [memory.characterStateChanges, memory.knowledgeChanges, memory.foreshadowingChanges, memory.timelineEvents, memory.canonFacts, memory.conflicts]
+          .some(list => (list || []).length > 0))
+      .map(memory => memory.chapterId));
+    const targets = project.chapters
+      .map((chapter, index) => ({ chapter, number: index + 1 }))
+      .filter(({ chapter, number }) => number >= from && !hasRealMemory.has(chapter.id));
+    if (!targets.length) {
+      setNotice({ title: '无需补全', content: `第 ${from} 章之后没有缺记忆的章节。` });
+      return;
+    }
+    memoryBackfillAbortRef.current = false;
+    setMemoryBackfillProgress({ done: 0, total: targets.length });
+    setNotice({ title: '开始补全章节记忆', content: `共 ${targets.length} 章，逐章调用记忆提炼；随时可以点“停止”，已完成的章节会保留。` });
+    let working = project;
+    const failures: string[] = [];
+    for (const [index, { chapter, number }] of targets.entries()) {
+      if (memoryBackfillAbortRef.current) break;
+      setMemoryBackfillProgress({ done: index, total: targets.length });
+      try {
+        const result = await agentRpc<AgentMemoryResult>('memory.write', {
+          projectTitle: working.title,
+          chapterTitle: chapter.title,
+          content: chapter.content,
+          cards: working.cards.filter(card => card.title.trim() && chapter.content.includes(card.title)).slice(0, 10),
+          apiKey: agentConfig.apiKey.trim(),
+          baseURL: agentConfig.baseURL.trim(),
+          model: agentConfig.model.trim() || fallbackModels[0],
+          apiMode: agentConfig.apiMode,
+          reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow,
+          knowledgeGraph: { nodes: working.graphNodes, edges: working.graphEdges },
+          ...agentNetworkParams(agentConfig),
+        });
+        const local = buildLocalStructuredMemory(chapter, working);
+        const selectedKeywords = working.cards.filter(card => chapter.content.includes(card.title) && card.title.trim()).map(card => card.title);
+        working = buildProjectWithChapterMemory(working, chapter, buildChapterMemoryPatch({
+          result,
+          local,
+          keywords: selectedKeywords.length ? selectedKeywords : local.keywords,
+          existing: working.memories.find(memory => memory.chapterId === chapter.id),
+        }));
+        // 每五章落一次盘：中途关掉应用不至于把已补的全丢
+        if (index % 5 === 4) await applyProjectChange(working);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failures.push(`第 ${number} 章：${message}`);
+        // 额度用尽就别再往下撞了，后一章只会得到同样的错
+        if (isQuotaExceededError(error)) break;
+      }
+    }
+    const finished = { ...working, memoryDocuments: buildMemoryDocuments(working.memories, working.memoryDocuments) };
+    await applyProjectChange(finished);
+    setMemoryBackfillProgress(null);
+    setNotice({
+      title: '章节记忆补全结束',
+      content: `已补 ${targets.length - failures.length} 章${failures.length ? `，${failures.length} 章失败：${failures.slice(0, 3).join('；')}` : ''}。`,
+    });
+  };
+
   const activeOutline = editingProject?.outlines.find(outline => outline.id === activeOutlineId) ?? null;
   const outlineIntentPreview = editingProject && activeOutline?.kind === '章纲'
     ? resolveOutlineGenerationIntent(editingProject, activeOutline, outlineAgentInstruction)
@@ -6088,6 +6010,31 @@ function App() {
                   <div className="knowledge-toolbar">
                     <button className="knowledge-rebuild-button" onClick={rebuildMemoryDocuments}>重新整理记忆</button>
                   </div>
+                  {/* 导入的书、旧版本写的章节没有章节记忆，而章节智能体的“前文”就靠这些记忆 */}
+                  <div className="knowledge-backfill">
+                    <label>
+                      从第
+                      <input
+                        type="number"
+                        min={1}
+                        max={editingProject.chapters.length}
+                        value={memoryBackfillFrom}
+                        disabled={memoryBackfillProgress !== null}
+                        onChange={event => setMemoryBackfillFrom(Number(event.target.value) || 1)}
+                      />
+                      章开始补章节记忆（只补没有记忆的章）
+                    </label>
+                    <div className="knowledge-backfill-actions">
+                      {memoryBackfillProgress ? (
+                        <>
+                          <span className="knowledge-backfill-progress">补全中 {memoryBackfillProgress.done}/{memoryBackfillProgress.total}</span>
+                          <button className="knowledge-rebuild-button" onClick={() => { memoryBackfillAbortRef.current = true; }}>停止</button>
+                        </>
+                      ) : (
+                        <button className="knowledge-rebuild-button" onClick={runMemoryBackfill}>开始补全</button>
+                      )}
+                    </div>
+                  </div>
                   <div className="memory-kind-list">
                     {memoryDocumentKinds.map(kind => {
                       const document = editingProject.memoryDocuments.find(item => item.kind === kind);
@@ -6526,7 +6473,7 @@ function App() {
               {outlineMode ? (
                 <div className="agent-panel-scroll outline-agent-panel">
                   <section className="agent-task-section">
-                    <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className="link-button" onClick={() => { setOutlinePreviousSessionId(outlineSessionId); setOutlineSessionId(newAgentSessionId('outline')); setOutlineChatMessages([]); outlineStreamRawRef.current = ''; setOutlineStreamContent(''); }}>新建会话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className="link-button" onClick={() => { setOutlineSessionId(rotateSessionId('outline')); setOutlineChatMessages([]); outlineStreamRawRef.current = ''; setOutlineStreamContent(''); setNotice({ title: '已开启新对话', content: '大纲创作不再带之前的会话记忆；已保存的大纲内容不受影响。' }); }} title="开启新对话：不再使用之前的会话上下文（小说资料不受影响）">新对话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={outlineAgentInstruction} onChange={event => setOutlineAgentInstruction(event.target.value)} placeholder="描述要补全的结构、节奏、冲突和章节安排" />
                     {outlineIntentPreview && <div className={`outline-intent-preview ${outlineIntentPreview.sourceChapter || outlineIntentPreview.isFirstChapter ? '' : 'warning'}`}>
                       <strong>意图识别</strong>
@@ -6548,7 +6495,7 @@ function App() {
               ) : cardMode ? (
                 <div className="agent-panel-scroll card-agent-panel">
                   <section className="agent-task-section">
-                    <div className="agent-instruction-heading"><label>卡片创建指令</label><button type="button" className="link-button" onClick={() => { setCardPreviousSessionId(cardSessionId); setCardSessionId(newAgentSessionId('card')); setCardChatMessages([]); cardStreamRawRef.current = ''; setCardStreamContent(''); }}>新建会话</button><button type="button" className="agent-skill-button" onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <div className="agent-instruction-heading"><label>卡片创建指令</label><button type="button" className="link-button" onClick={() => { setCardSessionId(rotateSessionId('card')); setCardChatMessages([]); cardStreamRawRef.current = ''; setCardStreamContent(''); setNotice({ title: '已开启新对话', content: '卡片创建不再带之前的会话记忆；已保存的卡片内容不受影响。' }); }} title="开启新对话：不再使用之前的会话上下文（小说资料不受影响）">新对话</button><button type="button" className="agent-skill-button" onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={cardAgentInstruction} onChange={event => setCardAgentInstruction(event.target.value)} placeholder="描述要补充的身份、能力、关系、限制或状态变化" />
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择卡片技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
                     <div className="card-agent-context"><span>当前卡片</span><strong>{activeCard?.title || cardDraft.title || '新建卡片'}</strong><small>{cardDraft.type} · {countNovelCharacters(cardDraft.content)} 字</small></div>
@@ -6572,7 +6519,7 @@ function App() {
               ) : (
               <div className="agent-panel-scroll">
                 <section className="agent-task-section">
-                  <div className="agent-instruction-heading"><label>创作指令</label><button type="button" className="link-button" onClick={() => { setChapterPreviousSessionId(chapterSessionId); setChapterSessionId(newAgentSessionId('chapter')); setAgentDraft(null); setAgentDisplayContent(''); setAgentProgress([]); }}>新建会话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                  <div className="agent-instruction-heading"><label>创作指令</label><button type="button" className="link-button" onClick={() => { setChapterSessionId(rotateSessionId('chapter')); setAgentDraft(null); setAgentDisplayContent(''); setAgentProgress([]); setNotice({ title: '已清空对话记忆', content: '下一章起不再带之前的会话上下文（上一轮生成留下的计划与摘要）；总纲、故事账本、章节记忆不受影响。' }); }} title="清空对话记忆：不再使用之前的会话上下文（总纲、故事账本、章节记忆不受影响）">清空对话记忆</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                   <textarea value={agentInstruction} onChange={(event) => setAgentInstruction(event.target.value)} />
                   {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择本次写作技能">
                     <div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div>
