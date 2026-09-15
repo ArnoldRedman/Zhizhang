@@ -219,6 +219,45 @@ describe("model client configuration", () => {
     expect(requestBody).not.toHaveProperty("reasoning");
   });
 
+  // 症状：作者把推理强度设成 high，但模型名不在白名单里（如 deepseek/*），运行时不发 reasoning_effort
+  // 也不给思考留额度，模型把 max_tokens 全花在思考上、正文返回空，只报“输出被截断”
+  it("给推理强度非 auto 的模型预留思考额度，即使模型名不在白名单里", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ model: "deepseek/deepseek-flash", choices: [{ message: { content: "{}" } }] }), { status: 200 }));
+
+    const client = new ModelApiClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "deepseek/deepseek-flash", reasoningMode: "high" });
+    await client.chat([{ role: "user", content: "请输出 JSON" }], { max_tokens: 1300, response_format: { type: "json_object" } });
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
+    expect(Number(body.max_tokens)).toBe(1300 + 12000);
+  });
+
+  it("auto 推理强度且模型名未知时不改调用方的 max_tokens", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ model: "some/plain", choices: [{ message: { content: "{}" } }] }), { status: 200 }));
+
+    await new ModelApiClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "some/plain", reasoningMode: "auto" })
+      .chat([{ role: "user", content: "请输出 JSON" }], { max_tokens: 1300 });
+    expect((JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>).max_tokens).toBe(1300);
+  });
+
+  it("看到过 reasoningTokens 的模型，下一次请求也会预留思考额度", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        model: "some/reasoner",
+        choices: [{ message: { content: "{}" } }],
+        usage: { completion_tokens: 900, completion_tokens_details: { reasoning_tokens: 880 } },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ model: "some/reasoner", choices: [{ message: { content: "{}" } }] }), { status: 200 }));
+
+    const client = new ModelApiClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "some/reasoner", reasoningMode: "auto" });
+    await client.chat([{ role: "user", content: "第一次" }], { max_tokens: 1000 });
+    await client.chat([{ role: "user", content: "第二次" }], { max_tokens: 1000 });
+    const first = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
+    const second = JSON.parse(String(fetchMock.mock.calls[1][1]?.body)) as Record<string, unknown>;
+    expect(first.max_tokens).toBe(1000);
+    expect(Number(second.max_tokens)).toBeGreaterThan(1000);
+  });
+
   it("extracts text from OpenAI-compatible content blocks and legacy text choices", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({ model: "gpt-test", choices: [{ message: { content: [{ type: "text", text: "第一段" }, { text: "第二段" }] } }] }), { status: 200 }))

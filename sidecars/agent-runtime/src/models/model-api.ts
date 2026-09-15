@@ -71,6 +71,26 @@ function normalizeAnthropicRoot(value?: string): string {
 // saturates at "high". Anthropic instead takes an explicit thinking budget,
 // which is where the stronger levels become meaningful.
 
+/**
+ * OpenAI 兼容接口的思考预留（token）
+ * 这类接口的思考 token 和正文共用 max_tokens：不给思考留额度，模型把额度全用在思考上，正文返回空，
+ * 调用方只会看到“输出被截断”或“只返回了推理内容”（实测标题、章纲、记忆提炼、章节正文都踩过）
+ * 实测 deepseek/deepseek-flash 这种开启推理的模型，连“返回 {ok:true}”都要花 700+ 思考 token
+ */
+const openAIReasoningHeadroom: Readonly<Record<string, number>> = Object.freeze({ minimal: 3000, low: 4000, medium: 8000, high: 12000, max: 12000 });
+
+/**
+ * 这个模型这次请求要留多少思考额度
+ * 满足任一条件就留：模型名能确定是推理模型、解析过它的响应带 reasoningTokens、或者作者把推理强度设成了具体档位
+ * （不能假设“没发 reasoning_effort 就不思考”：很多中继不认这个参数，模型照旧思考）
+ */
+function openAIReasoningTokens(reasoningMode: string | undefined, model: string, learned: boolean): number {
+  if (!reasoningMode || reasoningMode === "off") return 0;
+  const wantsThinking = supportsOpenAIReasoning(model) || learned || reasoningMode !== "auto";
+  if (!wantsThinking) return 0;
+  return openAIReasoningHeadroom[openAIReasoningEffort[reasoningMode] ?? "high"] ?? 0;
+}
+
 const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 /** 所有出网请求都必须带超时。Agent Runtime 每次只处理一个 RPC，
@@ -501,6 +521,8 @@ const proxyRouteHint = (targetURL: string, config: Pick<ModelApiClientConfig, "p
 
 export class ModelApiClient {
   private config: ModelApiClientConfig;
+  /** 解析到过 reasoningTokens 的模型：中继可能不认 reasoning_effort，但模型确实在思考，下次要给它留额度 */
+  private reasoningModels = new Set<string>();
 
   constructor(config: ModelApiClientConfig) {
     this.config = config;
@@ -527,6 +549,23 @@ export class ModelApiClient {
 
   // Anthropic 提供官方 count_tokens 端点；先用本地 tokenizer 裁剪，再用
   // 服务端真实计数校准。中转站未实现该端点时仍保持兼容编码的硬上限。
+  /**
+   * 输出预算 = 调用方要的正文额度 + 思考预留
+   * 上限取窗口的一半：预留再重要也不能把输入挤没（fitContextMessages 会按这个数扣输入预算）
+   */
+  private outputBudget(baseTokens: number, reasoningTokens: number): number {
+    const total = baseTokens + reasoningTokens;
+    const contextTokens = Math.floor(Number(this.config.contextWindowKTokens || 0) * 1024);
+    if (!contextTokens) return total;
+    return Math.max(baseTokens, Math.min(total, Math.floor(contextTokens * 0.5)));
+  }
+
+  /** 记下这个模型会思考，供后续请求预留额度 */
+  private noteReasoning(model: string, usage?: ApiUsage): void {
+    if (!usage) return;
+    if ((usage.reasoningTokens || 0) > 0) this.reasoningModels.add(model);
+  }
+
   private async fitContextMessages(messages: ChatMessage[], maxOutputTokens: number, model: string, key: string): Promise<ChatMessage[]> {
     const contextTokens = Math.floor(Number(this.config.contextWindowKTokens || 0) * 1024);
     if (!contextTokens) return messages;
@@ -738,7 +777,10 @@ export class ModelApiClient {
     const reasoningMode = this.config.reasoningMode;
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
     // Anthropic rejects a thinking budget that is not strictly below max_tokens.
-    const maxTokens = Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0);
+    // OpenAI 兼容接口的思考 token 和正文共用 max_tokens，所以给思考额外留额度；
+    // 没开推理时不能凭空加（会改掉调用方明确指定的 max_tokens）
+    const openAIReasoning = mode === "anthropic" ? 0 : openAIReasoningTokens(reasoningMode, model, this.reasoningModels.has(model));
+    const maxTokens = this.outputBudget(Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0), openAIReasoning);
     const apiKey = this.requestKey;
     const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKey);
     const endpoint = this.endpoints().chat;
@@ -799,6 +841,7 @@ export class ModelApiClient {
           if (!content) throw emptyCompletionError(data, maxTokens);
           const usage = parseUsage(data.usage);
           recordRuntimeUsage(usage);
+          this.noteReasoning(model, usage);
           return { content, model: typeof data.model === "string" ? data.model : model, usage };
         }
 
@@ -848,7 +891,10 @@ export class ModelApiClient {
     const dispatcher = proxyDispatcherFor(endpoint, this.config);
     const reasoningMode = this.config.reasoningMode;
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
-    const maxTokens = Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0);
+    // OpenAI 兼容接口的思考 token 和正文共用 max_tokens，所以给思考额外留额度；
+    // 没开推理时不能凭空加（会改掉调用方明确指定的 max_tokens）
+    const openAIReasoning = mode === "anthropic" ? 0 : openAIReasoningTokens(reasoningMode, model, this.reasoningModels.has(model));
+    const maxTokens = this.outputBudget(Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0), openAIReasoning);
     const apiKey = this.requestKey;
     const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKey);
     const streamBody = mode === "anthropic"
@@ -935,6 +981,8 @@ export class ModelApiClient {
             const chunk = typeof delta?.content === "string" ? delta.content : "";
             if (chunk) { content += chunk; onChunk?.(chunk); }
             usage = parseUsage(event.usage) || usage;
+            const reasoningDelta = typeof (delta?.reasoning_content ?? delta?.reasoning) === "string" ? String(delta?.reasoning_content ?? delta?.reasoning) : "";
+            if (reasoningDelta) this.reasoningModels.add(model);
             // A number of OpenAI-compatible relays omit the terminal [DONE]
             // event but do provide choice.finish_reason. Stop as soon as the
             // model reports completion so the UI cannot remain stuck waiting
