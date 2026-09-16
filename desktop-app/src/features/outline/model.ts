@@ -6,10 +6,12 @@ import { parseChapterNumber } from '../../utils/text.ts';
  * 从 App.tsx 搬出来的纯函数：不碰界面状态，只看项目数据和作者指令
  */
 
-/** 从任意文本里找“第 N 章”并解析章号；章节标题和章纲开头都可能写章号 */
+/** 从任意文本里找“第 N 章”并解析章号；章节标题和章纲开头都可能写章号
+ * “第178～185章”这种区间是阶段节拍表的标题，不是某一章 */
 export const chapterNumberFromText = (value: string) => {
   const match = value.match(/第\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章/u);
-  return match ? (parseChapterNumber(match[1]) ?? undefined) : undefined;
+  if (!match || /^阶段节拍｜/u.test(value.trim())) return undefined;
+  return parseChapterNumber(match[1]) ?? undefined;
 };
 
 /** Old chapter outlines may not have a chapterId. Recover it from their title

@@ -168,6 +168,21 @@ export function tailText(value: unknown, maxBytes: number): string {
   return (firstBreak > 0 && firstBreak < tail.length / 2 ? tail.slice(firstBreak + 1) : tail).trim();
 }
 
+/**
+ * 只保留开头，在句末收口
+ * 账本里一章一行，摘要的头一两句就是主事件；头尾拼接会在每一行中间留一个裁剪标记，
+ * 实测账本里六行事件带了十二个标记，模型读到的是被截成两半的句子
+ */
+export function leadText(value: unknown, maxBytes: number): string {
+  const text = normalizePromptWhitespace(value).replace(/\s*\n\s*/gu, " ");
+  if (!text || maxBytes <= 0) return "";
+  if (byteLength(text) <= maxBytes) return text;
+  const head = sliceToBytes(text, Math.max(0, maxBytes - byteLength("…")));
+  const cut = Math.max(head.lastIndexOf("。"), head.lastIndexOf("！"), head.lastIndexOf("？"), head.lastIndexOf("；"));
+  // 句末离得太近就整句砍掉，太远就只能截在半句
+  return `${cut > head.length * 0.5 ? head.slice(0, cut + 1) : head}…`;
+}
+
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value && typeof value === "object") {
@@ -210,9 +225,25 @@ export class LruCache<Value> {
   }
 }
 
-/** 总纲和故事账本不占各资料区的加权预算：它们是全书级资料，不该被上一章正文挤掉 */
-export const masterOutlineBytes = 5600;
-const storyLedgerBytes = 3600;
+/** 总纲和故事账本不占各资料区的加权预算：它们是全书级资料，不该被上一章正文挤掉
+ * 章节图与章纲两条路径都按这两个数截，别再各自写一个更小的数二次裁剪 */
+export const masterOutlineBytes = 8200;
+export const storyLedgerBytes = 4400;
+
+/**
+ * 阶段节拍表里本章那一行，连同前一行与后一行
+ * 节拍表一章一行（表格行或列表项），行里带“第 N 章”；本章行是硬目标，前后行只用来看承接与不得提前兑现的边界
+ */
+export function stageBeatLines(content: unknown, chapterNumber: number | undefined): { current: string; previous: string; next: string } {
+  const empty = { current: "", previous: "", next: "" };
+  if (!chapterNumber) return empty;
+  const lines = normalizePromptWhitespace(content).split("\n").filter(line => /第\s*\d{1,4}\s*章/u.test(line) && !/第\s*\d{1,4}\s*[～~\-—–至到]\s*\d{1,4}\s*章/u.test(line));
+  const numberOf = (line: string) => Number(/第\s*(\d{1,4})\s*章/u.exec(line)?.[1]);
+  const index = lines.findIndex(line => numberOf(line) === chapterNumber);
+  if (index < 0) return empty;
+  const clean = (line: string | undefined) => (line || "").replace(/^\|\s*|\s*\|$/gu, "").replace(/\s*\|\s*/gu, "｜").trim();
+  return { current: clean(lines[index]), previous: clean(lines[index - 1]), next: clean(lines[index + 1]) };
+}
 
 /** 资料区预算占比：按 1 token ≈ 3 字节的汉字估算，给各资料区留窗口的 16% */
 const contextBudgetShare = 0.16;
@@ -344,7 +375,7 @@ export function compactKnowledgeGraph(graph: unknown, text: string, maxBytes = 2
 }
 
 /** 带状态的伏笔条目压成一行：已回收的不再进入写作上下文，剩下的标明埋设章与计划回收章 */
-function compactForeshadowingItems(value: unknown, maxItems: number): string[] {
+function foreshadowingItemEntries(value: unknown, maxItems: number): Array<{ line: string; planted?: number }> {
   if (!Array.isArray(value)) return [];
   return value.flatMap(item => {
     if (!item || typeof item !== "object") return [];
@@ -358,8 +389,12 @@ function compactForeshadowingItems(value: unknown, maxItems: number): string[] {
       Number.isFinite(planted) && planted > 0 ? `埋于第 ${planted} 章` : "",
       Number.isFinite(target) && target > 0 ? `计划第 ${target} 章回收` : "",
     ].filter(Boolean).join("，");
-    return [`[${status}] ${text}${meta ? `（${meta}）` : ""}`];
+    return [{ line: `[${status}] ${text}${meta ? `（${meta}）` : ""}`, planted: Number.isFinite(planted) && planted > 0 ? planted : undefined }];
   }).slice(0, maxItems);
+}
+
+function compactForeshadowingItems(value: unknown, maxItems: number): string[] {
+  return foreshadowingItemEntries(value, maxItems).map(entry => entry.line);
 }
 
 const memoryChapterNumber = (memory: Record<string, unknown>): number | undefined => {
@@ -486,6 +521,57 @@ function outlineSubtreeText(sections: OutlineSection[], startIndex: number, used
   return picked.map(section => [section.heading, section.body].filter(Boolean).join("\n")).join("\n\n");
 }
 
+type VolumeBlock = { kind: "text"; lines: string[] } | { kind: "stage"; from: number; to: number; lines: string[] };
+
+/** 阶段行多半写成“- **第178～185章：研究沉淀与生活回落**”，去掉列表符与加粗只留标题 */
+const stageTitle = (stage: VolumeBlock): string => stage.lines[0].replace(/^[-*]\s*/u, "").replace(/\*\*/gu, "").trim();
+
+/**
+ * 当前卷按阶段压缩：找出本章所在阶段与下一阶段，其余阶段只留标题行，并给出“本章位置”
+ * 把整卷平铺进提示词时，模型面对的是十几个阶段的文字，分不清自己在哪一段、离阶段结束还有几章；
+ * 阶段末该收束的事就这样被一章章拖过去。位置是唯一能告诉模型“该走多快”的输入
+ */
+function compactVolumeByStage(volumeText: string, chapterNumber: number | undefined, maxBytes: number): { text: string; position: string; atVolumeEnd: boolean } {
+  const blocks: VolumeBlock[] = [];
+  let current: VolumeBlock = { kind: "text", lines: [] };
+  volumeText.split("\n").forEach((line, index) => {
+    // 首行是卷标题本身，它的章号区间是卷的，不是阶段的
+    const range = index > 0 ? chapterRangeHeading.exec(line) : null;
+    if (range) {
+      blocks.push(current);
+      current = { kind: "stage", from: Number(range[1]), to: Number(range[2]), lines: [line] };
+      return;
+    }
+    if (current.kind === "stage" && /^#{1,6}\s/u.test(line)) {
+      blocks.push(current);
+      current = { kind: "text", lines: [line] };
+      return;
+    }
+    current.lines.push(line);
+  });
+  blocks.push(current);
+  const stages = blocks.filter((block): block is Extract<VolumeBlock, { kind: "stage" }> => block.kind === "stage");
+  if (!stages.length || chapterNumber === undefined) return { text: compactText(volumeText, maxBytes), position: "", atVolumeEnd: false };
+  const currentStage = stages.find(stage => chapterNumber >= stage.from && chapterNumber <= stage.to);
+  const nextStage = currentStage ? stages[stages.indexOf(currentStage) + 1] : stages.find(stage => stage.from > chapterNumber);
+  const ordinal = currentStage ? chapterNumber - currentStage.from + 1 : 0;
+  const total = currentStage ? currentStage.to - currentStage.from + 1 : 0;
+  const left = currentStage ? currentStage.to - chapterNumber : 0;
+  const rendered = blocks.map(block => {
+    if (block.kind === "text") return block.lines.join("\n");
+    if (block === currentStage) return `【当前阶段：本章是本阶段第 ${ordinal}/${total} 章${left === 0 ? "，也是最后一章" : `，之后还剩 ${left} 章`}】\n${block.lines.join("\n")}`;
+    if (block === nextStage) return `【下一阶段：本章不得提前兑现它的事件，只能为它做过渡】\n${block.lines.join("\n")}`;
+    // 其他阶段只留标题行：已完成阶段的细节再多也不是本章的事，更后面的阶段更不能提前写
+    return block.lines[0];
+  }).map(part => part.trim()).filter(Boolean).join("\n\n");
+  const position = currentStage
+    ? `本章位于阶段「${stageTitle(currentStage)}」：第 ${ordinal}/${total} 章${left === 0
+      ? `，是本阶段最后一章——必须在本章内收束本阶段，并把故事推进到${nextStage ? `下一阶段「${stageTitle(nextStage)}」` : "下一卷"}的起点`
+      : `，本阶段的推进要摊在这 ${total} 章里，本章只走其中一步，之后还剩 ${left} 章`}`
+    : nextStage ? `本章不在总纲已列出的阶段区间内；下一阶段「${stageTitle(nextStage)}」从第 ${nextStage.from} 章开始` : "";
+  return { text: compactText(rendered, maxBytes), position, atVolumeEnd: Boolean(currentStage) && !nextStage };
+}
+
 /**
  * 总纲只给三样东西：全书结构骨架、当前卷与下一卷、以及本章所处的当前节点
  * 老做法按词面相关度挑段落，挑中的永远是“已经写过的部分”——后续节点用的词和正文本来就不重合，
@@ -515,6 +601,9 @@ export function compactMasterOutline(content: unknown, text: string, maxBytes: n
     .filter(entry => entry.range || forwardOutlineHeading.test(entry.section.heading));
   const routeIndexes = new Set<number>();
   let route = "";
+  // 按章号精确定位到卷时，“当前节点/下一步”从卷内阶段里取，不再全书词面打分：
+  // 实测词面打分挑中的是伏笔矩阵表格，而真正的下一步（卷内下一阶段）一次都没进过提示词
+  let locatedByNumber = false;
   if (volumeLike.length > 0) {
     const located = chapterNumber === undefined ? undefined : volumeLike.find(entry => {
       if (!entry.range) return false;
@@ -532,16 +621,37 @@ export function compactMasterOutline(content: unknown, text: string, maxBytes: n
       : anchor;
     const next = current ? volumeLike.find(entry => entry.section.index > current.section.index) : undefined;
     const blocks: string[] = [];
+    let atVolumeEnd = false;
     if (current) {
-      blocks.push(`【当前卷】\n${compactText(outlineSubtreeText(sections, current.section.index, routeIndexes), Math.max(240, Math.floor(remaining * 0.6)))}`);
+      const currentBudget = Math.max(240, Math.floor(remaining * 0.6));
+      const subtree = outlineSubtreeText(sections, current.section.index, routeIndexes);
+      if (located) {
+        locatedByNumber = true;
+        const byStage = compactVolumeByStage(subtree, chapterNumber, currentBudget);
+        atVolumeEnd = byStage.atVolumeEnd;
+        blocks.push(`${byStage.position ? `本章位置：${current.section.heading.replace(/^#+\s*/u, "")}；${byStage.position}\n\n` : ""}【当前卷】\n${byStage.text}`);
+      } else {
+        blocks.push(`【当前卷】\n${compactText(subtree, currentBudget)}`);
+      }
     }
     if (next) {
       const left = remaining - byteLength(blocks.join("\n\n")) - 8;
-      if (left > 200) blocks.push(`【下一卷】\n${compactText(outlineSubtreeText(sections, next.section.index, routeIndexes), left)}`);
+      // 卷末最后一个阶段才需要看下一卷的细节；卷中只留下一卷的标题，省下的预算给当前卷与主线目标
+      if (locatedByNumber && !atVolumeEnd) blocks.push(`【下一卷】\n${next.section.heading}`);
+      else if (left > 200) blocks.push(`【下一卷】\n${compactText(outlineSubtreeText(sections, next.section.index, routeIndexes), left)}`);
     }
     route = blocks.join("\n\n");
     remaining -= byteLength(route) + 2;
   }
+
+  // 已按章号定位时再带一份全书主线目标：它是校准本章方向的全书级尺度，不是本章任务
+  const mainline = locatedByNumber ? sections.find(section => section.heading && /主线/u.test(section.heading) && !routeIndexes.has(section.index)) : undefined;
+  const mainlineText = mainline && remaining > 300 ? compactText(outlineSubtreeText(sections, mainline.index), Math.min(remaining, 1500)) : "";
+  if (mainlineText) remaining -= byteLength(mainlineText) + 2;
+  // 人物成长弧：以前从没进过提示词，写出来的人物只剩动作没有性格；限定二级标题，免得把配角表整段带进来
+  const characters = locatedByNumber ? sections.find(section => section.heading && section.level <= 2 && /人物|角色/u.test(section.heading) && /弧|成长|性格/u.test(section.heading) && !routeIndexes.has(section.index)) : undefined;
+  const charactersText = characters && remaining > 300 ? compactText(outlineSubtreeText(sections, characters.index), Math.min(remaining, 2600)) : "";
+  if (charactersText) remaining -= byteLength(charactersText) + 2;
 
   const usable = sections.filter(section => section.body
     && !endingOutlineHeading.test(section.heading)
@@ -549,7 +659,8 @@ export function compactMasterOutline(content: unknown, text: string, maxBytes: n
     && !routeIndexes.has(section.index));
 
   // 当前节点：与本章资料词面最合的段落，正文里已经写出来的东西就在这一段
-  const current = usable
+  // 已经按章号定位到阶段时不再做这一步：卷内阶段就是当前节点与下一步，词面挑出来的段落只会是噪声
+  const current = locatedByNumber ? undefined : usable
     .map(section => ({
       section,
       score: (/主线|目标|总览|核心|当前/u.test(section.heading) ? 24 : 0) + bigramOverlap(`${section.heading}\n${section.body}`, text),
@@ -559,21 +670,31 @@ export function compactMasterOutline(content: unknown, text: string, maxBytes: n
   if (currentText) remaining -= byteLength(currentText) + 2;
 
   // 接下来必须推进：当前节点之后的第一段正文，本章的终点就落在这里
-  const next = usable.find(section => section.index > (current?.index ?? 0));
+  const next = locatedByNumber ? undefined : usable.find(section => section.index > (current?.index ?? 0));
   const nextText = next && remaining > 200 ? compactText(`${next.heading}\n${next.body}`, remaining) : "";
 
   return [
     skeleton,
     route ? `推进路线（【当前卷】是本章的出发点，必须推进到本卷的下一步；【下一卷】只在卷末交接时用，不得提前兑现）：\n${route}` : "",
+    mainlineText ? `主线目标（全书级方向，只用于校准本章走向，不是本章任务）：\n${mainlineText}` : "",
+    charactersText ? `人物成长弧（人物在本阶段的性格、局限与关系状态；每个出场人物都要按自己的性格行动，不能只剩动作）：\n${charactersText}` : "",
     currentText ? `当前节点（本章的出发点）：\n${currentText}` : "",
     nextText ? `接下来必须推进（本章的终点：正文推进到这里就收笔，允许用一到两段过渡跨越时间或地点；再后面的节点不得提前兑现）：\n${nextText}` : "",
   ].filter(Boolean).join("\n\n");
 }
 
+/** 事件行统一用“第 N 章 标题”：标题里自带的章号（第一百七十二章）去掉，避免同一章号两种写法 */
+const chapterLabel = (memory: Record<string, unknown>): string => {
+  const number = memoryChapterNumber(memory);
+  const title = compactText(memory.title || memory.chapterTitle || "", 60).replace(/^第\s*[\d一二三四五六七八九十百千零〇两]+\s*章\s*[:：]?\s*/u, "");
+  if (!number) return title || "前文章节";
+  return title ? `第 ${number} 章 ${title}` : `第 ${number} 章`;
+};
+
 /**
- * 故事账本：最近几章的记忆压成"一章一行"的已发生事件清单，再列出未回收伏笔
+ * 故事账本：近期章节的记忆压成"一章一行"的已发生事件清单，更早的章只列标题，再列出未回收伏笔
  * 章节图靠它禁止重复前文、并知道全书写到哪，这是过去"只看上一章"时完全缺失的信息；
- * 超预算时先丢最早的章，最近几章和伏笔必须保住
+ * 超预算时先丢最早的章的摘要（标题仍保留），最近几章和伏笔必须保住
  */
 export function buildStoryLedger(memories: unknown, position: ChapterPosition | undefined, maxBytes: number): string {
   const source = Array.isArray(memories) ? memories.filter(item => item && typeof item === "object") as Array<Record<string, unknown>> : [];
@@ -592,39 +713,58 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
     ? `注意：第 ${gaps[0][0]}–${gaps[0][1]} 章没有章节记忆，这段剧情不在下面的清单里，只能以总纲、章纲和记忆文档为准，不得凭空补写这一段发生过什么。`
     : "";
   const seen = new Set<string>();
-  const foreshadowing = ordered
-    .flatMap(memory => {
-      const items = compactForeshadowingItems(memory.foreshadowingItems, 8);
-      if (items.length) return items;
-      // 结构化伏笔要模型额外填一个带 status 的字段，实际几乎总是空的（整个项目 12 章一条都没写）
-      // 退回到每章都有的伏笔文字，否则“未回收伏笔”永远为空，模型就永远不知道有线索要回收
-      const number = memoryChapterNumber(memory);
-      const changes = Array.isArray(memory.foreshadowingChanges) ? memory.foreshadowingChanges : [];
-      return changes.map(text => compactText(text, 150)).filter(Boolean)
-        // 启发式猜出来的伏笔经常是对话残句（以引号开头），列进账本只会干扰
-        .filter(text => text.length >= 6 && !/^["“”‘’]/u.test(text))
-        .map(text => `第 ${number || "?"} 章：${text}`);
-    })
-    .filter(item => (seen.has(item) ? false : (seen.add(item), true)))
-    .slice(-10);
-  const foreshadowingBlock = foreshadowing.length
-    ? `未回收伏笔（推进或回收它们，不要再埋同类线）：\n${foreshadowing.map(item => `- ${item}`).join("\n")}`
-    : "";
-  let remaining = maxBytes - byteLength(header) - byteLength(gapNote) - byteLength(foreshadowingBlock) - 80;
-  const events: string[] = [];
-  for (const memory of [...ordered].reverse()) {
-    const summary = compactText(memory.summary || "", 220);
-    if (!summary) continue;
+  const entries = ordered.flatMap(memory => {
     const number = memoryChapterNumber(memory);
-    const label = number ? `第 ${number} 章` : compactText(memory.title || "前文章节", 60);
-    const hook = compactText(memory.endingHook || "", 90);
-    const line = `- ${label}：${summary}${hook ? `（章末：${hook}）` : ""}`;
-    if (byteLength(line) > remaining) break;
+    const structured = foreshadowingItemEntries(memory.foreshadowingItems, 8).map(entry => ({ line: entry.line, planted: entry.planted ?? number }));
+    if (structured.length) return structured;
+    // 结构化伏笔要模型额外填一个带 status 的字段，实际几乎总是空的（整个项目 12 章一条都没写）
+    // 退回到每章都有的伏笔文字，否则“未回收伏笔”永远为空，模型就永远不知道有线索要回收
+    const changes = Array.isArray(memory.foreshadowingChanges) ? memory.foreshadowingChanges : [];
+    return changes.map(text => compactText(text, 150)).filter(Boolean)
+      // 启发式猜出来的伏笔经常是对话残句（以引号开头），列进账本只会干扰
+      .filter(text => text.length >= 6 && !/^["“”‘’]/u.test(text))
+      .map(text => ({ line: `第 ${number || "?"} 章：${text}`, planted: number }));
+  }).filter(entry => (seen.has(entry.line) ? false : (seen.add(entry.line), true)));
+  // 上一两章刚埋的多半是场景级的未了事项（签字没落、封条起翘、名单没提）：
+  // 把它们和长线伏笔混成一份“必须回收”的清单，下一章就会为了逐条回收整章留在原地——这就是越写越拖的循环
+  const currentNumber = position?.number;
+  const isLeftover = (entry: { planted?: number }) => currentNumber !== undefined && entry.planted !== undefined && currentNumber - entry.planted <= 2;
+  const longRunning = entries.filter(entry => !isLeftover(entry)).slice(-8);
+  const leftovers = entries.filter(isLeftover).slice(-6);
+  const foreshadowingBlock = [
+    longRunning.length ? `长线伏笔（本章可推进或回收其中一两条，不要再埋同类新线）：\n${longRunning.map(entry => `- ${entry.line}`).join("\n")}` : "",
+    leftovers.length ? `上一两章留下的未了事项（只在本章开头几段内收束或一笔带过，不得为了逐条处理它们把整章留在原地）：\n${leftovers.map(entry => `- ${entry.line}`).join("\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+  const remaining = maxBytes - byteLength(header) - byteLength(gapNote) - byteLength(foreshadowingBlock) - 120;
+  // 近期章节带摘要，更早的只列标题：以前装不下的章直接消失，模型以为前文就只有最近六章
+  const summaryBudget = Math.floor(remaining * 0.7);
+  const events: string[] = [];
+  let used = 0;
+  let index = ordered.length - 1;
+  for (; index >= 0; index -= 1) {
+    const memory = ordered[index];
+    const summary = leadText(memory.summary || "", 200);
+    if (!summary) continue;
+    const hook = leadText(memory.endingHook || "", 80);
+    const line = `- ${chapterLabel(memory)}：${summary}${hook ? `（章末：${hook}）` : ""}`;
+    if (used + byteLength(line) + 1 > summaryBudget) break;
     events.unshift(line);
-    remaining -= byteLength(line) + 1;
+    used += byteLength(line) + 1;
   }
-  const eventsBlock = events.length ? `已发生事件（一章一行，本章不得再写一遍）：\n${events.join("\n")}` : "";
-  return [header, gapNote, eventsBlock, foreshadowingBlock].filter(Boolean).join("\n\n");
+  let titleBudget = remaining - used;
+  const titles: string[] = [];
+  for (const memory of ordered.slice(0, index + 1).reverse()) {
+    const label = chapterLabel(memory);
+    if (byteLength(label) + 2 > titleBudget) {
+      if (titles.length) titles.push("……");
+      break;
+    }
+    titles.push(label);
+    titleBudget -= byteLength(label) + 2;
+  }
+  const olderBlock = titles.length ? `更早的章节（只列标题，事件以记忆文档与总纲为准）：${titles.reverse().join("、")}` : "";
+  const eventsBlock = events.length ? `已发生事件（近期章节一章一行，本章不得再写一遍）：\n${events.join("\n")}` : "";
+  return [header, gapNote, olderBlock, eventsBlock, foreshadowingBlock].filter(Boolean).join("\n\n");
 }
 
 function compactSkills(skills: unknown, instruction: string, maxBytes: number): Array<{ name: string; displayName?: string; category: string; description: string; tags: string[]; content: string }> {

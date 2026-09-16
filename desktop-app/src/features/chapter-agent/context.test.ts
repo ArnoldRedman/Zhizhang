@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { boundChapterOutlineFor, buildChapterWriteContext } from './context.ts';
+import { boundChapterOutlineFor, buildChapterWriteContext, outlineFinalChapterNumber, stageBeatsFor, stageRangeFor } from './context.ts';
 import type { Chapter, ChapterMemory, MemoryDocument, OutlineDocument, Project } from '../../domain/project.ts';
 import type { Skill } from '../../domain/skill.ts';
 
@@ -32,6 +32,40 @@ test('boundChapterOutlineFor 先按 chapterId，再按标题里的章号绑定�
   const current = project();
   assert.equal(boundChapterOutlineFor(current, chapters[1])?.id, 13);
   assert.equal(boundChapterOutlineFor(current, chapters[2])?.id, 14);
+  assert.equal(boundChapterOutlineFor(current, chapters[0]), undefined);
+});
+
+test('没勾卡片时按上一章正文与章纲里出现的卡名自动带入，金手指卡固定带入', () => {
+  const current = project({
+    cards: [...project().cards, { id: 3, type: '金手指卡', title: '修复之眼', content: '', createdAt: now, updatedAt: now }],
+    chapters: [chapter(1), chapter(2, '沈砚推开门。'), chapter(3), chapter(4)],
+  });
+  const context = buildChapterWriteContext({ project: current, chapter: current.chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.deepEqual((context.params.cards as Array<{ id: number }>).map(item => item.id), [3, 1]);
+});
+
+test('outlineFinalChapterNumber 取总纲里最大的章号区间上限', () => {
+  assert.equal(outlineFinalChapterNumber(project()), undefined);
+  const current = project({ outlines: [{ ...outline(12, '总纲', '总纲'), content: '## 第一卷（第1～40章）\n## 第六卷（第206～250章）' }] });
+  assert.equal(outlineFinalChapterNumber(current), 250);
+});
+
+test('stageRangeFor 取包含本章、跨度最小的区间；只有大卷时只规划八章', () => {
+  const master = { ...outline(12, '总纲', '总纲'), content: '## 第五卷（第156～205章）\n- **第171～177章**\n- **第178～185章：研究沉淀**' };
+  const current = project({ outlines: [master] });
+  assert.deepEqual(stageRangeFor(current, 180), { from: 178, to: 185 });
+  assert.deepEqual(stageRangeFor(current, 190), { from: 190, to: 197 });
+  assert.equal(stageRangeFor(current, 300), undefined);
+});
+
+test('阶段节拍表按标题区间匹配本章，进 stageBeats 而不进普通章纲列表', () => {
+  const beats: OutlineDocument = { ...outline(99, '章纲', '阶段节拍｜第1～4章'), content: '| 第 3 章 | 出城 |' };
+  const current = project({ outlines: [...project().outlines, beats] });
+  assert.equal(stageBeatsFor(current, 3)?.id, 99);
+  assert.equal(stageBeatsFor(current, 9), undefined);
+  const context = buildChapterWriteContext({ project: current, chapter: chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal(context.params.stageBeats, '| 第 3 章 | 出城 |');
+  assert.ok(!(context.params.outlines as Array<{ id: number }>).some(item => item.id === 99));
   assert.equal(boundChapterOutlineFor(current, chapters[0]), undefined);
 });
 

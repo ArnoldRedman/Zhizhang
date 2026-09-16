@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, LruCache, normalizePromptWhitespace, prepareChapterInput, stableHash, tailText } from "../src/context/context-optimizer.js";
+import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, leadText, LruCache, normalizePromptWhitespace, prepareChapterInput, stableHash, stageBeatLines, tailText } from "../src/context/context-optimizer.js";
 
 describe("context optimizer", () => {
   it("keeps both ends of oversized chapter material", () => {
@@ -157,6 +157,78 @@ describe("story-level context", () => {
     expect(result).toContain("第六卷：大美敦煌");
   });
 
+  // 症状（《穿成恶人前夫后》第 177 章实测）：卷定位对了，但阶段区间写在列表项里而不是标题里，定位逻辑看不见；
+  // “当前节点”按词面挑中了伏笔矩阵表格，“接下来必须推进”因预算耗尽根本没出现——模型只知道当前卷有 50 章，不知道自己在哪一段、该走多快
+  it("compactMasterOutline 在当前卷里按章号定位阶段并标出本章位置，阶段最后一章要求收束并进入下一阶段", () => {
+    const outline = [
+      "# 全书总纲",
+      "## 七、分卷规划",
+      "## 第五卷：栖迟文脉（第156～205章）",
+      "### 卷定位",
+      "以稳定伴侣生活与长期研究为主。",
+      "### 已完成阶段归纳",
+      "- **第156～170章**",
+      "  - 书肆二期生活进入持续推进阶段。",
+      "- **第171～177章**",
+      "  - 已进入桑皮纸试制与样本观察阶段。",
+      "### 后续宏观方向",
+      "- **第178～185章：研究沉淀与生活回落**",
+      "  - 延续既有研究，不回写第177章技术流程。",
+      "- **第186～195章：专著影响扩展**",
+      "  - 《古籍微痕通论》逐渐形成社会影响。",
+      "## 第六卷：大美敦煌（第206～250章）",
+      "### 卷定位",
+      "把个人治愈推向国家文化保护层面。",
+      "## 十、伏笔埋设与回收矩阵",
+      "| 伏笔 | 回收要求 |",
+      "| 深蓝色笔记本 | 主动生活完成最终反转 |",
+    ].join("\n");
+    const last = compactMasterOutline(outline, "沈妄在教室里讲桑皮纸", 5600, 177);
+    expect(last).toContain("本章位置：第五卷：栖迟文脉（第156～205章）；本章位于阶段「第171～177章」：第 7/7 章，是本阶段最后一章");
+    expect(last).toContain("下一阶段「第178～185章：研究沉淀与生活回落」");
+    expect(last).toContain("【当前阶段：本章是本阶段第 7/7 章，也是最后一章】");
+    expect(last).toContain("【下一阶段：本章不得提前兑现它的事件，只能为它做过渡】\n- **第178～185章：研究沉淀与生活回落**");
+    // 其他阶段只留标题行；伏笔矩阵不再被当成“当前节点”
+    expect(last).toContain("- **第186～195章：专著影响扩展**");
+    expect(last).not.toContain("《古籍微痕通论》逐渐形成社会影响");
+    expect(last).not.toContain("当前节点");
+    expect(last).not.toContain("深蓝色笔记本");
+    // 卷中只给下一卷的标题，细节留给卷末
+    expect(last).toContain("【下一卷】\n## 第六卷：大美敦煌（第206～250章）");
+    const middle = compactMasterOutline(outline, "沈妄整理记录", 5600, 180);
+    expect(middle).toContain("本章位于阶段「第178～185章：研究沉淀与生活回落」：第 3/8 章，本阶段的推进要摊在这 8 章里，本章只走其中一步，之后还剩 5 章");
+  });
+
+  it("leadText 只取开头并在句末收口，不留裁剪标记", () => {
+    expect(leadText("沈砚回到老家。夜里听见敲门声。", 30)).toBe("沈砚回到老家。…");
+    expect(leadText("短句", 40)).toBe("短句");
+  });
+
+  // 症状：账本把上一章刚埋的场景待办（签字没落、封条起翘）和长线伏笔混成一份“必须回收”的清单，
+  // 下一章为了逐条回收就整章留在原地；摘要按头尾拼接，每行中间都插着裁剪标记；预算装不下的更早章节直接消失
+  it("buildStoryLedger 把上一两章的未了事项与长线伏笔分开列，事件行只取摘要开头，更早的章只列标题", () => {
+    const memories = Array.from({ length: 30 }, (_, index) => ({
+      chapterNumber: index + 1,
+      title: `第 ${index + 1} 章 标题${index + 1}`,
+      summary: `第${index + 1}章：沈砚在阁楼里守着旧电台，等门外的敲门声再响一次，顺手把频率表抄进笔记本。${"细".repeat(120)}`,
+      foreshadowingItems: index === 4
+        ? [{ text: "母亲留下的旧电台频率", status: "active", plantedChapter: 5, targetChapter: 40 }]
+        : index === 28 ? [{ text: "签字笔悬在中止权条款上没落下", status: "active", plantedChapter: 29, targetChapter: 30 }] : [],
+    }));
+    const ledger = buildStoryLedger(memories, { number: 30, total: 29 }, 3000);
+    expect(ledger).toContain("长线伏笔");
+    expect(ledger).toContain("旧电台频率");
+    expect(ledger).toContain("上一两章留下的未了事项");
+    expect(ledger.indexOf("长线伏笔")).toBeLessThan(ledger.indexOf("上一两章留下的未了事项"));
+    expect(ledger).toContain("签字笔悬在中止权条款上没落下");
+    expect(ledger).not.toContain("已按相关性与预算裁剪");
+    expect(ledger).toContain("- 第 29 章 标题29：");
+    expect(ledger).toContain("抄进笔记本。…");
+    expect(ledger).not.toContain("细细细");
+    expect(ledger).toContain("更早的章节（只列标题");
+    expect(ledger).toContain("第 1 章 标题1");
+  });
+
   it("buildStoryLedger 按章号排事件、标出当前位置、只列未回收伏笔", () => {
     const ledger = buildStoryLedger([
       { chapterNumber: 3, title: "第三章", summary: "沈砚确认门外是守夜人。", endingHook: "守夜人递来一把钥匙。", foreshadowingItems: [{ text: "钥匙能开灯塔地下室", status: "active", plantedChapter: 3, targetChapter: 6 }] },
@@ -176,7 +248,7 @@ describe("story-level context", () => {
       { chapterNumber: 2, title: "第二章", summary: "阁楼电台亮起。", foreshadowingChanges: ["电台里的摩斯码还没译完"], foreshadowingItems: [] },
       { chapterNumber: 3, title: "第三章", summary: "守夜人出现。", foreshadowingChanges: ["守夜人递来一把钥匙。"], foreshadowingItems: [{ text: "钥匙能开地下室", status: "resolved" }] },
     ], { number: 4, total: 3 }, 2400);
-    expect(ledger).toContain("未回收伏笔");
+    expect(ledger).toContain("未了事项");
     expect(ledger).toContain("第 2 章：电台里的摩斯码还没译完");
     expect(ledger).toContain("第 3 章：守夜人递来一把钥匙。");
   });
@@ -237,5 +309,23 @@ describe("story-level context", () => {
     expect(prepared.previousChapters[0]?.ending).not.toContain("沈砚回到老家");
     expect(prepared.storyLedger).toContain("当前正在写第 3 章");
     expect(prepared.report.sections.masterOutline).toBeGreaterThan(0);
+  });
+});
+
+describe("stage beats", () => {
+  it("stageBeatLines 取节拍表里本章那一行与前后行，区间标题行不算章", () => {
+    const sheet = [
+      "# 阶段节拍｜第178～185章",
+      "本阶段：研究沉淀与生活回落。",
+      "| 章 | 核心事件 | 时间与地点 |",
+      "| 第178章 | 回书肆整理试讲记录 | 次日，书肆 |",
+      "| 第179章 | 同行来访交流 | 三日后，文津书院 |",
+      "| 第180章 | 挑喜帖 | 一周后，家中 |",
+    ].join("\n");
+    const beat = stageBeatLines(sheet, 179);
+    expect(beat.current).toBe("第179章｜同行来访交流｜三日后，文津书院");
+    expect(beat.previous).toContain("第178章");
+    expect(beat.next).toContain("第180章");
+    expect(stageBeatLines(sheet, 190).current).toBe("");
   });
 });

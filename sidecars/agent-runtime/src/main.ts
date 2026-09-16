@@ -3,8 +3,8 @@ import { createChapterGraph, selectSkillsByIntent, type SkillDefinition } from "
 import { StoryStore } from "./storage/story-store.js";
 import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
-import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, masterOutlineBytes, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
-import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, type AgentSessionState } from "./application/runtime-state.js";
+import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, masterOutlineBytes, prepareChapterInput, stableHash, stageBeatLines, storyLedgerBytes, tailText, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
+import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, stageBeatSheetProtocol, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
@@ -19,7 +19,14 @@ import type { RpcResponse } from "@zhizhang/contracts";
 
 /** 资料组装规则版本：改了预算或裁剪策略就加一
  * 准备结果的缓存 key 只由入参算出，代码变了 key 不变，旧缓存会一直命中、优化完全看不出效果 */
-const contextPipelineVersion = 4;
+const contextPipelineVersion = 5;
+
+/** 阶段节拍表里本章那一行压成一段：本章行是硬目标，前后行只划边界 */
+function chapterBeatText(stageBeats: unknown, chapterNumber: number | undefined): string | undefined {
+  const beat = stageBeatLines(stageBeats, chapterNumber);
+  if (!beat.current) return undefined;
+  return [`本章：${beat.current}`, beat.previous ? `上一章（已定或已写）：${beat.previous}` : "", beat.next ? `下一章（不得提前兑现）：${beat.next}` : ""].filter(Boolean).join("\n");
+}
 
 async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse> {
   try {
@@ -60,12 +67,6 @@ async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse>
         return { id: req.id, result: { ...cachedMemory, contextReport: cachedReport } };
       }
       const client = createModelApiClient(req.params ?? {}, { model: "gpt-5.5" });
-      const cardContext = Array.isArray(cards) && cards.length
-        ? `\n## 已有卡片及当前状态（仅更新正文有证据的卡片）\n${cards.map(card => { const item = card as Record<string, unknown>; return `${String(item.id || "")}|${String(item.title || "卡片")}：${String(item.content || "")}\n当前状态：${String(item.currentState || "暂无")}`; }).join("\n")}`
-        : "";
-      const graphContext = knowledgeGraph && typeof knowledgeGraph === "object"
-        ? `\n## 已有知识图谱（用于增量更新）\n${JSON.stringify(knowledgeGraph).slice(0, 12000)}`
-        : "";
       const compactCardContext = relevantCards.length
         ? `\n## 正文命中的卡片（仅可更新这些卡片）\n${relevantCards.map(card => {
           const history = Array.isArray(card.stateHistory) ? card.stateHistory.slice(-2).map(item => {
@@ -88,7 +89,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
   "characterStateChanges": ["角色名：持续状态变化"],
   "knowledgeChanges": ["角色名：得知或隐瞒的信息"],
   "foreshadowingChanges": ["伏笔进展"],
-  "foreshadowingItems": [{"text":"伏笔内容","status":"active|progressing|resolved|overdue","priority":"high|normal|low","plantedChapter":1,"targetChapter":5}],
+  "foreshadowingItems": [{"text":"跨越多章的长线伏笔；当场就要处理的签字、开箱、答复之类的场景待办不算","status":"active|progressing|resolved|overdue","priority":"high|normal|low","plantedChapter":1,"targetChapter":5}],
   "timelineEvents": ["可排序事件"],
   "canonFacts": ["后续必须遵守的事实"],
   "conflicts": ["冲突和结果"],
@@ -505,7 +506,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       }
     }
     if (req.method === "outline.write") {
-      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, masterOutline, recentMemories, totalChapters, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, apiKey, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, masterOutline, recentMemories, totalChapters, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, beatSheet, stageBeats, apiKey, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!projectTitle || !kind || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
@@ -588,11 +589,17 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const sourceHandoff = sourceContent.length > 7000 ? sourceContent.slice(-7000) : sourceContent;
       // 总纲与故事账本：章纲不能只看上一章正文，得知道本章在全书哪一段、前文已经写过什么，否则每章都在给上一章写续集
       const chapterTotal = Number(totalChapters) >= 0 ? Number(totalChapters) : undefined;
-      const ledgerPosition = { number: targetChapterNumber || (chapterTotal !== undefined ? chapterTotal + 1 : undefined), total: chapterTotal };
+      // 节拍表模式：按第一个未写的章定位总纲位置，规划的是整段而不是某一章
+      const beatSheetRecord = beatSheet && typeof beatSheet === "object" ? beatSheet as Record<string, unknown> : undefined;
+      const beatFrom = Number(beatSheetRecord?.from || 0);
+      const beatTo = Number(beatSheetRecord?.to || 0);
+      const beatWrittenThrough = Number(beatSheetRecord?.writtenThrough || 0);
+      const isBeatSheet = kind === "章纲" && beatFrom > 0 && beatTo >= beatFrom;
+      const ledgerPosition = { number: isBeatSheet ? Math.max(beatFrom, beatWrittenThrough + 1) : targetChapterNumber || (chapterTotal !== undefined ? chapterTotal + 1 : undefined), total: chapterTotal };
       const memoryList = Array.isArray(recentMemories) ? recentMemories.filter(item => item && typeof item === "object") as Array<Record<string, unknown>> : [];
       const directionQuery = [String(instruction || ""), sourceHandoff, String(existingContent || ""), ...memoryList.map(item => String(item.summary || ""))].join("\n").toLowerCase();
       const masterOutlineSection = kind === "章纲" ? compactMasterOutline(masterOutline, directionQuery, masterOutlineBytes, Number(ledgerPosition.number) || undefined) : "";
-      const ledgerSection = kind === "章纲" ? buildStoryLedger(memoryList, ledgerPosition, 3600) : "";
+      const ledgerSection = kind === "章纲" ? buildStoryLedger(memoryList, ledgerPosition, storyLedgerBytes) : "";
       const directionSection = masterOutlineSection || ledgerSection
         ? `## 总纲与故事账本（本章必须沿总纲推进一个新节点；账本里已发生的事不得再作为本章主事件）\n${[
           masterOutlineSection ? `### 总纲（含推进路线、当前节点与“接下来必须推进”的节点；本章章纲必须推进到那里，更后面的节点不得提前兑现）\n${masterOutlineSection}` : "",
@@ -600,13 +607,25 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         ].filter(Boolean).join("\n\n")}\n\n`
         : "";
       if (directionSection) emitter.context("retrieve", "已装载总纲骨架与故事账本", { source: "总纲 / 章节记忆", status: "loaded", bytes: byteLength(directionSection), items: memoryList.length });
-      const sourceSection = sourceChapterRecord
-        ? `## 唯一正文依据（优先级最高）\n依据模式：${compactText(sourceChapterRecord.mode || "作者指定", 80)}\n第 ${String(sourceChapterRecord.number || "")} 章《${compactText(sourceChapterRecord.title || "未命名", 120)}》正文：\n${compactText(sourceContent, 26000)}\n\n${isNextChapterHandoff ? `## 章节交接状态（最高优先级，目标章必须从此处之后开始）\n以下是上一章结尾原文：\n${compactText(sourceHandoff, 7000)}\n\n硬性要求：目标章开场只能发生在上述结尾状态之后。上一章已发生的行动、战斗、跟踪发现、资源消耗、人物位置与情绪不得重新规划或倒退；必须承接其结果并推进新的事件。` : sourceChapterNumber === targetChapterNumber ? `## 本章复盘规则\n这是“根据本章正文生成本章章纲”。章纲必须忠实概括正文中已发生的事件、人物状态、冲突、伏笔与结尾；不得把正文结尾之后的计划写成已发生事实，也不得使用“下一章承接”规则。` : `## 指定正文参考规则\n这是指定章节正文的参考分析。只提取该正文可证实的事实；不要把它误当作目标章的上一章，也不要强行制造章节承接。`}\n\n章纲事件、人物状态和结尾承接必须来自这段正文；不得引用其他章节正文，不得把历史会话中的旧章节当作事实。`
+      // 承接模式只给上一章结尾：以前把上一章全文（两万多字节）标成“唯一正文依据（优先级最高）”交给章纲，
+      // 五千多字节的总纲根本压不住它，章纲就整章续写上一章最后一场戏，正文再照着章纲写，于是一件事拖十几章
+      const sourceSection = sourceChapterRecord && isNextChapterHandoff
+        ? `## 上一章结尾（承接锚点：目标章只在开场一到三段承接它，之后必须离开这个场景）\n依据模式：${compactText(sourceChapterRecord.mode || "作者指定", 80)}\n第 ${String(sourceChapterRecord.number || "")} 章《${compactText(sourceChapterRecord.title || "未命名", 120)}》结尾原文：\n${tailText(sourceContent, 3200)}\n\n硬性要求：目标章开场只能发生在上述结尾状态之后。上一章已发生的行动、战斗、跟踪发现、资源消耗、人物位置与情绪不得重新规划或倒退；上一章留下的未了事项只在开场收束或一笔带过。目标章的主体必须推进到“总纲与故事账本”标出的本阶段下一步，并写明本章相对上一章的时间跨度与地点位移；开场承接不超过全章两成。上一章的完整事件以故事账本为准，不得引用其他章节正文，不得把历史会话中的旧章节当作事实。`
+        : sourceChapterRecord
+        ? `## 唯一正文依据（优先级最高）\n依据模式：${compactText(sourceChapterRecord.mode || "作者指定", 80)}\n第 ${String(sourceChapterRecord.number || "")} 章《${compactText(sourceChapterRecord.title || "未命名", 120)}》正文：\n${compactText(sourceContent, 26000)}\n\n${sourceChapterNumber === targetChapterNumber ? `## 本章复盘规则\n这是“根据本章正文生成本章章纲”。章纲必须忠实概括正文中已发生的事件、人物状态、冲突、伏笔与结尾；不得把正文结尾之后的计划写成已发生事实，也不得使用“下一章承接”规则。` : `## 指定正文参考规则\n这是指定章节正文的参考分析。只提取该正文可证实的事实；不要把它误当作目标章的上一章，也不要强行制造章节承接。`}\n\n章纲事件、人物状态和结尾承接必须来自这段正文；不得引用其他章节正文，不得把历史会话中的旧章节当作事实。`
         : `## 正文依据\n本次没有提供可用正文。只能生成通用结构，不得声称承接任何具体章节。`;
       const formatSection = formatOutlineRecord
         ? `## 格式参考章纲（仅参考表达密度，不得覆盖固定输出协议）\n参考模式：${compactText(formatOutlineRecord.mode || "上一章章纲格式", 100)}\n${compactText(formatOutlineRecord.title || "参考章纲", 120)}\n${compactText(formatOutlineRecord.content || "", 9000)}\n\n硬性要求：固定输出协议的栏目、顺序和字段名优先；只能参考这份章纲的详略和语气，不得照抄其人物、事件、数字、旧栏目或结尾。`
         : `## 格式要求\n没有可用的参考章纲，请严格使用“小说章纲生成器”技能定义的固定模板。`;
-      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。章纲的核心事件必须是故事账本里没有出现过的新推进，并在“主线推进”栏写明本章推进的总纲节点与和前文的区别；上一章已经完成的行动不得重新发生。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
+      // 本章节拍：阶段节拍表里给本章定的事件，是章纲的硬目标；有它章纲就不能再从上一章末尾往下顺
+      const beat = stageBeatLines(stageBeats, targetChapterNumber || undefined);
+      const beatSection = beat.current
+        ? `## 本章节拍（阶段节拍表为本章定好的事件，章纲必须围绕它展开，不得改写成上一章事件线的枝节）\n本章：${beat.current}${beat.previous ? `\n上一章（已定或已写）：${beat.previous}` : ""}${beat.next ? `\n下一章（不得提前兑现）：${beat.next}` : ""}\n\n`
+        : "";
+      if (beatSection) emitter.context("retrieve", "已装载本章节拍", { source: "阶段节拍表", status: "loaded", bytes: byteLength(beatSection), items: 1 });
+      const dynamicTask = isBeatSheet
+        ? `## 本次大纲任务\n类型：阶段节拍表（第 ${beatFrom}～${beatTo} 章${beatWrittenThrough >= beatFrom ? `，其中第 ${beatFrom}～${beatWrittenThrough} 章已写` : ""}）\n作者指令：${compactText(instruction || "按总纲把本阶段拆成逐章事件", 1800)}\n\n${directionSection}${stageBeatSheetProtocol}\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n只输出节拍表 Markdown。`
+        : `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${beatSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。章纲的核心事件必须是故事账本里没有出现过的新推进${beat.current ? "，并且就是“本章节拍”里定的那件事" : ""}，并在“主线推进”栏写明本章推进的总纲节点与和前文的区别；上一章已经完成的行动不得重新发生。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
       emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
       emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
       emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
@@ -618,7 +637,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         // Keep the current target/source packet last so stale session turns
         // cannot override the chapter the author just selected.
         { role: "user", content: dynamicTask },
-      ], { max_tokens: kind === "章纲" ? 5000 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
+      ], { max_tokens: isBeatSheet ? 6000 : kind === "章纲" ? 5000 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
       emitter.progress("review", 92, "步骤 5/5：校验章节承接、格式与章末钩子");
       emitter.complete("大纲内容生成完成");
       const nextOutlineSession = appendAgentSession(outlineSession, String(instruction || "补全结构并强化可执行性"), response.content, contextWindow, byteLength(stableProjectPacket));
@@ -626,7 +645,8 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       void writePersistentContext(`outline-session-${outlineSessionKey}`, nextOutlineSession.state);
       void writePersistentDocument(`outline-session-${outlineSessionKey}`, `# 大纲会话摘要\n\n${nextOutlineSession.state.summary || "暂无压缩摘要"}`);
       if (nextOutlineSession.compressed) emitter.progress("plan", 90, "会话动态上下文已超过 80%，已自动压缩为摘要并保留最近两轮");
-      return { id: req.id, result: { content: kind === "章纲" ? normalizeChapterOutlineOutput(response.content) : response.content } };
+      // 节拍表是一张表，不走章纲的标题去重；只剥代码围栏
+      return { id: req.id, result: { content: kind === "章纲" && !isBeatSheet ? normalizeChapterOutlineOutput(response.content) : response.content.trim().replace(/^```(?:markdown|md)?\s*/iu, "").replace(/```$/u, "").trim() } };
     }
     if (req.method === "chapter.write") {
       const {
@@ -645,6 +665,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         memories,
         memoryDocuments,
         knowledgeGraph,
+        stageBeats,
         writingStyle,
         authorPreferences,
         preferredSkillNames,
@@ -797,6 +818,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           worldSetting: prepared.worldSetting,
           masterOutline: prepared.masterOutline,
           storyLedger: prepared.storyLedger,
+          chapterBeat: chapterBeatText(stageBeats, chapterPosition.number),
           targetWords: Number(targetWords) > 0 ? Number(targetWords) : undefined,
           writingStyle: writingStyle && typeof writingStyle === "object" ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) } : undefined,
           outline: prepared.outline,

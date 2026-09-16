@@ -4591,3 +4591,7 @@ select.input {
     min-height: 40px;
   }
 }
+
+/* 懒人连续创作：章数输入与开始/停止按钮并排 */
+.agent-continuous-count { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-3); white-space: nowrap; }
+.agent-continuous-count input { width: 56px; min-width: 0; padding: 4px 6px; }

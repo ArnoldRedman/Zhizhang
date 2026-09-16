@@ -1,7 +1,10 @@
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
 /// 0.1.6 之前应用叫 ApiSaverWriter，bundle identifier 是 com.apisaverwriter.app。
@@ -38,6 +41,64 @@ fn adopt_legacy_data_directory(directory: PathBuf) -> PathBuf {
     }
 }
 
+/// 保存是整目录级的操作：读写改到后台线程后，自动保存、手动保存和启动读取可能重叠，必须串行
+fn save_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// 上次写入各文件的内容指纹
+/// 一本书有近千个图谱档案、近两百个章节文件，以前每次自动保存都先清空再全量重写，
+/// 编辑器每停顿一次就是上千次磁盘写入，整个应用跟着卡；现在只重写内容变了的文件
+fn written_digests() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static DIGESTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    DIGESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn content_digest(content: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 内容与上次写入一致且文件仍在时跳过；文件被外部删掉会补回。返回是否真的写了
+fn write_if_changed(path: &Path, content: &[u8]) -> Result<bool, String> {
+    let digest = content_digest(content);
+    let unchanged = written_digests()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .is_some_and(|known| *known == digest);
+    if unchanged && path.is_file() {
+        return Ok(false);
+    }
+    fs::write(path, content).map_err(|error| format!("写入 {} 失败: {error}", path.display()))?;
+    written_digests()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), digest);
+    Ok(true)
+}
+
+/// 删除目录里不再对应任何条目的 Markdown：改名或删除的条目不留旧文件，保留的文件不再先删后写
+fn remove_stale_markdown(dir: &Path, keep: &HashSet<PathBuf>) -> Result<(), String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("md") || keep.contains(&path) {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|error| format!("清理旧文件 {} 失败: {error}", path.display()))?;
+        written_digests()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod data_directory_tests {
     use super::adopt_legacy_data_directory;
@@ -66,7 +127,16 @@ mod data_directory_tests {
 }
 
 #[tauri::command]
-pub fn load_projects(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+pub async fn load_projects(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+    // 启动时要读几百个章节和近千个图谱档案；同步命令跑在主线程上，读盘期间整个窗口无响应
+    tauri::async_runtime::spawn_blocking(move || load_projects_blocking(app))
+        .await
+        .map_err(|error| format!("读取小说任务中断: {error}"))?
+}
+
+fn load_projects_blocking(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+    // 读盘期间不能有保存正在写一半
+    let _guard = save_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let app_data = app_data_directory(&app)?;
     let root = app_data.join("projects");
 
@@ -212,7 +282,15 @@ pub fn load_projects(app: tauri::AppHandle) -> Result<Option<Value>, String> {
 
 
 #[tauri::command]
-pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, String> {
+pub async fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, String> {
+    // 同步命令跑在主线程上，写上千个文件时整个窗口都会卡住；改到阻塞线程池，并用锁保证两次保存不交错
+    tauri::async_runtime::spawn_blocking(move || save_projects_blocking(app, projects))
+        .await
+        .map_err(|error| format!("保存小说任务中断: {error}"))?
+}
+
+fn save_projects_blocking(app: tauri::AppHandle, projects: Value) -> Result<String, String> {
+    let _guard = save_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let app_data = app_data_directory(&app)?;
     let root = app_data.join("projects");
     fs::create_dir_all(&root).map_err(|error| format!("创建小说目录失败: {error}"))?;
@@ -267,37 +345,10 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
         fs::create_dir_all(&cards_dir).map_err(|error| format!("创建卡片目录失败: {error}"))?;
         fs::create_dir_all(&memories_dir).map_err(|error| format!("创建记忆目录失败: {error}"))?;
         fs::create_dir_all(&graph_dir).map_err(|error| format!("创建图谱目录失败: {error}"))?;
-        if let Ok(entries) = fs::read_dir(&chapters_dir) {
-            for entry in entries.filter_map(Result::ok).filter(|entry| {
-                entry.path().extension().and_then(|value| value.to_str()) == Some("md")
-            }) {
-                fs::remove_file(entry.path())
-                    .map_err(|error| format!("清理旧章节 Markdown 失败: {error}"))?;
-            }
-        }
-        if let Ok(entries) = fs::read_dir(&outline_dir) {
-            for entry in entries.filter_map(Result::ok).filter(|entry| {
-                entry.path().extension().and_then(|value| value.to_str()) == Some("md")
-            }) {
-                fs::remove_file(entry.path())
-                    .map_err(|error| format!("清理旧大纲 Markdown 失败: {error}"))?;
-            }
-        }
-        if let Ok(entries) = fs::read_dir(&cards_dir) {
-            for entry in entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().is_dir())
-            {
-                if let Ok(files) = fs::read_dir(entry.path()) {
-                    for file in files.filter_map(Result::ok).filter(|file| {
-                        file.path().extension().and_then(|value| value.to_str()) == Some("md")
-                    }) {
-                        fs::remove_file(file.path())
-                            .map_err(|error| format!("清理旧卡片 Markdown 失败: {error}"))?;
-                    }
-                }
-            }
-        }
+        // 不再先清空目录再全量重写：只写内容有变化的文件，最后删掉不再对应任何条目的旧文件
+        let mut kept_chapter_files = HashSet::new();
+        let mut kept_outline_files = HashSet::new();
+        let mut kept_card_files = HashSet::new();
 
         let mut metadata = project.clone();
         if let Some(chapters) = metadata.get_mut("chapters").and_then(Value::as_array_mut) {
@@ -307,14 +358,13 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("未命名章节");
-                fs::write(
-                    chapters_dir.join(format!("{}.md", safe_file_name(chapter_title))),
-                    content,
-                )
-                .map_err(|error| format!("保存章节 Markdown 失败: {error}"))?;
+                let path = chapters_dir.join(format!("{}.md", safe_file_name(chapter_title)));
+                write_if_changed(&path, content.as_bytes())?;
+                kept_chapter_files.insert(path);
                 chapter["content"] = Value::String(String::new());
             }
         }
+        remove_stale_markdown(&chapters_dir, &kept_chapter_files)?;
 
         if let Some(outlines) = metadata.get_mut("outlines").and_then(Value::as_array_mut) {
             for outline in outlines.iter_mut() {
@@ -323,11 +373,9 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
                     .and_then(Value::as_str)
                     .unwrap_or("大纲");
                 let content = outline.get("content").and_then(Value::as_str).unwrap_or("");
-                fs::write(
-                    outline_dir.join(format!("{}.md", safe_file_name(title))),
-                    content,
-                )
-                .map_err(|error| format!("保存大纲 Markdown 失败: {error}"))?;
+                let path = outline_dir.join(format!("{}.md", safe_file_name(title)));
+                write_if_changed(&path, content.as_bytes())?;
+                kept_outline_files.insert(path);
                 outline["content"] = Value::String(String::new());
             }
         }
@@ -339,9 +387,11 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
             .unwrap_or(true)
         {
             let outline_markdown = outline_to_markdown(project.get("outline"));
-            fs::write(outline_dir.join("大纲.md"), outline_markdown)
-                .map_err(|error| format!("保存大纲 Markdown 失败: {error}"))?;
+            let path = outline_dir.join("大纲.md");
+            write_if_changed(&path, outline_markdown.as_bytes())?;
+            kept_outline_files.insert(path);
         }
+        remove_stale_markdown(&outline_dir, &kept_outline_files)?;
 
         if let Some(cards) = metadata.get_mut("cards").and_then(Value::as_array_mut) {
             for card in cards.iter_mut() {
@@ -362,12 +412,16 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
                 let type_dir = cards_dir.join(card_type);
                 fs::create_dir_all(&type_dir)
                     .map_err(|error| format!("创建卡片分类目录失败: {error}"))?;
-                fs::write(
-                    type_dir.join(format!("{}.md", safe_file_name(title))),
-                    format!("{content}\n\n## 当前状态\n{}\n\n## 状态历史\n{}\n", if current_state.trim().is_empty() { "暂无" } else { current_state }, if state_history.trim().is_empty() { "- 暂无" } else { &state_history }),
-                )
-                .map_err(|error| format!("保存卡片 Markdown 失败: {error}"))?;
+                let path = type_dir.join(format!("{}.md", safe_file_name(title)));
+                let markdown = format!("{content}\n\n## 当前状态\n{}\n\n## 状态历史\n{}\n", if current_state.trim().is_empty() { "暂无" } else { current_state }, if state_history.trim().is_empty() { "- 暂无" } else { &state_history });
+                write_if_changed(&path, markdown.as_bytes())?;
+                kept_card_files.insert(path);
                 card["content"] = Value::String(String::new());
+            }
+        }
+        if let Ok(entries) = fs::read_dir(&cards_dir) {
+            for entry in entries.filter_map(Result::ok).filter(|entry| entry.path().is_dir()) {
+                remove_stale_markdown(&entry.path(), &kept_card_files)?;
             }
         }
         if let Some(memories) = metadata.get_mut("memories").and_then(Value::as_array_mut) {
@@ -377,11 +431,7 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
                     .and_then(Value::as_str)
                     .unwrap_or("章节记忆");
                 let content = chapter_memory_to_markdown(memory);
-                fs::write(
-                    memories_dir.join(format!("{}.md", safe_file_name(title))),
-                    content,
-                )
-                .map_err(|error| format!("保存章节记忆 Markdown 失败: {error}"))?;
+                write_if_changed(&memories_dir.join(format!("{}.md", safe_file_name(title))), content.as_bytes())?;
             }
         }
         if let Some(documents) = metadata.get_mut("memoryDocuments").and_then(Value::as_array_mut) {
@@ -392,15 +442,13 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
                     .and_then(Value::as_str)
                     .unwrap_or("章节快照");
                 let content = document.get("content").and_then(Value::as_str).unwrap_or("");
-                fs::write(
-                    memories_dir.join(format!("{}.md", safe_file_name(title))),
-                    content,
-                )
-                .map_err(|error| format!("保存聚合记忆 Markdown 失败: {error}"))?;
+                write_if_changed(&memories_dir.join(format!("{}.md", safe_file_name(title))), content.as_bytes())?;
             }
         }
-        let graph_edges = project.get("graphEdges").and_then(Value::as_array).cloned().unwrap_or_default();
-        let graph_node_snapshots = project.get("graphNodes").and_then(Value::as_array).cloned().unwrap_or_default();
+        let graph_edges: &[Value] = project.get("graphEdges").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let graph_node_snapshots: &[Value] = project.get("graphNodes").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        // 索引建一次：以前近千个节点各自扫一遍近三千条关系、再线性查对端标签，一次保存要几百万次比较
+        let graph_index = build_graph_index(graph_node_snapshots, graph_edges);
         if let Some(nodes) = metadata.get_mut("graphNodes").and_then(Value::as_array_mut) {
             for node in nodes.iter_mut() {
                 let relative_path = graph_node_relative_path(node);
@@ -408,8 +456,7 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).map_err(|error| format!("创建图谱档案目录失败: {error}"))?;
                 }
-                fs::write(&path, graph_node_to_markdown(node, &graph_node_snapshots, &graph_edges))
-                    .map_err(|error| format!("保存图谱档案 Markdown 失败: {error}"))?;
+                write_if_changed(&path, graph_node_markdown_with_index(node, &graph_index).as_bytes())?;
                 node["sourcePath"] = Value::String(relative_path.to_string_lossy().into_owned());
                 node["content"] = Value::String(String::new());
             }
@@ -417,8 +464,7 @@ pub fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, S
 
         let metadata_content = serde_json::to_vec_pretty(&metadata)
             .map_err(|error| format!("序列化小说元数据失败: {error}"))?;
-        fs::write(project_dir.join("metadata.json"), metadata_content)
-            .map_err(|error| format!("保存小说元数据失败: {error}"))?;
+        write_if_changed(&project_dir.join("metadata.json"), &metadata_content)?;
     }
 
     let legacy_path = app_data.join("projects.json");
@@ -488,19 +534,50 @@ pub fn graph_edge_default_weight(label: &str) -> f64 {
 }
 
 
+/// 图谱档案渲染用的索引：按节点 id 查标签、查相连的关系
+pub struct GraphIndex<'a> {
+    labels: HashMap<&'a str, &'a str>,
+    edges: HashMap<&'a str, Vec<&'a Value>>,
+}
+
+/// 建一次索引给全部节点共用；单个节点渲染时也可以临时建一个小的
+pub fn build_graph_index<'a>(nodes: &'a [Value], edges: &'a [Value]) -> GraphIndex<'a> {
+    let mut labels = HashMap::new();
+    for node in nodes {
+        if let (Some(id), Some(label)) = (node.get("id").and_then(Value::as_str), node.get("label").and_then(Value::as_str)) {
+            // 同一 id 重复出现时沿用先出现的那个，与旧的线性查找结果一致
+            labels.entry(id).or_insert(label);
+        }
+    }
+    let mut by_node: HashMap<&str, Vec<&Value>> = HashMap::new();
+    for edge in edges {
+        let source = edge.get("source").and_then(Value::as_str).unwrap_or("");
+        let target = edge.get("target").and_then(Value::as_str).unwrap_or("");
+        by_node.entry(source).or_default().push(edge);
+        if target != source {
+            by_node.entry(target).or_default().push(edge);
+        }
+    }
+    GraphIndex { labels, edges: by_node }
+}
+
+/// 单个节点的档案渲染：只有测试用，正式保存走 build_graph_index 共用一份索引
+#[cfg(test)]
 pub fn graph_node_to_markdown(node: &Value, nodes: &[Value], edges: &[Value]) -> String {
+    graph_node_markdown_with_index(node, &build_graph_index(nodes, edges))
+}
+
+pub fn graph_node_markdown_with_index(node: &Value, index: &GraphIndex) -> String {
     let id = node.get("id").and_then(Value::as_str).unwrap_or("");
     let title = node.get("label").and_then(Value::as_str).unwrap_or("未命名节点");
     let content = node.get("content").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or("待补充。");
     let status = node.get("status").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or("待补充");
     let mut relation_lines = Vec::new();
-    for edge in edges {
+    for edge in index.edges.get(id).map(Vec::as_slice).unwrap_or(&[]) {
         let source = edge.get("source").and_then(Value::as_str).unwrap_or("");
         let target = edge.get("target").and_then(Value::as_str).unwrap_or("");
-        if source != id && target != id { continue; }
         let other_id = if source == id { target } else { source };
-        let other_label = nodes.iter().find(|item| item.get("id").and_then(Value::as_str) == Some(other_id))
-            .and_then(|item| item.get("label").and_then(Value::as_str)).unwrap_or(other_id);
+        let other_label = index.labels.get(other_id).copied().unwrap_or(other_id);
         let relation = edge.get("label").and_then(Value::as_str).unwrap_or("关联");
         let direction = if source == id { "指向对方" } else { "来自对方" };
         let weight = edge.get("weight").and_then(Value::as_f64).unwrap_or_else(|| graph_edge_default_weight(relation)).clamp(0.1, 1.0);
@@ -606,6 +683,34 @@ pub fn outline_to_markdown(outline: Option<&Value>) -> String {
         visit(nodes, &mut output, 0);
     }
     output
+}
+
+#[cfg(test)]
+mod incremental_write_tests {
+    use super::{remove_stale_markdown, write_if_changed};
+    use std::collections::HashSet;
+    use std::fs;
+
+    #[test]
+    fn 内容没变不重写_变了才写_被删的文件会补回_旧文件按保留清单清理() {
+        let root = std::env::temp_dir().join(format!("zhizhang-incremental-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.md");
+        assert!(write_if_changed(&path, b"one").unwrap());
+        assert!(!write_if_changed(&path, b"one").unwrap(), "内容没变不该再写");
+        assert!(write_if_changed(&path, b"two").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        fs::remove_file(&path).unwrap();
+        assert!(write_if_changed(&path, b"two").unwrap(), "文件被外部删掉时要补回");
+
+        let stale = root.join("b.md");
+        fs::write(&stale, b"old").unwrap();
+        remove_stale_markdown(&root, &HashSet::from([path.clone()])).unwrap();
+        assert!(path.exists());
+        assert!(!stale.exists(), "不在保留清单里的旧文件要删掉");
+
+        fs::remove_dir_all(&root).ok();
+    }
 }
 
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, type ChangeEvent } from 'react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ChangeEvent } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
@@ -6,13 +6,13 @@ import { partsFromBreaks, splitParagraphs, type AgentProgressEvent, type Runtime
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
-import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
+import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile, buildGraphRelationIndex, computeGraphLayout, noGraphNodes, noGraphEdges, type GraphRelationSummary } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories } from './domain/memory';
 import { cardSearchTerms, refreshCardStatesForProject } from './domain/cards';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
 import { chapterNumberFromText, outlineByChapterNumber, resolveOutlineGenerationIntent } from './features/outline/model';
-import { boundChapterOutlineFor, buildChapterWriteContext } from './features/chapter-agent/context';
+import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, outlineFinalChapterNumber, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
 import { buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
@@ -1185,7 +1185,7 @@ function App() {
       .finally(() => setFanqieCategoriesLoading(false));
   }, [activeTab, rankingPlatform, fanqieCategories, agentConfig]);
 
-  const [agentInstruction, setAgentInstruction] = useState('根据当前章节上下文继续创作，保持人物设定和时间线一致，并在结尾留下自然的悬念。');
+  const [agentInstruction, setAgentInstruction] = useState(defaultChapterInstruction);
   const [outlineAgentInstruction, setOutlineAgentInstruction] = useState('根据作品设定和当前大纲内容补全结构，明确章节目标、冲突推进、人物动机和结尾钩子。');
   const [cardAgentInstruction, setCardAgentInstruction] = useState('根据作品设定、当前章节和已有卡片，补全这张知识卡的详细信息，保持设定一致。');
   const [outlineGenerating, setOutlineGenerating] = useState(false);
@@ -1223,6 +1223,10 @@ function App() {
   const [memoryBackfillFrom, setMemoryBackfillFrom] = useState(1);
   const [memoryBackfillProgress, setMemoryBackfillProgress] = useState<{ done: number; total: number } | null>(null);
   const memoryBackfillAbortRef = useRef(false);
+  // 懒人连续创作：要写几章、当前写到第几章；停止只在本章写完后生效
+  const [continuousCount, setContinuousCount] = useState(3);
+  const [continuousWriting, setContinuousWriting] = useState<{ done: number; total: number; message: string } | null>(null);
+  const continuousAbortRef = useRef(false);
   const [outlineSessionId, setOutlineSessionId] = useState(() => loadSessionId('outline'));
   const [cardSessionId, setCardSessionId] = useState(() => loadSessionId('card'));
   const [outlineStreamContent, setOutlineStreamContent] = useState('');
@@ -4053,9 +4057,12 @@ function App() {
     sourceMode?: string;
     formatOutline?: OutlineDocument;
     formatMode?: string;
+    /** 生成阶段节拍表：规划这几章的逐章事件，而不是某一章的章纲 */
+    beatSheet?: { from: number; to: number; writtenThrough: number };
   }) => {
-    const { runId, project, targetOutline, kind, instruction, targetChapter, sourceChapter, sourceMode, formatOutline, formatMode } = options;
+    const { runId, project, targetOutline, kind, instruction, targetChapter, sourceChapter, sourceMode, formatOutline, formatMode, beatSheet } = options;
     const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
+    const targetNumber = targetChapter ? (chapterNumberFromText(targetChapter.title) || project.chapters.findIndex(chapter => chapter.id === targetChapter.id) + 1) : undefined;
     const result = await agentRpc<{ content?: string; title?: string }>('outline.write', {
         runId,
         sessionId: outlineSessionId,
@@ -4064,9 +4071,12 @@ function App() {
         projectTitle: project.title,
         kind,
         existingContent: targetOutline.content,
+        beatSheet,
+        // 本章节拍：阶段节拍表里给目标章定的事件，章纲必须围着它写
+        stageBeats: targetNumber ? stageBeatsFor(project, targetNumber)?.content : undefined,
         targetChapter: targetChapter ? {
           id: targetChapter.id,
-          number: chapterNumberFromText(targetChapter.title) || project.chapters.findIndex(chapter => chapter.id === targetChapter.id) + 1,
+          number: targetNumber,
           title: targetChapter.title,
         } : undefined,
         sourceChapter: sourceChapter ? {
@@ -4093,7 +4103,7 @@ function App() {
         masterOutline: project.outlines.filter(item => item.kind === '总纲' && item.content.trim()).map(item => item.content).join('\n\n'),
         recentMemories: recentChapterMemories(
           project,
-          chapterNumberFromText(`${targetOutline.title}\n${targetOutline.content.slice(0, 500)}`) || project.chapters.length + 1,
+          options.beatSheet ? options.beatSheet.writtenThrough + 1 : chapterNumberFromText(`${targetOutline.title}\n${targetOutline.content.slice(0, 500)}`) || project.chapters.length + 1,
         ).map(memory => ({ chapterNumber: memory.chapterNumber, title: memory.chapterTitle, summary: memory.summary, endingHook: memory.endingHook, foreshadowingItems: memory.foreshadowingItems || [] })),
         totalChapters: project.chapters.length,
         authorPreferences: project.authorPreferences || [],
@@ -4109,6 +4119,41 @@ function App() {
         ...agentNetworkParams(agentConfig),
       });
     return String(result.content || '');
+  };
+
+  /**
+   * 阶段节拍表：进入一个新阶段（总纲里的章号区间）时，先把这几章的事件一次规划好，一章一行
+   * 没有它，每章章纲只能从上一章末尾往下顺，一条线越挖越深（实测某本书六章都在写同一份签字）；
+   * 表存进大纲页，作者可以改，改完下一章就按改后的写。没有节拍表覆盖本章、总纲又有区间时才生成
+   */
+  const ensureStageBeats = async (project: Project, chapter: Chapter, runId: string): Promise<Project> => {
+    const number = project.chapters.findIndex(item => item.id === chapter.id) + 1;
+    if (stageBeatsFor(project, number)) return project;
+    const range = stageRangeFor(project, number);
+    if (!range) return project;
+    const message = `进入第 ${range.from}～${range.to} 章阶段，正在按总纲规划这几章的逐章节拍`;
+    setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
+    setAgentProgressMessage(message);
+    const now = new Date().toISOString();
+    const draft: OutlineDocument = { id: Date.now(), kind: '章纲', title: stageBeatsTitle(range), content: '', createdAt: now, updatedAt: now };
+    const content = await requestOutlineWrite({
+      runId: `${runId}:beats`,
+      project,
+      targetOutline: draft,
+      kind: '章纲',
+      instruction: `按总纲把第 ${range.from}～${range.to} 章拆成逐章事件。作者对当前创作的要求：${agentInstruction.trim()}`,
+      beatSheet: { from: range.from, to: range.to, writtenThrough: number - 1 },
+    });
+    if (!content.trim()) throw new Error('大纲智能体没有返回阶段节拍表');
+    const beats: OutlineDocument = { ...draft, content, updatedAt: new Date().toISOString() };
+    const attach = (current: Project): Project => ({
+      ...current,
+      outlines: [...current.outlines, beats],
+      graphNodes: [...current.graphNodes, { id: `outline:${beats.id}`, label: beats.title, type: 'outline', category: '章纲' }],
+      updatedAt: beats.updatedAt,
+    });
+    setEditingProject(current => current && current.id === project.id ? attach(current) : current);
+    return attach(project);
   };
 
   /**
@@ -4314,14 +4359,11 @@ function App() {
     setNotice({ title: 'AI 检测完成', content: `已分析 ${report.chapters.length} 个章节，预估 AI 率 ${report.averageAIRate}%。` });
   };
 
-  const runChapterAgent = async () => {
-    if (!editingProject || !activeChapter || agentRunning(agentStage)) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
-      setAgentError('请先填写 API Saver Key');
-      setAgentStage('error');
-      return;
-    }
-    const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  /**
+   * 请求章节智能体写一章：本章没有章纲就先自动生成并绑定，再组装资料调 chapter.write
+   * 单次运行与连续创作共用；返回带上新章纲的项目与已剥好标题的草稿，界面状态怎么落由调用方决定
+   */
+  const requestChapterDraft = async (sourceProject: Project, chapter: Chapter, runId: string): Promise<{ project: Project; result: AgentDraftResult }> => {
     activeAgentRunRef.current = runId;
     setAgentError('');
     setAgentDraft(null);
@@ -4345,113 +4387,223 @@ function App() {
         agentSkills = builtinSkills;
       }
     }
-    const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
-    try {
-      await invoke<string>('start_agent_runtime');
-      // 懒人流程：本章没有章纲就先自动生成并绑定，作者只管点一次运行，不用先去大纲页
-      let project = editingProject;
-      if (!boundChapterOutlineFor(project, activeChapter)) {
-        const message = '本章还没有章纲，正在按总纲、故事账本和上一章自动生成';
-        setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
-        setAgentProgressPercent(current => Math.max(current, 2));
-        setAgentProgressMessage(message);
-        project = await autoGenerateChapterOutline(project, activeChapter, agentInstruction, runId);
-      }
-      // 章节智能体能看到哪些资料，统一由 buildChapterWriteContext 决定；这里只补会话与模型配置
-      const chapterContext = buildChapterWriteContext({
-        project,
-        chapter: activeChapter,
-        instruction: agentInstruction,
-        skills: agentSkills,
-        preferredSkillNames: selectedAgentSkillNames,
-        extraOutlineIds: selectedOutlineIds,
-        selectedCardIds,
-        writingStyle: activeStyle,
-      });
-      setAgentProgress(items => items.map(item => item.id === 'starting'
-        ? { ...item, status: 'active', progress: Math.max(item.progress, 3), message: '运行环境已就绪，正在发送创作任务' }
-        : item));
-      setAgentProgressPercent(current => Math.max(current, 3));
-      setAgentProgressMessage('运行环境已就绪，正在发送创作任务');
-      const result = await agentRpc<AgentDraftResult>('chapter.write', {
-          runId,
-          sessionId: chapterSessionId,
-          ...chapterContext.params,
-          apiKey: agentConfig.apiKey.trim(),
-          baseURL: agentConfig.baseURL.trim(),
-          model: agentConfig.model.trim() || 'gpt-4o-mini',
-          apiMode: agentConfig.apiMode,
-          reasoningMode: agentConfig.reasoningMode,
-          contextWindow: agentConfig.contextWindow,
-          ...agentNetworkParams(agentConfig),
-        });
-      // The completed RPC result is the source of truth. It must replace the
-      // streaming buffer because JSON envelopes can be split across SSE frames.
-      // 标题行属于标题栏、不属于正文：拆出来单独带走
-      // 运行时已经在图里拆过一次，这里再兜一次——非流式回退或模型二次补标题时也能拿到章节名
-      const draft = splitChapterTitleHeading(chapterDraftFromStream(result.draftContent || ''));
-      const draftContent = draft.content;
-      // 运行时的信封 title 优先（它已做过清洗和命名兵底），非流式回退时才用正文开头剥下来的那行
-      const normalizedResult = { ...result, draftContent, chapterTitle: result.chapterTitle || draft.title };
-      setAgentDraft(normalizedResult);
-      setAgentDisplayContent(draftContent);
-      // 标题当场算好并展示：作者接受前能看见、能改，不用写入后才发现标题标还是占位章号
-      setAgentDraftTitle(applyDraftChapterTitle(activeChapter.title, normalizedResult.chapterTitle || ''));
-      agentStreamRawContentRef.current = '';
-      // SSE chunks are already rendered by the shared stream listener. The
-      // completed result is authoritative when the provider falls back to a
-      // non-streaming response.
-      if (agentTypewriterRef.current) {
-        window.clearInterval(agentTypewriterRef.current);
-        agentTypewriterRef.current = null;
-      }
-      await syncRuntimeUsage();
-      setAgentStage('done');
-      setAgentProgressPercent(100);
-      setAgentProgressMessage('章节草稿和一致性审查已完成');
-      setAgentProgress(items => items.map(item => ({ ...item, status: 'complete', progress: Math.max(item.progress, 100) })));
-    } catch (error) {
-      const message = String(error);
-      setAgentError(message);
-      setAgentStage('error');
+    const activeStyle = sourceProject.styleProfileId ? writingStyles.find(style => style.id === sourceProject.styleProfileId) : undefined;
+    await invoke<string>('start_agent_runtime');
+    // 懒人流程：先保证本章所在阶段有逐章节拍表，再保证本章有章纲；作者只管点一次运行
+    let project = await ensureStageBeats(sourceProject, chapter, runId);
+    if (!boundChapterOutlineFor(project, chapter)) {
+      const message = '本章还没有章纲，正在按总纲、故事账本和上一章自动生成';
+      setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
+      setAgentProgressPercent(current => Math.max(current, 2));
       setAgentProgressMessage(message);
-      setAgentProgress(items => {
-        const activeIndex = Math.max(0, items.findIndex(item => item.status === 'active'));
-        return items.map((item, index) => index === activeIndex ? { ...item, status: 'error', message } : item);
-      });
+      project = await autoGenerateChapterOutline(project, chapter, agentInstruction, runId);
     }
+    // 章节智能体能看到哪些资料，统一由 buildChapterWriteContext 决定；这里只补会话与模型配置
+    const chapterContext = buildChapterWriteContext({
+      project,
+      chapter,
+      instruction: agentInstruction,
+      skills: agentSkills,
+      preferredSkillNames: selectedAgentSkillNames,
+      extraOutlineIds: selectedOutlineIds,
+      selectedCardIds,
+      writingStyle: activeStyle,
+    });
+    setAgentProgress(items => items.map(item => item.id === 'starting'
+      ? { ...item, status: 'active', progress: Math.max(item.progress, 3), message: '运行环境已就绪，正在发送创作任务' }
+      : item));
+    setAgentProgressPercent(current => Math.max(current, 3));
+    setAgentProgressMessage('运行环境已就绪，正在发送创作任务');
+    const result = await agentRpc<AgentDraftResult>('chapter.write', {
+        runId,
+        sessionId: chapterSessionId,
+        ...chapterContext.params,
+        apiKey: agentConfig.apiKey.trim(),
+        baseURL: agentConfig.baseURL.trim(),
+        model: agentConfig.model.trim() || 'gpt-4o-mini',
+        apiMode: agentConfig.apiMode,
+        reasoningMode: agentConfig.reasoningMode,
+        contextWindow: agentConfig.contextWindow,
+        ...agentNetworkParams(agentConfig),
+      });
+    // The completed RPC result is the source of truth. It must replace the
+    // streaming buffer because JSON envelopes can be split across SSE frames.
+    // 标题行属于标题栏、不属于正文：拆出来单独带走
+    // 运行时已经在图里拆过一次，这里再兜一次——非流式回退或模型二次补标题时也能拿到章节名
+    const draft = splitChapterTitleHeading(chapterDraftFromStream(result.draftContent || ''));
+    // 运行时的信封 title 优先（它已做过清洗和命名兵底），非流式回退时才用正文开头剥下来的那行
+    return { project, result: { ...result, draftContent: draft.content, chapterTitle: result.chapterTitle || draft.title } };
+  };
+
+  // 一次运行收尾：停掉打字机、同步用量、把进度条推到 100%
+  const finishAgentRun = async (message = '章节草稿和一致性审查已完成') => {
+    agentStreamRawContentRef.current = '';
+    if (agentTypewriterRef.current) {
+      window.clearInterval(agentTypewriterRef.current);
+      agentTypewriterRef.current = null;
+    }
+    await syncRuntimeUsage();
+    setAgentStage('done');
+    setAgentProgressPercent(100);
+    setAgentProgressMessage(message);
+    setAgentProgress(items => items.map(item => ({ ...item, status: 'complete', progress: Math.max(item.progress, 100) })));
+  };
+
+  const failAgentRun = (error: unknown) => {
+    const message = String(error);
+    setAgentError(message);
+    setAgentStage('error');
+    setAgentProgressMessage(message);
+    setAgentProgress(items => {
+      const activeIndex = Math.max(0, items.findIndex(item => item.status === 'active'));
+      return items.map((item, index) => index === activeIndex ? { ...item, status: 'error', message } : item);
+    });
+  };
+
+  const runChapterAgent = async () => {
+    if (!editingProject || !activeChapter || agentRunning(agentStage) || continuousWriting) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setAgentError('请先填写 API Saver Key');
+      setAgentStage('error');
+      return;
+    }
+    const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const { result } = await requestChapterDraft(editingProject, activeChapter, runId);
+      setAgentDraft(result);
+      setAgentDisplayContent(result.draftContent || '');
+      // 标题当场算好并展示：作者接受前能看见、能改，不用写入后才发现标题栏还是占位章号
+      setAgentDraftTitle(applyDraftChapterTitle(activeChapter.title, result.chapterTitle || ''));
+      await finishAgentRun();
+    } catch (error) {
+      failAgentRun(error);
+    }
+  };
+
+  /** 把草稿写进章节并生成本地记忆、刷新卡片状态：手动“采用草稿”和连续创作共用 */
+  const applyAgentDraft = (project: Project, chapter: Chapter, draftContent: string, title: string, summary?: string): { project: Project; chapter: Chapter } => {
+    // 写入前再剥一次标题行：预览框可手改，手改后同样不该把 # 标题存进正文
+    const draft = splitChapterTitleHeading(draftContent);
+    const updatedChapter: Chapter = {
+      // 采用草稿会覆盖现有正文，先存快照
+      ...pushChapterSnapshot(chapter, 'Agent 草稿'),
+      title: title.slice(0, 160),
+      content: draft.content,
+      wordCount: countNovelCharacters(draft.content),
+      updatedAt: new Date().toISOString(),
+    };
+    const selectedCards = project.cards.filter(card => selectedCardIds.includes(card.id));
+    const updatedWithMemory = buildProjectWithChapterMemory(project, updatedChapter, {
+      summary: summary || buildLocalChapterSummary(draft.content),
+      keywords: selectedCards.map(card => card.title),
+    });
+    const updated = refreshCardStatesForProject(updatedWithMemory, new Set(updatedWithMemory.cards
+      .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => updatedChapter.content.includes(term)))
+      .map(card => card.id)));
+    return { project: updated, chapter: updatedChapter };
+  };
+
+  /**
+   * 连续创作时同步提炼本章记忆：下一章的故事账本靠它拿到本章的章末钩子与伏笔，
+   * 不能像手动保存那样丢到后台——后台跑完之前下一章已经开写了
+   */
+  const refineChapterMemory = async (project: Project, chapter: Chapter): Promise<Project> => {
+    const local = buildLocalStructuredMemory(chapter, project);
+    const existing = project.memories.find(memory => memory.chapterId === chapter.id);
+    const keywords = existing?.keywords?.length ? existing.keywords : local.keywords;
+    const result = await agentRpc<AgentMemoryResult>('memory.write', {
+      projectTitle: project.title,
+      chapterTitle: chapter.title,
+      content: chapter.content,
+      cards: project.cards.filter(card => card.title.trim() && chapter.content.includes(card.title)).slice(0, 10),
+      apiKey: agentConfig.apiKey.trim(),
+      baseURL: agentConfig.baseURL.trim(),
+      model: agentConfig.model.trim() || fallbackModels[0],
+      apiMode: agentConfig.apiMode,
+      reasoningMode: agentConfig.reasoningMode,
+      contextWindow: agentConfig.contextWindow,
+      knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
+      ...agentNetworkParams(agentConfig),
+    });
+    const withMemory = buildProjectWithChapterMemory(project, chapter, buildChapterMemoryPatch({ result, local, keywords, existing }));
+    const mentioned = new Set(withMemory.cards.filter(card => cardSearchTerms(card).some(term => chapter.content.includes(term))).map(card => card.id));
+    return refreshCardStatesForProject(mergeKnowledgeGraph(withMemory, chapter, result), mentioned);
+  };
+
+  /**
+   * 懒人连续创作：新建一章 → 自动章纲 → 写正文 → 采用草稿 → 提炼记忆 → 再新建下一章
+   * 写满指定章数、写到总纲末章、出错或作者点停止为止；每章写完立刻落盘，中途停下已写的章都在
+   */
+  const runContinuousWriting = async () => {
+    const start = editingProjectRef.current;
+    if (!start || agentRunning(agentStage) || continuousWriting) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '无法连续创作', content: '请先在设置里填写模型 API Key。' });
+      return;
+    }
+    const total = Math.max(1, Math.min(200, Math.round(continuousCount) || 1));
+    const finalChapter = outlineFinalChapterNumber(start);
+    continuousAbortRef.current = false;
+    setContinuousWriting({ done: 0, total, message: '准备新建章节' });
+    let project = start;
+    let done = 0;
+    let stopReason = '';
+    try {
+      for (; done < total; done += 1) {
+        if (continuousAbortRef.current) {
+          stopReason = '作者点了停止';
+          break;
+        }
+        const number = project.chapters.length + 1;
+        if (finalChapter !== undefined && number > finalChapter) {
+          stopReason = `总纲规划到第 ${finalChapter} 章，已写到末章`;
+          break;
+        }
+        const inserted = insertChapterAfter(project, project.chapters.at(-1)?.id ?? null, `第 ${number} 章`);
+        project = inserted.project;
+        setEditingProject(project);
+        setActiveChapter(inserted.chapter);
+        setContinuousWriting({ done, total, message: `第 ${number} 章：生成章纲与正文` });
+        const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const drafted = await requestChapterDraft(project, inserted.chapter, runId);
+        if (!drafted.result.draftContent?.trim()) throw new Error(`第 ${number} 章没有生成出正文`);
+        const applied = applyAgentDraft(drafted.project, inserted.chapter, drafted.result.draftContent, applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''), drafted.result.summary);
+        project = applied.project;
+        setActiveChapter(applied.chapter);
+        setAgentDraft(null);
+        setAgentDisplayContent('');
+        await finishAgentRun(`第 ${number} 章已写入并采用`);
+        await applyProjectChange(project);
+        setContinuousWriting({ done: done + 1, total, message: `第 ${number} 章：正文已采用，正在提炼记忆` });
+        try {
+          project = await refineChapterMemory(project, applied.chapter);
+          await applyProjectChange(project);
+        } catch (error) {
+          // 额度用尽就别再往下撞了；其他失败只影响下一章的承接质量，正文已经保住
+          if (isQuotaExceededError(error)) throw error;
+          setNotice({ title: `第 ${number} 章记忆未提炼`, content: `${String(error)}。正文已保存，下一章只能靠本章摘要承接。` });
+        }
+      }
+    } catch (error) {
+      failAgentRun(error);
+      stopReason = `第 ${project.chapters.length} 章出错：${String(error)}`;
+    }
+    setContinuousWriting(null);
+    setNotice({ title: '连续创作结束', content: `已写 ${done} 章${stopReason ? `；${stopReason}` : ''}。` });
   };
 
   const acceptAgentDraft = () => {
     if (!agentDraft?.draftContent) return;
     if (editingProject && activeChapter) {
-      const now = new Date().toISOString();
-      // 写入前再剥一次标题行：预览框可手改，手改后同样不该把 # 标题存进正文
       const draft = splitChapterTitleHeading(agentDraft.draftContent);
-      const chapterContent = draft.content;
       // 标题栏里的值是作者看得见也改得动的那一个，优先级最高；
       // 它被清空才回退到正文开头剥下来的标题行与运行时给的章节名，且只补占位标题
       const draftTitle = agentDraftTitle.trim()
         || applyDraftChapterTitle(activeChapter.title, draft.title || agentDraft.chapterTitle || '');
-      const updatedChapter: Chapter = {
-        // 采用草稿会覆盖现有正文，先存快照
-        ...pushChapterSnapshot(activeChapter, 'Agent 草稿'),
-        title: draftTitle.slice(0, 160),
-        content: chapterContent,
-        wordCount: countNovelCharacters(chapterContent),
-        updatedAt: now,
-      };
-      const selectedCards = editingProject.cards.filter(card => selectedCardIds.includes(card.id));
-      const updatedWithMemory = buildProjectWithChapterMemory(editingProject, updatedChapter, {
-        summary: agentDraft.summary || buildLocalChapterSummary(agentDraft.draftContent),
-        keywords: selectedCards.map(card => card.title),
-      });
-      const updated = refreshCardStatesForProject(updatedWithMemory, new Set(updatedWithMemory.cards
-        .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => updatedChapter.content.includes(term)))
-        .map(card => card.id)));
-      setEditingProject(updated);
-      setActiveChapter(updatedChapter);
-      setProjects(current => current.map(project => project.id === updated.id ? updated : project));
+      const applied = applyAgentDraft(editingProject, activeChapter, agentDraft.draftContent, draftTitle, agentDraft.summary);
+      setEditingProject(applied.project);
+      setActiveChapter(applied.chapter);
+      setProjects(current => current.map(project => project.id === applied.project.id ? applied.project : project));
       window.setTimeout(() => chapterEditorRef.current?.focus(), 0);
     }
     setAgentDraft(null);
@@ -5424,36 +5576,36 @@ function App() {
   const activeMemoryDocument = editingProject?.memoryDocuments.find(document => document.id === activeMemoryDocumentId) ?? null;
   const activeChapterMemory = editingProject?.memories.find(memory => memory.id === activeChapterMemoryId) ?? null;
   const activeGraphNode = editingProject?.graphNodes.find(node => node.id === activeGraphNodeId) ?? null;
-  const focusedGraphRelationIds = new Set(editingProject && activeGraphNodeId
-    ? editingProject.graphEdges
-      .filter(edge => edge.source === activeGraphNodeId || edge.target === activeGraphNodeId)
-      .map(edge => edge.id)
-    : []);
-  const focusedGraphNodeIds = new Set(editingProject && activeGraphNodeId
-    ? [
-      activeGraphNodeId,
-      ...editingProject.graphEdges
-        .filter(edge => edge.source === activeGraphNodeId || edge.target === activeGraphNodeId)
-        .map(edge => edge.source === activeGraphNodeId ? edge.target : edge.source),
-    ]
-    : []);
-  const graphDocumentGroups = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeGroup))) : [];
+  // 图谱的派生数据全部按输入缓存，并且只在图谱页打开时才算：
+  // 一本书近千个节点、近三千条关系时，力导向布局一次七八百毫秒、文档视图排序三百毫秒，
+  // 以前它们写在渲染函数体里，每敲一个字都要重算一遍，整个编辑器都跟着卡
+  const graphNodes = editingProject?.graphNodes ?? noGraphNodes;
+  const graphEdges = editingProject?.graphEdges ?? noGraphEdges;
+  const graphPaneVisible = Boolean(editingProject) && editorSidebarTab === 'knowledge-graph';
+  const graphRelations = useMemo(() => graphPaneVisible ? buildGraphRelationIndex(graphEdges) : new Map<string, GraphRelationSummary>(), [graphPaneVisible, graphEdges]);
+  const graphNodeById = useMemo(() => new Map(graphNodes.map(node => [node.id, node])), [graphNodes]);
+  const focusedGraphEdges = activeGraphNodeId ? graphRelations.get(activeGraphNodeId)?.edges ?? [] : [];
+  const focusedGraphRelationIds = new Set(focusedGraphEdges.map(edge => edge.id));
+  const focusedGraphNodeIds = new Set(activeGraphNodeId ? [activeGraphNodeId, ...focusedGraphEdges.map(edge => edge.source === activeGraphNodeId ? edge.target : edge.source)] : []);
+  const graphGroupCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    if (graphPaneVisible) graphNodes.forEach(node => { const group = graphNodeGroup(node); counts.set(group, (counts.get(group) || 0) + 1); });
+    return counts;
+  }, [graphPaneVisible, graphNodes]);
+  const graphDocumentGroups = Array.from(graphGroupCounts.keys());
   const activeGraphDocumentGroup = graphDocumentGroups.some(group => group === graphDocumentGroup) ? graphDocumentGroup : (graphDocumentGroups[0] || '');
-  const graphDocumentTypeOptions = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeTypeLabel))).sort((left, right) => left.localeCompare(right, 'zh-CN')) : [];
-  const graphDocumentNodes = editingProject ? editingProject.graphNodes.filter(node => {
-    const matchesGroup = !activeGraphDocumentGroup || graphNodeGroup(node) === activeGraphDocumentGroup;
-    const matchesType = graphDocumentType === '全部类型' || graphNodeTypeLabel(node) === graphDocumentType;
-    const searchText = `${node.label}\n${graphNodeRelativePath(node)}\n${graphNodeProfile(node)}`.toLowerCase();
-    const matchesQuery = !graphDocumentQuery.trim() || searchText.includes(graphDocumentQuery.trim().toLowerCase());
-    const relationCount = editingProject.graphEdges.filter(edge => edge.source === node.id || edge.target === node.id).length;
-    return matchesGroup && matchesType && matchesQuery && (!graphOnlyIsolated || relationCount === 0);
-  }).sort((left, right) => {
-    const relationStrength = (node: KnowledgeGraphNode) => editingProject.graphEdges
-      .filter(edge => edge.source === node.id || edge.target === node.id)
-      .reduce((sum, edge) => sum + normalizeKnowledgeGraphWeight(edge.weight, edge.label), 0);
-    const relationDifference = relationStrength(right) - relationStrength(left);
-    return relationDifference || left.label.localeCompare(right.label, 'zh-CN');
-  }) : [];
+  const graphDocumentTypeOptions = useMemo(() => graphPaneVisible ? Array.from(new Set(graphNodes.map(graphNodeTypeLabel))).sort((left, right) => left.localeCompare(right, 'zh-CN')) : [], [graphPaneVisible, graphNodes]);
+  const graphIsolatedCount = useMemo(() => graphPaneVisible ? graphNodes.filter(node => !graphRelations.has(node.id)).length : 0, [graphPaneVisible, graphNodes, graphRelations]);
+  const graphDocumentNodes = useMemo(() => {
+    if (!graphPaneVisible || graphViewMode !== 'document') return [] as KnowledgeGraphNode[];
+    const query = graphDocumentQuery.trim().toLowerCase();
+    return graphNodes.filter(node => {
+      const matchesGroup = !activeGraphDocumentGroup || graphNodeGroup(node) === activeGraphDocumentGroup;
+      const matchesType = graphDocumentType === '全部类型' || graphNodeTypeLabel(node) === graphDocumentType;
+      const matchesQuery = !query || `${node.label}\n${graphNodeRelativePath(node)}\n${graphNodeProfile(node)}`.toLowerCase().includes(query);
+      return matchesGroup && matchesType && matchesQuery && (!graphOnlyIsolated || !graphRelations.has(node.id));
+    }).sort((left, right) => (graphRelations.get(right.id)?.strength ?? 0) - (graphRelations.get(left.id)?.strength ?? 0) || left.label.localeCompare(right.label, 'zh-CN'));
+  }, [graphPaneVisible, graphViewMode, graphNodes, graphRelations, activeGraphDocumentGroup, graphDocumentType, graphDocumentQuery, graphOnlyIsolated]);
   const visibleCards = editingProject?.cards.filter(card => cardTypeFilter === '全部' || card.type === cardTypeFilter) ?? [];
   const characterNames = editingProject ? Array.from(new Set([
     ...(editingProject.protagonist1 || '').split(/[、,，/\s]+/u),
@@ -5518,50 +5670,8 @@ function App() {
       editor.setSelectionRange(position, position + searchQuery.length);
     }, 0);
   };
-  const graphLayout = (() => {
-    const nodes = editingProject?.graphNodes ?? [];
-    const edges = editingProject?.graphEdges ?? [];
-    if (!nodes.length) return [];
-    const positions = nodes.map((node, index) => {
-      const angle = index * 2.399963229728653;
-      const radius = 0.18 + 0.27 * Math.sqrt(index / Math.max(nodes.length - 1, 1));
-      return { id: node.id, x: 0.5 + Math.cos(angle) * radius, y: 0.5 + Math.sin(angle) * radius };
-    });
-    const byId = new Map(positions.map(position => [position.id, position]));
-    for (let iteration = 0; iteration < 65; iteration += 1) {
-      for (let left = 0; left < positions.length; left += 1) {
-        for (let right = left + 1; right < positions.length; right += 1) {
-          const first = positions[left]; const second = positions[right];
-          const dx = first.x - second.x; const dy = first.y - second.y;
-          const distance = Math.max(0.025, Math.hypot(dx, dy));
-          const force = Math.min(0.018, 0.0019 / (distance * distance));
-          first.x += dx / distance * force; first.y += dy / distance * force;
-          second.x -= dx / distance * force; second.y -= dy / distance * force;
-        }
-      }
-      for (const edge of edges) {
-        const source = byId.get(edge.source); const target = byId.get(edge.target);
-        if (!source || !target) continue;
-        const dx = target.x - source.x; const dy = target.y - source.y;
-        const distance = Math.max(0.025, Math.hypot(dx, dy));
-        const weight = normalizeKnowledgeGraphWeight(edge.weight, edge.label);
-        const preferredDistance = 0.27 - weight * 0.11;
-        const force = (distance - preferredDistance) * (0.018 + weight * 0.035);
-        source.x += dx / distance * force; source.y += dy / distance * force;
-        target.x -= dx / distance * force; target.y -= dy / distance * force;
-      }
-      positions.forEach(position => {
-        position.x = Math.max(0.05, Math.min(0.95, position.x + (0.5 - position.x) * 0.004));
-        position.y = Math.max(0.07, Math.min(0.93, position.y + (0.5 - position.y) * 0.004));
-      });
-    }
-    return positions.map(position => ({
-      ...position,
-      x: 5 + position.x * 90,
-      y: 6 + position.y * 88,
-      degree: edges.filter(edge => edge.source === position.id || edge.target === position.id).length,
-    }));
-  })();
+  const graphLayout = useMemo(() => graphPaneVisible && graphViewMode === 'graph' ? computeGraphLayout(graphNodes, graphEdges) : [], [graphPaneVisible, graphViewMode, graphNodes, graphEdges]);
+  const graphLayoutById = useMemo(() => new Map(graphLayout.map(position => [position.id, position])), [graphLayout]);
   const projectAgentPendingChanges = projectAgentSession?.changes.filter(change => change.status === 'pending') || [];
   const projectAgentChangeLabel = (change: ProjectAgentChange) => {
     switch (change.type) {
@@ -6157,25 +6267,24 @@ function App() {
                     </div>
                     {graphViewMode === 'document' ? <div className="graph-document-view">
                       <div className="graph-document-toolbar">
-                        <div className="graph-document-groups">{graphDocumentGroups.map(group => <button key={group} className={group === activeGraphDocumentGroup ? 'active' : ''} onClick={() => setGraphDocumentGroup(group)}>{group} <small>{editingProject.graphNodes.filter(node => graphNodeGroup(node) === group).length}</small></button>)}</div>
+                        <div className="graph-document-groups">{graphDocumentGroups.map(group => <button key={group} className={group === activeGraphDocumentGroup ? 'active' : ''} onClick={() => setGraphDocumentGroup(group)}>{group} <small>{graphGroupCounts.get(group) || 0}</small></button>)}</div>
                         <div className="graph-document-controls">
                           <select className="select" value={graphDocumentType} onChange={event => setGraphDocumentType(event.target.value)}><option>全部类型</option>{graphDocumentTypeOptions.map(type => <option key={type}>{type}</option>)}</select>
                           <input className="input" type="search" value={graphDocumentQuery} placeholder="搜索节点标题或来源路径" onChange={event => setGraphDocumentQuery(event.target.value)} />
                           <label className="graph-document-isolated"><input type="checkbox" checked={graphOnlyIsolated} onChange={event => setGraphOnlyIsolated(event.target.checked)} /> 只看孤立节点</label>
                         </div>
-                        <div className="graph-document-summary"><span>当前显示 {graphDocumentNodes.length} / {editingProject.graphNodes.filter(node => !activeGraphDocumentGroup || graphNodeGroup(node) === activeGraphDocumentGroup).length} 个节点</span><span>孤立节点 {editingProject.graphNodes.filter(node => !editingProject.graphEdges.some(edge => edge.source === node.id || edge.target === node.id)).length} 个</span><button className="link-button" onClick={() => setExpandedGraphDocumentIds(graphDocumentNodes.map(node => node.id))}>全部展开</button><button className="link-button" onClick={() => setExpandedGraphDocumentIds([])}>全部收起</button></div>
+                        <div className="graph-document-summary"><span>当前显示 {graphDocumentNodes.length} / {activeGraphDocumentGroup ? (graphGroupCounts.get(activeGraphDocumentGroup) || 0) : graphNodes.length} 个节点</span><span>孤立节点 {graphIsolatedCount} 个</span><button className="link-button" onClick={() => setExpandedGraphDocumentIds(graphDocumentNodes.map(node => node.id))}>全部展开</button><button className="link-button" onClick={() => setExpandedGraphDocumentIds([])}>全部收起</button></div>
                       </div>
                       {graphDocumentNodes.length === 0 ? <div className="empty-state"><p>当前筛选下暂无图谱节点。</p></div> : <div className="graph-document-list">{graphDocumentNodes.map((node, index) => {
-                        const relations = editingProject.graphEdges.filter(edge => edge.source === node.id || edge.target === node.id)
-                          .sort((left, right) => normalizeKnowledgeGraphWeight(right.weight, right.label) - normalizeKnowledgeGraphWeight(left.weight, left.label));
-                        const relatedChapterNodes = relations.map(edge => editingProject.graphNodes.find(item => item.id === (edge.source === node.id ? edge.target : edge.source))).filter((item): item is KnowledgeGraphNode => Boolean(item && item.type === 'chapter'));
+                        const relations = graphRelations.get(node.id)?.edges ?? [];
+                        const relatedChapterNodes = relations.map(edge => graphNodeById.get(edge.source === node.id ? edge.target : edge.source)).filter((item): item is KnowledgeGraphNode => Boolean(item && item.type === 'chapter'));
                         const expanded = expandedGraphDocumentIds.includes(node.id);
                         return <article className="graph-document-node" key={node.id}>
                           <div className="graph-document-node-heading"><div><h4>{index + 1}. {node.label}</h4><span>{graphNodeTypeLabel(node)} · {relations.length} 条关联</span></div><button className="link-button" onClick={() => setExpandedGraphDocumentIds(current => current.includes(node.id) ? current.filter(id => id !== node.id) : [...current, node.id])}>{expanded ? '收起' : '展开'}</button></div>
                           {expanded && <div className="graph-document-node-body">
                             <div className="graph-document-node-actions"><button className="link-button" onClick={() => void handleOpenGraphNodeLocation(node)}>打开位置</button><span>来源路径：{graphNodeRelativePath(node)}</span></div>
                             <div className="graph-document-profile"><strong>档案</strong><textarea value={graphNodeProfile(node)} onChange={event => updateGraphNodeProfile(node.id, event.target.value)} /></div>
-                            <div className="graph-document-relations"><strong>关系网络</strong>{relations.length === 0 ? <p>暂无关联关系。</p> : <table><thead><tr><th>关联对象</th><th>关系</th><th>方向</th><th>权重</th></tr></thead><tbody>{relations.map(edge => { const isSource = edge.source === node.id; const other = editingProject.graphNodes.find(item => item.id === (isSource ? edge.target : edge.source)); return <tr key={edge.id}><td><button className="link-button" onClick={() => { setActiveGraphNodeId(other?.id || null); setGraphViewMode('graph'); }}>{other?.label || '未知节点'}</button></td><td>{edge.label}</td><td>{isSource ? '指向对方' : '来自对方'}</td><td>{normalizeKnowledgeGraphWeight(edge.weight, edge.label).toFixed(2)}</td></tr>; })}</tbody></table>}</div>
+                            <div className="graph-document-relations"><strong>关系网络</strong>{relations.length === 0 ? <p>暂无关联关系。</p> : <table><thead><tr><th>关联对象</th><th>关系</th><th>方向</th><th>权重</th></tr></thead><tbody>{relations.map(edge => { const isSource = edge.source === node.id; const other = graphNodeById.get(isSource ? edge.target : edge.source); return <tr key={edge.id}><td><button className="link-button" onClick={() => { setActiveGraphNodeId(other?.id || null); setGraphViewMode('graph'); }}>{other?.label || '未知节点'}</button></td><td>{edge.label}</td><td>{isSource ? '指向对方' : '来自对方'}</td><td>{normalizeKnowledgeGraphWeight(edge.weight, edge.label).toFixed(2)}</td></tr>; })}</tbody></table>}</div>
                             <div className="graph-document-events"><strong>相关事件</strong>{relatedChapterNodes.length ? relatedChapterNodes.map(chapter => <span key={chapter.id}>{chapter.label}</span>) : <p>暂无直接关联事件。</p>}</div>
                           </div>}
                         </article>;
@@ -6183,23 +6292,23 @@ function App() {
                     </div> : <>
                       <div className={`knowledge-graph-canvas ${activeGraphNodeId ? 'is-focused' : ''}`} onClick={() => setActiveGraphNodeId(null)}>
                         <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">{editingProject.graphEdges.map(edge => {
-                          const source = graphLayout.find(item => item.id === edge.source);
-                          const target = graphLayout.find(item => item.id === edge.target);
+                          const source = graphLayoutById.get(edge.source);
+                          const target = graphLayoutById.get(edge.target);
                           const weight = normalizeKnowledgeGraphWeight(edge.weight, edge.label);
                           const edgeFocusClass = !activeGraphNodeId ? '' : focusedGraphRelationIds.has(edge.id) ? 'related' : 'muted';
                           return source && target ? <line key={edge.id} className={edgeFocusClass} x1={source.x} y1={source.y} x2={target.x} y2={target.y} style={{ strokeWidth: `${0.3 + weight * 1.05}px` }} /> : null;
                         })}</svg>
                         {editingProject.graphNodes.map(node => {
-                          const position = graphLayout.find(item => item.id === node.id) ?? { x: 50, y: 50 };
+                          const position = graphLayoutById.get(node.id) ?? { x: 50, y: 50 };
                           const nodeFocusClass = !activeGraphNodeId ? '' : activeGraphNodeId === node.id ? 'active' : focusedGraphNodeIds.has(node.id) ? 'related' : 'muted';
                           return <button key={node.id} className={`knowledge-graph-vertex ${node.type} ${nodeFocusClass}`} style={{ left: `${position.x}%`, top: `${position.y}%` }} onClick={event => { event.stopPropagation(); setActiveGraphNodeId(node.id); }}>{node.label}</button>;
                         })}
                       </div>
                       <div className="knowledge-graph-details">
                         <div><strong>{activeGraphNode?.label || '选择一个节点'}</strong><span>{activeGraphNode ? graphNodeTypeLabel(activeGraphNode) : '查看节点关联'}</span></div>
-                        <div className="knowledge-graph-relations">{!activeGraphNode ? '点击图中的节点查看关联。' : editingProject.graphEdges.filter(edge => edge.source === activeGraphNode.id || edge.target === activeGraphNode.id).sort((left, right) => normalizeKnowledgeGraphWeight(right.weight, right.label) - normalizeKnowledgeGraphWeight(left.weight, left.label)).map(edge => {
+                        <div className="knowledge-graph-relations">{!activeGraphNode ? '点击图中的节点查看关联。' : (graphRelations.get(activeGraphNode.id)?.edges ?? []).map(edge => {
                           const otherId = edge.source === activeGraphNode.id ? edge.target : edge.source;
-                          const other = editingProject.graphNodes.find(node => node.id === otherId);
+                          const other = graphNodeById.get(otherId);
                           return <button key={edge.id} onClick={() => setActiveGraphNodeId(otherId)}>{edge.source === activeGraphNode.id ? '关联到' : '被引用于'} {other?.label || otherId}<small>{edge.label} · {normalizeKnowledgeGraphWeight(edge.weight, edge.label).toFixed(2)}</small></button>;
                         })}</div>
                       </div>
@@ -6544,10 +6653,10 @@ function App() {
                     <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{selectedOutlineIds.filter(id => editingProject.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length} 份</small></div>
                     <button type="button" className={`agent-context-select ${showChapterOutlinePicker ? 'active' : ''}`} onClick={() => setShowChapterOutlinePicker(current => !current)}>选择章纲</button>
                     {showChapterOutlinePicker && <div className="agent-context-dropdown">{editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => <label key={outline.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} /><span><strong>{outline.title || '未命名章纲'}</strong><small>{String(outline.chapterId ?? '') === String(activeChapter?.id ?? '') ? '当前章节' : '其他章节'}</small></span></label>)}</div>}
-                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行章节智能体时会先按总纲与前文自动生成一份并绑定到本章；'; })()}世界观、总纲骨架与最近六章记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
+                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行章节智能体时会先按总纲与前文自动生成一份并绑定到本章；'; })()}世界观、总纲位置与最近章节记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
                   </div>
                   <div className="agent-card-picker">
-                    <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length} 张</small></div>
+                    <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length ? `${selectedCardIds.length} 张` : '未勾选：按章纲与上一章出现的卡自动带入'}</small></div>
                     <button type="button" className={`agent-context-select ${showChapterCardPicker ? 'active' : ''}`} onClick={() => setShowChapterCardPicker(current => !current)}>选择卡片</button>
                     {showChapterCardPicker && <div className="agent-context-dropdown">{editingProject.cards.length === 0 ? <p className="empty-hint compact">先在卡片页创建知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedCardIds.includes(card.id)} onChange={() => toggleCardForChapter(card.id)} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>}
                   </div>
@@ -6558,6 +6667,16 @@ function App() {
                   <button className={`agent-run-button ${agentRunning(agentStage) ? 'running' : ''}`} aria-busy={agentRunning(agentStage)} onClick={runChapterAgent}>
                     {agentRunning(agentStage) ? `智能体执行中 · ${agentProgressPercent}%` : '运行章节智能体'}
                   </button>
+                  <div className="agent-card-picker">
+                    <div className="agent-card-picker-title"><span>懒人连续创作</span><small>{continuousWriting ? `已写 ${continuousWriting.done}/${continuousWriting.total} 章` : (() => { const final = outlineFinalChapterNumber(editingProject); return final ? `总纲写到第 ${final} 章，当前 ${editingProject.chapters.length} 章` : '总纲没写章号区间，只按章数停'; })()}</small></div>
+                    <div className="ai-writing-tool-actions">
+                      <label className="agent-continuous-count">再写 <input className="input" type="number" min={1} max={200} value={continuousCount} disabled={Boolean(continuousWriting)} onChange={event => setContinuousCount(Number(event.target.value) || 1)} /> 章</label>
+                      {continuousWriting
+                        ? <button className="btn-secondary" onClick={() => { continuousAbortRef.current = true; }}>{continuousAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
+                        : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runContinuousWriting()}>新建并连续创作</button>}
+                    </div>
+                    <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '每章自动：新建章节、（进入新阶段时先按总纲规划这几章的逐章节拍，存在大纲页可改）生成章纲、写正文、采用草稿、提炼记忆，再接着写下一章；写满章数、写到总纲末章、出错或点停止为止。'}</p>
+                  </div>
                 </section>
 
                 {agentProgress.length > 0 && (

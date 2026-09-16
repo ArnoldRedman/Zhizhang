@@ -197,7 +197,7 @@ describe("chapter continuity context", () => {
     });
 
     expect(result.continuityContext).toContain("三声敲门");
-    expect(requests[0]?.messages && JSON.stringify(requests[0].messages)).toContain("上一章结尾（最高优先级）");
+    expect(requests[0]?.messages && JSON.stringify(requests[0].messages)).toContain("上一章结尾（承接锚点");
     expect(requests[0]?.messages && JSON.stringify(requests[0].messages)).toContain("三声敲门");
     expect(result.selectedSkills).toContain("chapter-continuity");
     expect(result.chapterPlan).toBeTruthy();
