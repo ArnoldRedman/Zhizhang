@@ -11,8 +11,9 @@ import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, r
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories } from './domain/memory';
 import { cardSearchTerms, refreshCardStatesForProject } from './domain/cards';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
-import { chapterNumberFromText, outlineByChapterNumber, resolveOutlineGenerationIntent } from './features/outline/model';
-import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, outlineFinalChapterNumber, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
+import { mapWithConcurrency } from './utils/concurrency';
+import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
+import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
 import { buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
@@ -94,6 +95,65 @@ interface AIToolResult {
   maxWords?: number;
 }
 
+interface LegacyReviewItem {
+  number: number;
+  title: string;
+  status: 'pending' | 'active' | 'done' | 'error';
+  issues: string[];
+  suggestions: string[];
+  advances?: boolean;
+  revised: boolean;
+  message: string;
+}
+
+/** 审查报告写成 Markdown 存进大纲文档；读回时按同一套小标题拆出来，格式只在这里定义一次 */
+const reviewReportSection = (content: string, heading: string): string[] => {
+  const section = content.split(`## ${heading}`)[1];
+  if (!section) return [];
+  return section.split(/\n##\s/u)[0].split('\n')
+    .map(line => line.trim())
+    .filter(line => /^\d+\.\s+/u.test(line))
+    .map(line => line.replace(/^\d+\.\s+/u, ''));
+};
+
+/** 同一问题散在多章的机械聚类：拿能枚举的词找跨章重复——角色/地点/卡片名，以及“三年”“十一份”这类数字表述
+ * 只出现在一章里的词不列；目的是让作者一眼看出哪些问题是成片的，而不是逐章去读 */
+const buildReviewClusters = (items: LegacyReviewItem[], cards: Array<{ title: string }>) => {
+  const groups = new Map<string, Set<number>>();
+  const add = (key: string, number: number) => {
+    if (!groups.has(key)) groups.set(key, new Set());
+    groups.get(key)!.add(number);
+  };
+  const names = cards.map(card => card.title.trim()).filter(name => name.length >= 2);
+  for (const item of items) {
+    for (const text of [...item.issues, ...item.suggestions]) {
+      for (const name of names) if (text.includes(name)) add(name, item.number);
+      for (const match of text.matchAll(/[零一二三四五六七八九十百千两0-9]{1,6}(?:年|个月|月|天|日|份|次|章|万|人)/gu)) add(match[0], item.number);
+    }
+  }
+  return [...groups.entries()]
+    .filter(([, numbers]) => numbers.size >= 2)
+    .map(([text, numbers]) => ({ text, numbers: [...numbers].sort((left, right) => left - right) }))
+    .sort((left, right) => right.numbers.length - left.numbers.length)
+    .slice(0, 10);
+};
+
+const formatReviewReport = (number: number, chapterTitle: string, result: AgentReviewResult): string => [
+  `# 审查报告｜第 ${number} 章 ${chapterTitle.replace(/^第\s*\d+\s*章\s*/u, '')}`,
+  '',
+  `- 审查时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+  `- 结论：${result.consistent ? '与设定、前文一致' : '发现一致性问题'}${result.advances === false ? '；本章相对前文没有推进' : ''}`,
+  ...(result.progress ? [`- 推进到：${result.progress}`] : []),
+  '',
+  '## 问题',
+  ...(result.issues.length ? result.issues.map((item, index) => `${index + 1}. ${item}`) : ['无']),
+  '',
+  '## 建议',
+  ...(result.suggestions.length ? result.suggestions.map((item, index) => `${index + 1}. ${item}`) : ['无']),
+  ...(result.repeatedEvents?.length ? ['', '## 重复写过的前文事件', ...result.repeatedEvents.map(item => `- ${item}`)] : []),
+  '',
+].join('\n');
+
 interface AgentReviewResult {
   consistent: boolean;
   issues: string[];
@@ -102,6 +162,8 @@ interface AgentReviewResult {
   advances?: boolean;
   progress?: string;
   repeatedEvents?: string[];
+  /** 审查提出一致性问题后，已按意见定点修订过一次（改的是同一篇正文，不是又写一遍） */
+  revised?: boolean;
 }
 
 interface AgentDraftResult {
@@ -1224,6 +1286,128 @@ function App() {
   const [memoryBackfillProgress, setMemoryBackfillProgress] = useState<{ done: number; total: number } | null>(null);
   const memoryBackfillAbortRef = useRef(false);
   // 懒人连续创作：要写几章、当前写到第几章；停止只在本章写完后生效
+  /** 旧章审查：正文已经写好的章只能重跑审查，才发现当时没人修的遗留问题 */
+  /** 写作操作台：润色续写、连续创作、旧章审查三件费地方的事共用一个二级面板 */
+  const [showWritingConsole, setShowWritingConsole] = useState(false);
+  /** 操作台窗口位置与大小：记在本地，拖过一次下次打开还是这个样子 */
+  const [consoleFrame, setConsoleFrame] = useState<{ x: number; y: number; width: number; height: number } | null>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('writing-console-frame') || 'null');
+      if (saved && typeof saved.x === 'number' && typeof saved.y === 'number' && typeof saved.width === 'number' && typeof saved.height === 'number') return saved;
+    } catch {
+      // 存档坏了就用居中默认值，不值得打断打开面板
+    }
+    return null;
+  });
+  const consoleModalRef = useRef<HTMLDivElement | null>(null);
+  const consoleDragRef = useRef<{ mode: 'move' | 'resize'; startX: number; startY: number; frame: { x: number; y: number; width: number; height: number } } | null>(null);
+
+  /** 拖标题栏移动、拖右下角缩放：先把当前矩形固定成内联样式，之后按位移算新值 */
+  const startConsoleDrag = (mode: 'move' | 'resize') => (event: React.PointerEvent<HTMLElement>) => {
+    // 标题栏里有按钮，点按钮不该带着窗口跑
+    if ((event.target as HTMLElement).closest('button')) return;
+    const rect = consoleModalRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    event.preventDefault();
+    const frame = { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+    setConsoleFrame(frame);
+    consoleDragRef.current = { mode, startX: event.clientX, startY: event.clientY, frame };
+    const move = (moveEvent: PointerEvent) => {
+      const drag = consoleDragRef.current;
+      if (!drag) return;
+      const dx = moveEvent.clientX - drag.startX;
+      const dy = moveEvent.clientY - drag.startY;
+      const next = drag.mode === 'move'
+        ? {
+          ...drag.frame,
+          // 留住标题栏与一小截右边框，别拖出屏幕找不回来
+          x: Math.min(Math.max(-drag.frame.width + 160, drag.frame.x + dx), window.innerWidth - 80),
+          y: Math.min(Math.max(0, drag.frame.y + dy), window.innerHeight - 48),
+        }
+        : {
+          ...drag.frame,
+          width: Math.max(560, Math.min(1800, drag.frame.width + dx)),
+          height: Math.max(320, Math.min(window.innerHeight, drag.frame.height + dy)),
+        };
+      setConsoleFrame(next);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      consoleDragRef.current = null;
+      setConsoleFrame(current => {
+        if (current) {
+          try {
+            localStorage.setItem('writing-console-frame', JSON.stringify(current));
+          } catch {
+            // 存不下就只在本次会话生效
+          }
+        }
+        return current;
+      });
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
+  const [legacyReviewRange, setLegacyReviewRange] = useState<{ from: number; to: number } | null>(null);
+  const [legacyReview, setLegacyReview] = useState<{ running: boolean; done: number; total: number; message: string; items: LegacyReviewItem[] }>({ running: false, done: 0, total: 0, message: '', items: [] });
+  // 已经落盘的报告也在面板里列出来：标题与问题清单从大纲文档读回，不用再跑一次
+  const savedReviewItems: LegacyReviewItem[] = useMemo(() => {
+    if (!editingProject) return [];
+    return editingProject.outlines
+      .filter(outline => outline.kind === '审查报告')
+      .map(outline => {
+        const match = /第\s*(\d+)\s*章/u.exec(outline.title);
+        const number = match ? Number(match[1]) : 0;
+        const issues = reviewReportSection(outline.content, '问题');
+        const suggestions = reviewReportSection(outline.content, '建议');
+        return {
+          number,
+          title: editingProject.chapters[number - 1]?.title || outline.title,
+          status: 'done' as const,
+          issues,
+          suggestions,
+          revised: false,
+          message: issues.length ? `${issues.length} 条问题` : suggestions.length ? `${suggestions.length} 条建议` : '没有发现矛盾',
+        };
+      })
+      .filter(item => item.number > 0)
+      .sort((left, right) => left.number - right.number);
+  }, [editingProject]);
+  /** 修订状态：按章号单独存，从大纲读回的旧报告也能看见进度与结果 */
+  const [reviseStates, setReviseStates] = useState<Record<number, { status: 'running' | 'done' | 'error'; message: string; startedAt: number }>>({});
+  // 修订中每秒推一下时钟：长任务不刷秒数，作者无法分辨“在跑”和“卡死”
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (!Object.values(reviseStates).some(state => state.status === 'running')) return;
+    const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [reviseStates]);
+  const reviewItems = legacyReview.items.length ? legacyReview.items : savedReviewItems;
+  // 当前审查区间与提示：把章名显示出来，光看两个数字对不上章
+  const consoleChapters = editingProject?.chapters || [];
+  const consoleRange = legacyReviewRange ?? { from: Math.max(1, consoleChapters.length - 9), to: consoleChapters.length };
+  // 面板关着就不算：聚类只在操作台打开且已有报告时跑（几十毫秒级，不进渲染热路径）
+  const reviewClusters = showWritingConsole && reviewItems.length && editingProject
+    ? buildReviewClusters(reviewItems, editingProject.cards)
+    : [];
+
+  const consoleRangeHint = (() => {
+    const from = consoleChapters[consoleRange.from - 1];
+    const to = consoleChapters[consoleRange.to - 1];
+    if (!from || !to) return '区间超出正文范围，已按最近可用的章号算';
+    const count = Math.abs(consoleRange.to - consoleRange.from) + 1;
+    return `第 ${consoleRange.from} 章 ${from.title.replace(/^第\s*\d+\s*章\s*/u, '')} → 第 ${consoleRange.to} 章 ${to.title.replace(/^第\s*\d+\s*章\s*/u, '')}（共 ${count} 章）`;
+  })();
+  const legacyReviewAbortRef = useRef(false);
+  /** 批量修订：选中的章 + 统一口径 + 进度；散在多章的同一个问题要一次改完且改法一致 */
+  /** 批量审查：选中的区间与并发上限；中转站限流就把并发调小 */
+  const [reviewConcurrency, setReviewConcurrency] = useState(3);
+  const [selectedReviewNumbers, setSelectedReviewNumbers] = useState<number[]>([]);
+  const [reviewUnifiedNote, setReviewUnifiedNote] = useState('');
+  const [batchRevise, setBatchRevise] = useState<{ running: boolean; done: number; total: number; message: string } | null>(null);
+  const reviseAbortRef = useRef(false);
   const [continuousCount, setContinuousCount] = useState(3);
   const [continuousWriting, setContinuousWriting] = useState<{ done: number; total: number; message: string } | null>(null);
   const continuousAbortRef = useRef(false);
@@ -4094,7 +4278,8 @@ function App() {
         } : undefined,
         instruction: activeStyle ? `${instruction}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : instruction,
         synopsis: project.synopsis,
-        cards: project.cards.filter(card => selectedOutlineCardIds.includes(card.id)),
+        // 没勾卡片时按本章依据自动挑：章纲生成不看卡就没人出场，新人物与地点永远进不来
+        cards: effectiveCards(project, selectedOutlineCardIds, `${targetOutline.title}\n${targetOutline.content}\n${String(sourceChapter?.content || '').slice(-8000)}\n${instruction}`),
         knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
         worldSetting: project.outlines
           .filter(item => item.kind === '世界观与作品设定' && item.content.trim())
@@ -4122,16 +4307,17 @@ function App() {
   };
 
   /**
-   * 阶段节拍表：进入一个新阶段（总纲里的章号区间）时，先把这几章的事件一次规划好，一章一行
+   * 阶段节拍表：本章所在阶段还没有逐章节拍时，先把这几章的事件一次规划好，一章一行
    * 没有它，每章章纲只能从上一章末尾往下顺，一条线越挖越深（实测某本书六章都在写同一份签字）；
-   * 表存进大纲页，作者可以改，改完下一章就按改后的写。没有节拍表覆盖本章、总纲又有区间时才生成
+   * 表存进大纲页，作者可以改，改完下一章就按改后的写
+   * 作者已经手写了本章章纲就不生成：章纲优先，两套计划同时存在只会打架
    */
   const ensureStageBeats = async (project: Project, chapter: Chapter, runId: string): Promise<Project> => {
     const number = project.chapters.findIndex(item => item.id === chapter.id) + 1;
     if (stageBeatsFor(project, number)) return project;
+    if (boundChapterOutlineFor(project, chapter)) return project;
     const range = stageRangeFor(project, number);
-    if (!range) return project;
-    const message = `进入第 ${range.from}～${range.to} 章阶段，正在按总纲规划这几章的逐章节拍`;
+    const message = `正在按总纲与故事账本规划第 ${range.from}～${range.to} 章的逐章节拍`;
     setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
     setAgentProgressMessage(message);
     const now = new Date().toISOString();
@@ -4141,7 +4327,7 @@ function App() {
       project,
       targetOutline: draft,
       kind: '章纲',
-      instruction: `按总纲把第 ${range.from}～${range.to} 章拆成逐章事件。作者对当前创作的要求：${agentInstruction.trim()}`,
+      instruction: `按总纲把第 ${range.from}～${range.to} 章拆成逐章事件，相邻章不得围绕同一件事；作者对当前创作的要求：${agentInstruction.trim()}`,
       beatSheet: { from: range.from, to: range.to, writtenThrough: number - 1 },
     });
     if (!content.trim()) throw new Error('大纲智能体没有返回阶段节拍表');
@@ -4377,17 +4563,7 @@ function App() {
       : item));
     setAgentProgressPercent(1);
     setAgentProgressMessage('正在启动 Agent Runtime');
-    let agentSkills = skills;
-    if (!agentSkills.length) {
-      try {
-        const saved = JSON.parse(localStorage.getItem('writer-skills') || '[]');
-        const customSkills = Array.isArray(saved) ? saved.filter((skill): skill is Skill => Boolean(skill && typeof skill.name === 'string' && !skill.builtin)) : [];
-        agentSkills = [...builtinSkills, ...customSkills];
-      } catch {
-        agentSkills = builtinSkills;
-      }
-    }
-    const activeStyle = sourceProject.styleProfileId ? writingStyles.find(style => style.id === sourceProject.styleProfileId) : undefined;
+    const { agentSkills, activeStyle } = resolveAgentSkillsAndStyle(sourceProject);
     await invoke<string>('start_agent_runtime');
     // 懒人流程：先保证本章所在阶段有逐章节拍表，再保证本章有章纲；作者只管点一次运行
     let project = await ensureStageBeats(sourceProject, chapter, runId);
@@ -4532,7 +4708,238 @@ function App() {
 
   /**
    * 懒人连续创作：新建一章 → 自动章纲 → 写正文 → 采用草稿 → 提炼记忆 → 再新建下一章
-   * 写满指定章数、写到总纲末章、出错或作者点停止为止；每章写完立刻落盘，中途停下已写的章都在
+   * 写满指定章数、写到总纲按卷写明的末章、出错或作者点停止为止；每章写完立刻落盘，中途停下已写的章都在
+   * 只认卷里的章号区间，不认正文里的区间：总纲里“须在第174～177章完成”这类句子会把边界算错，第 178 章起就再也写不动
+   */
+  /** 技能库与绑定文风：写正文与审查旧章用同一份，不能一边带一边不带 */
+  const resolveAgentSkillsAndStyle = (project: Project) => {
+    let agentSkills = skills;
+    if (!agentSkills.length) {
+      try {
+        const saved = JSON.parse(localStorage.getItem('writer-skills') || '[]');
+        const customSkills = Array.isArray(saved) ? saved.filter((skill): skill is Skill => Boolean(skill && typeof skill.name === 'string' && !skill.builtin)) : [];
+        agentSkills = [...builtinSkills, ...customSkills];
+      } catch {
+        agentSkills = builtinSkills;
+      }
+    }
+    const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
+    return { agentSkills, activeStyle };
+  };
+
+  /**
+   * 审查已经写好的旧章：正文不再重新写，只跑审查那一步
+   * 资料与写正文时同一份（总纲位置、账本、卡片、节拍），否则“有没有推进”判不准；审查报告由调用方落盘
+   */
+  const reviewExistingChapter = async (project: Project, chapter: Chapter) => {
+    const { agentSkills, activeStyle } = resolveAgentSkillsAndStyle(project);
+    const context = buildChapterWriteContext({
+      project,
+      chapter,
+      instruction: '审查本章与前文、总纲和既定设定的一致性',
+      skills: agentSkills,
+      preferredSkillNames: [],
+      extraOutlineIds: [],
+      selectedCardIds: [],
+    });
+    await invoke<string>('start_agent_runtime');
+    return agentRpc<{ reviewResult: AgentReviewResult }>('chapter.review', {
+      runId: `review-${chapter.id}`,
+      ...context.params,
+      existingContent: chapter.content,
+      writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
+      apiKey: agentConfig.apiKey.trim(),
+      baseURL: agentConfig.baseURL.trim(),
+      model: agentConfig.model.trim() || fallbackModels[0],
+      apiMode: agentConfig.apiMode,
+      reasoningMode: agentConfig.reasoningMode,
+      contextWindow: agentConfig.contextWindow,
+      ...agentNetworkParams(agentConfig),
+    });
+  };
+
+  /** 审查报告落盘：存成一份大纲文档（大纲页里能直接打开看，下次加载不会丢） */
+  const saveLegacyReviewReport = async (project: Project, chapter: Chapter, result: AgentReviewResult) => {
+    const now = new Date().toISOString();
+    const number = project.chapters.findIndex(item => item.id === chapter.id) + 1;
+    const title = `审查报告｜第 ${number} 章 ${chapter.title.replace(/^第\s*\d+\s*章\s*/u, '')}`;
+    const existing = project.outlines.find(outline => outline.title === title);
+    const document: OutlineDocument = {
+      id: existing?.id ?? Date.now(),
+      kind: '审查报告',
+      title,
+      chapterId: chapter.id,
+      content: formatReviewReport(number, chapter.title, result),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    const outlines = existing
+      ? project.outlines.map(outline => outline.id === existing.id ? document : outline)
+      : [...project.outlines, document];
+    await applyProjectChange({ ...project, outlines, updatedAt: now });
+  };
+
+
+  /**
+   * 项目写盘的串行锁
+   * 审查报告与修订后的正文都要改同一个 project 对象；并发时两处都读旧值再写，会互相覆盖（丢一章的修订或丢一份报告）
+   * 模型调用可以并行，落盘必须排队
+   */
+  const projectWriteChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const queueProjectChange = async (change: () => Promise<void>) => {
+    const next = projectWriteChainRef.current.then(change, change);
+    projectWriteChainRef.current = next.catch(() => undefined);
+    await next;
+  };
+
+  /** 批量审查：并发跑（中转站限流就把并发调小），逐章落盘报告，中途停下已完成的报告都在 */
+  const runLegacyReview = async (from: number, to: number) => {
+    const project = editingProjectRef.current;
+    if (!project) return;
+    if (!agentConfig.apiKey.trim()) {
+      setNotice({ title: '无法审查旧章', content: '请先在设置里填写模型 API Key。' });
+      return;
+    }
+    if (!project.chapters.length) {
+      setNotice({ title: '无法审查旧章', content: '这本书还没有正文。' });
+      return;
+    }
+    const start = Math.max(1, Math.min(from, to));
+    const end = Math.min(project.chapters.length, Math.max(from, to));
+    const targets = project.chapters.slice(start - 1, end);
+    setLegacyReview({
+      running: true,
+      done: 0,
+      total: targets.length,
+      message: `正在审查第 ${start}～${end} 章（并发 ${reviewConcurrency}）`,
+      items: targets.map((chapter, index) => ({ number: start + index, title: chapter.title, status: 'pending', issues: [], suggestions: [], revised: false, message: '' })),
+    });
+    let done = 0;
+    await mapWithConcurrency(targets, reviewConcurrency, async (chapter, index) => {
+      const number = start + index;
+      if (legacyReviewAbortRef.current) return;
+      setLegacyReview(current => ({ ...current, items: current.items.map(item => item.number === number ? { ...item, status: 'active', message: '审查中' } : item) }));
+      try {
+        const result = await reviewExistingChapter(project, chapter);
+        const review = result.reviewResult || { consistent: true, issues: [], suggestions: [] };
+        await queueProjectChange(() => saveLegacyReviewReport(editingProjectRef.current || project, chapter, review));
+        done += 1;
+        setLegacyReview(current => ({
+          ...current,
+          done,
+          items: current.items.map(item => item.number === number
+            ? { ...item, status: 'done', issues: review.issues, suggestions: review.suggestions, advances: review.advances, message: review.issues.length ? `${review.issues.length} 条问题` : '没有发现矛盾' }
+            : item),
+        }));
+      } catch (error) {
+        setLegacyReview(current => ({
+          ...current,
+          done,
+          items: current.items.map(item => item.number === number ? { ...item, status: 'error', message: String(error) } : item),
+        }));
+      }
+    });
+    setLegacyReview(current => ({ ...current, running: false, message: legacyReviewAbortRef.current ? `已停止；完成 ${done}/${targets.length} 章` : `审查完成：${done}/${targets.length} 章` }));
+  };
+
+  /** 批量修订：同样并发跑，落盘排队；每章旧版本先进章节历史 */
+  const runBatchRevise = async (numbers: number[]) => {
+    const targets = reviewItems.filter(item => numbers.includes(item.number));
+    if (!targets.length) {
+      setNotice({ title: '没有可修订的章', content: '先选中要改的章节（列表左侧的勾选框）。' });
+      return;
+    }
+    reviseAbortRef.current = false;
+    setBatchRevise({ running: true, done: 0, total: targets.length, message: `正在修订 ${targets.length} 章（并发 ${reviewConcurrency}）` });
+    setNotice({ title: `开始批量修订 ${targets.length} 章`, content: reviewUnifiedNote.trim() ? '各章都会按同一份统一口径改，改法保持一致。' : '各章按自己的审查意见改；想保证口径一致，先在上面填一句统一口径。' });
+    let done = 0;
+    await mapWithConcurrency(targets, reviewConcurrency, async item => {
+      if (reviseAbortRef.current) return;
+      if (reviseStates[item.number]?.status === 'done') {
+        done += 1;
+        return;
+      }
+      const ok = await reviseChapter(item, reviewUnifiedNote);
+      if (ok) {
+        done += 1;
+        setBatchRevise(current => current ? { ...current, done, message: `已改 ${done}/${targets.length} 章` } : current);
+      }
+    });
+    setBatchRevise(current => current ? { ...current, running: false, message: reviseAbortRef.current ? `已停止；改完 ${done}/${targets.length} 章` : `批量修订完成：${done}/${targets.length} 章` } : current);
+    setNotice({ title: '批量修订结束', content: `成功 ${done} 章；每章旧版本都进了章节历史，可逐章回退复核。` });
+  };
+
+  /**
+   * 按审查意见修订一章正文
+   * 状态单独按章号存（不写进临时批次列表）：从大纲读回的旧报告也要能看见进度；
+   * 每一步都必须留下痕迹——之前这里在批次运行时静默 return，点按钮等于没点。
+   * sharedNote 是作者给的统一口径：同一问题散在多章时，靠它保证各章改法一致
+   */
+  const reviseChapter = async (item: LegacyReviewItem, sharedNote = '') => {
+    const project = editingProjectRef.current;
+    if (!project) return false;
+    if (reviseStates[item.number]?.status === 'running') return false;
+    if (reviseStates[item.number]?.status === 'done') {
+      setNotice({ title: '无需重复修订', content: `第 ${item.number} 章已经按这批意见改过了；不满意可以从章节历史回退。` });
+      return false;
+    }
+    const chapter = project.chapters[item.number - 1];
+    if (!chapter) {
+      setNotice({ title: '找不到这一章', content: `第 ${item.number} 章不存在，可能已被删除。` });
+      return false;
+    }
+    const instruction = [
+      ...(sharedNote.trim() ? [`本次统一口径（所有选中章都必须照这条改，改法保持一致）：\n${sharedNote.trim()}`, ''] : []),
+      '按以下一致性审查意见修订本章，逐条落到正文里；意见没点到的地方保持原样：',
+      ...item.issues.map((text, index) => `${index + 1}. ${text}`),
+      ...(item.suggestions.length ? ['', '审查给出的修改建议（按它改，不要另起主意）：', ...item.suggestions.map(text => `- ${text}`)] : []),
+    ].join('\n');
+    setReviseStates(current => ({ ...current, [item.number]: { status: 'running', message: '修订中', startedAt: Date.now() } }));
+    try {
+      const result = await agentRpc<{ content?: string }>('text.transform', {
+        mode: 'revise',
+        content: chapter.content,
+        instruction,
+        projectTitle: project.title,
+        chapterTitle: chapter.title,
+        apiKey: agentConfig.apiKey.trim(),
+        baseURL: agentConfig.baseURL.trim(),
+        model: agentConfig.model.trim() || fallbackModels[0],
+        apiMode: agentConfig.apiMode,
+        reasoningMode: agentConfig.reasoningMode,
+        contextWindow: agentConfig.contextWindow,
+        ...agentNetworkParams(agentConfig),
+      });
+      const content = result.content?.trim() || '';
+      if (!content) throw new Error('模型没有返回修订后的正文');
+      const now = new Date().toISOString();
+      const updatedChapter: Chapter = { ...pushChapterSnapshot(chapter, '按审查意见修订'), content, wordCount: countNovelCharacters(content), updatedAt: now };
+      const latest = editingProjectRef.current || project;
+      const chapters = latest.chapters.map(entry => entry.id === updatedChapter.id ? updatedChapter : entry);
+      await applyProjectChange({ ...latest, chapters, wordCount: chapters.reduce((sum, entry) => sum + entry.wordCount, 0), updatedAt: now });
+      setReviseStates(current => ({ ...current, [item.number]: { status: 'done', message: `已修订（${countNovelCharacters(content)} 字）`, startedAt: Date.now() } }));
+      return true;
+    } catch (error) {
+      setReviseStates(current => ({ ...current, [item.number]: { status: 'error', message: `修订失败：${String(error)}`, startedAt: Date.now() } }));
+      setNotice({ title: `第 ${item.number} 章修订失败`, content: String(error) });
+      return false;
+    }
+  };
+
+  /** 单章修订入口：给按钮用，先弹一条“开始了”的提示 */
+  const reviseReviewedChapter = async (item: LegacyReviewItem) => {
+    if (reviseStates[item.number]?.status === 'running') {
+      setNotice({ title: '正在修订', content: `第 ${item.number} 章还在改，等这一次跑完。` });
+      return;
+    }
+    setNotice({ title: `开始修订第 ${item.number} 章`, content: `按 ${item.issues.length} 条问题、${item.suggestions.length} 条建议改一遍，通常几十秒，先别关窗口。` });
+    const ok = await reviseChapter(item);
+    if (ok) setNotice({ title: `第 ${item.number} 章已按审查意见修订`, content: '正文已更新，旧版本存进了章节历史；不满意可以从章节历史回退。' });
+  };
+
+  /**
+   * 懒人连续创作：要写几章、当前写到第几章；停止只在本章写完后生效
+   * 写满章数、写到总纲按卷写明的末章、出错或点停止为止；只认卷里的章号区间，不认正文里的句子
    */
   const runContinuousWriting = async () => {
     const start = editingProjectRef.current;
@@ -4542,7 +4949,8 @@ function App() {
       return;
     }
     const total = Math.max(1, Math.min(200, Math.round(continuousCount) || 1));
-    const finalChapter = outlineFinalChapterNumber(start);
+    // 全书计划末章：总纲按卷写明的章号上限，到那里就停；写下一次要接着写就改总纲的卷区间
+    const planEnd = plannedVolumeEndChapter(start);
     continuousAbortRef.current = false;
     setContinuousWriting({ done: 0, total, message: '准备新建章节' });
     let project = start;
@@ -4555,8 +4963,8 @@ function App() {
           break;
         }
         const number = project.chapters.length + 1;
-        if (finalChapter !== undefined && number > finalChapter) {
-          stopReason = `总纲规划到第 ${finalChapter} 章，已写到末章`;
+        if (planEnd !== undefined && number > planEnd) {
+          stopReason = `总纲按卷写到第 ${planEnd} 章，已经写到全书计划末章`;
           break;
         }
         const inserted = insertChapterAfter(project, project.chapters.at(-1)?.id ?? null, `第 ${number} 章`);
@@ -5824,6 +6232,9 @@ function App() {
   };
   gatewayPricing.sort((left, right) => gatewayInputPrice(left) - gatewayInputPrice(right));
 
+  // 本次额外带入的章纲：绑定章纲与阶段节拍表本来就是自动的，这一栏只是作者手动加的参考
+  const extraOutlineCount = selectedOutlineIds.filter(id => editingProject?.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length;
+
   const startupReady = !('__TAURI_INTERNALS__' in window) || (deviceStorageReady && resourceStorageReady);
   if (!startupReady) {
     return (
@@ -6591,7 +7002,7 @@ function App() {
                       <small>{outlineIntentPreview.sourceMode} · 格式：{outlineIntentPreview.formatMode}</small>
                     </div>}
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择大纲技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><p>不选时由智能体按大纲创作意图自动选择技能。</p><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
-                    <div className="agent-card-picker"><div className="agent-card-picker-title">大纲带入卡片 <small>{selectedOutlineCardIds.length} 张</small></div>{editingProject.cards.length === 0 ? <p className="empty-hint compact">没有可带入的知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineCardIds.includes(card.id)} onChange={() => setSelectedOutlineCardIds(current => current.includes(card.id) ? current.filter(id => id !== card.id) : [...current, card.id])} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>
+                    <div className="agent-card-picker"><div className="agent-card-picker-title">大纲带入卡片 <small>{selectedOutlineCardIds.length ? `${selectedOutlineCardIds.length} 张` : '未勾选：按总纲、本章依据与指令自动带入'}</small><button type="button" className="link-button" onClick={() => setSelectedOutlineCardIds([])}>自动选择</button></div>{editingProject.cards.length === 0 ? <p className="empty-hint compact">没有可带入的知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineCardIds.includes(card.id)} onChange={() => setSelectedOutlineCardIds(current => current.includes(card.id) ? current.filter(id => id !== card.id) : [...current, card.id])} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>
                     {(outlineGenerating || outlineAgentActivity.length > 0) && <section className="outline-agent-activity" aria-live="polite"><div className="outline-activity-heading"><strong>大纲智能体执行过程</strong><small>{outlineGenerating ? '运行中' : '已完成'}</small></div>{outlineAgentActivity.map(item => <div key={item.id} className={`outline-activity-row ${item.status}`}><span className="outline-activity-dot" /><div><strong>{item.step === 'intent' ? '意图识别' : item.step === 'retrieve' ? '上下文装载' : item.step === 'plan' ? '事件规划' : item.step === 'draft' ? '生成章纲' : item.step === 'review' ? '承接校验' : item.step === 'complete' ? '任务完成' : item.step === 'error' ? '运行失败' : '准备运行'}</strong><span>{item.message}</span>{item.source && <small>{item.source}</small>}</div></div>)}</section>}
                     {outlineChatMessages.length > 0 && <div className="agent-chat-history">{outlineChatMessages.map((message, index) => <article key={`${message.createdAt}-${index}`} className={`agent-chat-bubble ${message.role}`}><small>{message.role === 'user' ? '你' : '大纲智能体'}</small><p>{message.content}</p></article>)}</div>}
                     {outlineGenerating && <article className="agent-chat-bubble assistant"><small>大纲智能体正在回复</small><p>{outlineStreamContent || '正在连接模型...'}</p></article>}
@@ -6635,28 +7046,19 @@ function App() {
                     <p>不选时由智能体按创作意图自动调用；勾选后会优先带入，章节承接和下一章计划仍会自动保留。</p>
                     <div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div>
                   </section>}
-                  <div className="ai-writing-tools">
-                    <div className="agent-card-picker-title">润色 / 续写要求 <small>可选</small></div>
-                    <textarea value={aiToolInstruction} onChange={event => setAIToolInstruction(event.target.value)} placeholder="例如：加强紧张感，保留冷峻文风；或让主角先观察再行动" />
-                    <div className="ai-writing-tool-actions">
-                      <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('polish')}>{aiToolRunning && aiToolMode === 'polish' ? '润色中...' : '润色选中内容 / 整章'}</button>
-                      <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('de-ai')}>{aiToolRunning && aiToolMode === 'de-ai' ? '处理中...' : '去 AI 味'}</button>
-                      <button className="btn-primary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('continue')}>{aiToolRunning && aiToolMode === 'continue' ? '续写中...' : '生成续写'}</button>
-                    </div>
-                    {aiToolResult && <div className="ai-tool-result">
-                      <div><strong>{aiToolResult.mode === 'continue' ? '续写草稿' : aiToolResult.mode === 'de-ai' ? '去 AI 味草稿' : '润色草稿'}</strong><span>{countNovelCharacters(aiToolResult.content)} 字{aiToolResult.maxWords ? ` / 最多 ${aiToolResult.maxWords} 字` : ''}</span></div>
-                      <textarea value={aiToolResult.content} onChange={event => setAIToolResult(current => current ? { ...current, content: event.target.value } : current)} />
-                      <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => copyText(aiToolResult.content)}>复制</button><button className="btn-primary" onClick={acceptAIToolResult}>{aiToolResult.mode === 'continue' ? '确认插入章节' : '确认替换'}</button></div>
-                    </div>}
+                  <div className="agent-card-picker">
+                    <div className="agent-card-picker-title"><span>写作操作台</span><small>{continuousWriting ? `连续创作中 ${continuousWriting.done}/${continuousWriting.total} 章` : legacyReview.running ? `审查旧章中 ${legacyReview.done}/${legacyReview.total} 章` : aiToolResult ? `有未处理的${aiToolResult.mode === 'continue' ? '续写' : aiToolResult.mode === 'de-ai' ? '去 AI 味' : '润色'}草稿` : '润色续写、懒人连续创作、审查旧章'}</small></div>
+                    <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => setShowWritingConsole(true)}>打开写作操作台</button></div>
+                    <p className="empty-hint compact">这三件事都要占地方，挪到单独的面板里跑；这里只留一行状态，跑起来后关掉面板也不会中断。</p>
                   </div>
                   <div className="agent-card-picker">
-                    <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{selectedOutlineIds.filter(id => editingProject.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length} 份</small></div>
+                    <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{extraOutlineCount ? `${extraOutlineCount} 份` : '未选：只用本章绑定的章纲'}</small></div>
                     <button type="button" className={`agent-context-select ${showChapterOutlinePicker ? 'active' : ''}`} onClick={() => setShowChapterOutlinePicker(current => !current)}>选择章纲</button>
                     {showChapterOutlinePicker && <div className="agent-context-dropdown">{editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => <label key={outline.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} /><span><strong>{outline.title || '未命名章纲'}</strong><small>{String(outline.chapterId ?? '') === String(activeChapter?.id ?? '') ? '当前章节' : '其他章节'}</small></span></label>)}</div>}
                     <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行章节智能体时会先按总纲与前文自动生成一份并绑定到本章；'; })()}世界观、总纲位置与最近章节记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
                   </div>
                   <div className="agent-card-picker">
-                    <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length ? `${selectedCardIds.length} 张` : '未勾选：按章纲与上一章出现的卡自动带入'}</small></div>
+                    <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length ? `${selectedCardIds.length} 张` : '未勾选：按章纲与上一章出现的卡自动带入'}</small>{selectedCardIds.length > 0 && <button type="button" className="link-button" onClick={() => setSelectedCardIds([])}>自动选择</button>}</div>
                     <button type="button" className={`agent-context-select ${showChapterCardPicker ? 'active' : ''}`} onClick={() => setShowChapterCardPicker(current => !current)}>选择卡片</button>
                     {showChapterCardPicker && <div className="agent-context-dropdown">{editingProject.cards.length === 0 ? <p className="empty-hint compact">先在卡片页创建知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedCardIds.includes(card.id)} onChange={() => toggleCardForChapter(card.id)} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>}
                   </div>
@@ -6667,16 +7069,6 @@ function App() {
                   <button className={`agent-run-button ${agentRunning(agentStage) ? 'running' : ''}`} aria-busy={agentRunning(agentStage)} onClick={runChapterAgent}>
                     {agentRunning(agentStage) ? `智能体执行中 · ${agentProgressPercent}%` : '运行章节智能体'}
                   </button>
-                  <div className="agent-card-picker">
-                    <div className="agent-card-picker-title"><span>懒人连续创作</span><small>{continuousWriting ? `已写 ${continuousWriting.done}/${continuousWriting.total} 章` : (() => { const final = outlineFinalChapterNumber(editingProject); return final ? `总纲写到第 ${final} 章，当前 ${editingProject.chapters.length} 章` : '总纲没写章号区间，只按章数停'; })()}</small></div>
-                    <div className="ai-writing-tool-actions">
-                      <label className="agent-continuous-count">再写 <input className="input" type="number" min={1} max={200} value={continuousCount} disabled={Boolean(continuousWriting)} onChange={event => setContinuousCount(Number(event.target.value) || 1)} /> 章</label>
-                      {continuousWriting
-                        ? <button className="btn-secondary" onClick={() => { continuousAbortRef.current = true; }}>{continuousAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
-                        : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runContinuousWriting()}>新建并连续创作</button>}
-                    </div>
-                    <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '每章自动：新建章节、（进入新阶段时先按总纲规划这几章的逐章节拍，存在大纲页可改）生成章纲、写正文、采用草稿、提炼记忆，再接着写下一章；写满章数、写到总纲末章、出错或点停止为止。'}</p>
-                  </div>
                 </section>
 
                 {agentProgress.length > 0 && (
@@ -6746,7 +7138,7 @@ function App() {
                     {agentDraft.summary && <p className="agent-summary">{agentDraft.summary}</p>}
                     {agentDraft.reviewResult && (
                       <div className={`agent-review ${agentDraft.reviewResult.consistent && agentDraft.reviewResult.advances !== false ? 'passed' : 'warning'}`}>
-                        <strong>{agentDraft.reviewResult.consistent ? '一致性审查通过' : '发现一致性问题'}{agentDraft.reviewResult.advances === false ? ' · 本章没有推进主线' : ''}</strong>
+                        <strong>{agentDraft.reviewResult.consistent ? '一致性审查通过' : '发现一致性问题'}{agentDraft.reviewResult.advances === false ? ' · 本章没有推进主线' : ''}{agentDraft.reviewResult.revised ? ' · 已按审查意见修订' : ''}</strong>
                         {agentDraft.reviewResult.progress && <p>推进：{agentDraft.reviewResult.progress}</p>}
                         {(agentDraft.reviewResult.repeatedEvents || []).map(event => <p key={`repeat-${event}`}>重复前文：{event}</p>)}
                         {agentDraft.reviewResult.issues.map(issue => <p key={issue}>{issue}</p>)}
@@ -7625,6 +8017,115 @@ function App() {
       )}
 
       {/* 写作统计：作者视角的日更数据，不是 token 账单 */}
+        {showWritingConsole && editingProject && <div className="modal-overlay writing-console-overlay" onClick={() => setShowWritingConsole(false)}>
+          <div
+            ref={consoleModalRef}
+            className="modal writing-console-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="写作操作台"
+            style={consoleFrame ? { position: 'fixed', left: consoleFrame.x, top: consoleFrame.y, width: consoleFrame.width, height: consoleFrame.height, maxHeight: 'none' } : undefined}
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="modal-header writing-console-header" onPointerDown={startConsoleDrag('move')}>
+              <h3>写作操作台</h3>
+              <small className="writing-console-drag-hint">拖标题栏移动 · 右下角缩放</small>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowWritingConsole(false)}><Icon name="x" size={16} /></button>
+            </div>
+            <div className="modal-body writing-console-body">
+          <section className="agent-task-section">
+            <div className="panel-section-title">润色 / 续写</div>
+              <div className="ai-writing-tools">
+                <div className="agent-card-picker-title">润色 / 续写要求 <small>可选</small></div>
+                <textarea value={aiToolInstruction} onChange={event => setAIToolInstruction(event.target.value)} placeholder="例如：加强紧张感，保留冷峻文风；或让主角先观察再行动" />
+                <div className="ai-writing-tool-actions">
+                  <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('polish')}>{aiToolRunning && aiToolMode === 'polish' ? '润色中...' : '润色选中内容 / 整章'}</button>
+                  <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('de-ai')}>{aiToolRunning && aiToolMode === 'de-ai' ? '处理中...' : '去 AI 味'}</button>
+                  <button className="btn-primary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('continue')}>{aiToolRunning && aiToolMode === 'continue' ? '续写中...' : '生成续写'}</button>
+                </div>
+                {aiToolResult && <div className="ai-tool-result">
+                  <div><strong>{aiToolResult.mode === 'continue' ? '续写草稿' : aiToolResult.mode === 'de-ai' ? '去 AI 味草稿' : '润色草稿'}</strong><span>{countNovelCharacters(aiToolResult.content)} 字{aiToolResult.maxWords ? ` / 最多 ${aiToolResult.maxWords} 字` : ''}</span></div>
+                  <textarea value={aiToolResult.content} onChange={event => setAIToolResult(current => current ? { ...current, content: event.target.value } : current)} />
+                  <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => copyText(aiToolResult.content)}>复制</button><button className="btn-primary" onClick={acceptAIToolResult}>{aiToolResult.mode === 'continue' ? '确认插入章节' : '确认替换'}</button></div>
+                </div>}
+              </div>
+          </section>
+          <section className="agent-task-section">
+              <div className="agent-card-picker">
+                <div className="agent-card-picker-title"><span>懒人连续创作</span><small>{continuousWriting ? `已写 ${continuousWriting.done}/${continuousWriting.total} 章` : (() => { const planned = plannedThroughChapterNumber(editingProject); const planEnd = plannedVolumeEndChapter(editingProject); return [planned ? `章纲已备到第 ${planned} 章` : '', planEnd ? `总纲计划到第 ${planEnd} 章` : '', `正文 ${editingProject.chapters.length} 章`].filter(Boolean).join('，'); })()}</small></div>
+                <div className="ai-writing-tool-actions">
+                  <label className="agent-continuous-count">再写 <input className="input" type="number" min={1} max={200} value={continuousCount} disabled={Boolean(continuousWriting)} onChange={event => setContinuousCount(Number(event.target.value) || 1)} /> 章</label>
+                  {continuousWriting
+                    ? <button className="btn-secondary" onClick={() => { continuousAbortRef.current = true; }}>{continuousAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
+                    : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runContinuousWriting()}>新建并连续创作</button>}
+                </div>
+                <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '每章自动：新建章节、（本章还没有章纲时，先按总纲往后八章规划逐章节拍，存在大纲页可改）生成章纲、写正文、采用草稿、提炼记忆，再接着写下一章；写满章数、写到总纲按卷写明的末章、出错或点停止为止。'}</p>
+              </div>
+          </section>
+          <section className="agent-task-section">
+              <div className="agent-card-picker">
+                <div className="agent-card-picker-title"><span>审查旧章</span><small>{legacyReview.running ? `已审 ${legacyReview.done}/${legacyReview.total} 章` : (legacyReview.message || '正文已经写好的章重跑审查，报告存进知识面板')}</small></div>
+                <div className="ai-writing-tool-actions writing-console-range">
+                  <label className="writing-console-range-field">从第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={consoleRange.from} disabled={legacyReview.running} onChange={event => setLegacyReviewRange({ ...consoleRange, from: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                  <label className="writing-console-range-field">到第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={consoleRange.to} disabled={legacyReview.running} onChange={event => setLegacyReviewRange({ ...consoleRange, to: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                  <label className="writing-console-range-field">并发 <input className="input console-number" type="number" min={1} max={6} value={reviewConcurrency} disabled={legacyReview.running || Boolean(batchRevise?.running)} onChange={event => setReviewConcurrency(Math.min(6, Math.max(1, Number(event.target.value) || 1)))} /> 章</label>
+                  <small className="writing-console-range-hint">{consoleRangeHint}</small>
+                  {legacyReview.running
+                    ? <button className="btn-secondary" onClick={() => { legacyReviewAbortRef.current = true; }}>{legacyReviewAbortRef.current ? '本章审完即停' : '审完本章后停止'}</button>
+                    : <button className="btn-primary" disabled={agentRunning(agentStage) || !editingProject.chapters.length} onClick={() => { legacyReviewAbortRef.current = false; const range = legacyReviewRange ?? { from: Math.max(1, editingProject.chapters.length - 9), to: editingProject.chapters.length }; void runLegacyReview(range.from, range.to); }}>开始审查</button>}
+                </div>
+                {reviewClusters.length > 0 && <div className="agent-review-clusters">
+                  <div className="agent-card-picker-title"><span>疑似同一个问题散在多章</span><small>点一下就勾上涉及的章，一起改</small></div>
+                  <div className="agent-cluster-chips">
+                    {reviewClusters.map(cluster => (
+                      <button key={cluster.text} type="button" className="agent-cluster-chip" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(current => [...new Set([...current, ...cluster.numbers])])}>
+                        {cluster.text}<small>第 {cluster.numbers.join('、')} 章</small>
+                      </button>
+                    ))}
+                  </div>
+                </div>}
+                {selectedReviewNumbers.length > 0 && <div className="agent-review-batch">
+                  <div className="agent-card-picker-title"><span>批量修订 {selectedReviewNumbers.length} 章</span><small>{batchRevise?.message || '各章共用下面这句统一口径'}</small></div>
+                  <textarea className="input" rows={2} value={reviewUnifiedNote} disabled={batchRevise?.running} onChange={event => setReviewUnifiedNote(event.target.value)} placeholder="统一口径（可选，但同一问题就该写）：例如「随访数据跨时不到一年，最早一份报告就是第一次入院那天」" />
+                  <div className="ai-writing-tool-actions">
+                    {batchRevise?.running
+                      ? <button className="btn-secondary" onClick={() => { reviseAbortRef.current = true; }}>{reviseAbortRef.current ? '改完本章即停' : '改完本章后停止'}</button>
+                      : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runBatchRevise(selectedReviewNumbers)}>按意见修订选中的 {selectedReviewNumbers.length} 章</button>}
+                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers([])}>清空选择</button>
+                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(reviewItems.filter(item => item.issues.length > 0).map(item => item.number))}>只选有问题的</button>
+                    {reviewUnifiedNote.trim() && <button className="btn-secondary" onClick={() => { copyText(reviewUnifiedNote.trim()); setNotice({ title: '已复制统一口径', content: '粘进硬事实账本或总纲，以后写新章也照这条办，否则这个错还会长回来。' }); }}>复制口径（写进档案）</button>}
+                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(selectedReviewNumbers.length === reviewItems.length ? [] : reviewItems.map(item => item.number))}>{selectedReviewNumbers.length === reviewItems.length ? '取消全选' : '全选'}</button>
+                  </div>
+                  <p className="empty-hint compact">串行改，一路模型调用；中途可停，已改完的章不回滚。每章旧版本都进章节历史，可逐章回退复核。</p>
+                </div>}
+                {reviewItems.length > 0 ? <div className="agent-review-list">
+                  {reviewItems.map(item => {
+                    const reviseState = reviseStates[item.number];
+                    const elapsed = reviseState?.status === 'running' ? Math.max(0, Math.round((nowTick - reviseState.startedAt) / 1000)) : 0;
+                    return (
+                    <div key={item.number} className={`agent-review-row ${reviseState?.status === 'running' ? 'active' : item.status}`}>
+                      <div className="agent-review-row-title">
+                        <label className="agent-review-check"><input type="checkbox" checked={selectedReviewNumbers.includes(item.number)} disabled={batchRevise?.running} onChange={event => setSelectedReviewNumbers(current => event.target.checked ? [...new Set([...current, item.number])] : current.filter(number => number !== item.number))} /></label>
+                        <strong>第 {item.number} 章 {item.title.replace(/^第\s*\d+\s*章\s*/u, '')}</strong><small>{reviseState?.status === 'running' ? `修订中…已 ${elapsed} 秒` : reviseState?.status === 'done' ? reviseState.message : item.message || (item.status === 'pending' ? '待审' : '')}</small></div>
+                      {item.issues.length > 0 && <ul className="agent-review-issues">{item.issues.map((text, index) => <li key={index}>{text}</li>)}</ul>}
+                      {item.issues.length + item.suggestions.length > 0 && <div className="ai-writing-tool-actions">
+                        <button className="btn-secondary" disabled={reviseState?.status === 'running' || reviseState?.status === 'done'} onClick={() => void reviseReviewedChapter(item)}>
+                          {reviseState?.status === 'running' ? `修订中…已 ${elapsed} 秒` : reviseState?.status === 'done' ? '已按意见修订' : '按意见修订本章'}
+                        </button>
+                        {reviseState?.status === 'error' && <small className="agent-review-error">{reviseState.message}</small>}
+                      </div>}
+                    </div>
+                    );
+                  })}
+                </div> : <p className="empty-hint compact">还没审过旧章。默认从最近十章开始，改成 156 到 182 就能一次审完那批。</p>}
+                <p className="empty-hint compact">审查只跑审查那一步，不重写正文；报告存成大綱页的“审查报告｜第 N 章”，面板里随时回看。“按意见修订本章”走定点修订：指令没点到的地方保持原样，覆盖前会把旧版压进章节历史。</p>
+              </div>
+          </section>
+            </div>
+            <div className="modal-footer"><span className="empty-hint compact">面板关掉不影响正在跑的连续创作与旧章审查，状态在右侧留一行提示。</span><button className="btn-primary" onClick={() => setShowWritingConsole(false)}>关闭</button></div>
+            <div className="writing-console-resize" role="separator" aria-label="调整面板大小" onPointerDown={startConsoleDrag('resize')} />
+          </div>
+        </div>}
       {showWritingStats && editingProject && (
         <div className="modal-overlay" onClick={() => setShowWritingStats(false)}>
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="stats-title" onClick={event => event.stopPropagation()}>

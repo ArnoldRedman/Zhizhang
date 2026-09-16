@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { chapterBoundToOutline, chapterByNumber, chapterNumberFromText, outlineByChapterNumber, resolveOutlineGenerationIntent } from './model.ts';
+import { chapterBoundToOutline, chapterByNumber, chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './model.ts';
 import type { Chapter, OutlineDocument, Project } from '../../domain/project.ts';
 
 const now = '2026-01-01T00:00:00.000Z';
@@ -26,6 +26,32 @@ test('chapterBoundToOutline 先按 chapterId，再按标题章号，最后按目
   assert.equal(chapterBoundToOutline(bound, outline(4, '章纲｜无章号')), undefined);
   assert.equal(chapterByNumber(bound, 3)?.id, 103);
   assert.equal(outlineByChapterNumber(project(chapters, [outline(9, '章纲｜第 1 章')]), 1)?.id, 9);
+});
+
+test('plannedThroughChapterNumber 只认章纲标题里的章号，阶段节拍区间与正文里的章号都不算', () => {
+  const beats: OutlineDocument = { ...outline(99, '阶段节拍｜第 174～177 章'), kind: '章纲' };
+  // 章纲正文提到别的章号（“承接第 173 章”）不能把终点拉低或拉高
+  const mentioned: OutlineDocument = { ...outline(5, '章纲｜第 180 章'), content: '承接第 173 章的收尾；这条线留到第 240 章才收' };
+  assert.equal(plannedThroughChapterNumber(project([], [outline(1, '章纲｜第一百二十三章 归乡'), outline(2, '第188章 章纲'), beats, mentioned])), 188);
+  assert.equal(plannedThroughChapterNumber(project([], [beats, outline(3, '没有章号的章纲')])), undefined);
+});
+
+test('plannedVolumeEndChapter 只认带卷的那一行里的章号区间', () => {
+  const master = {
+    ...outline(12, '总纲'),
+    kind: '总纲' as const,
+    content: [
+      '# 全书宏观总纲',
+      '| 第一卷 | 1～67 | 已完成 |',
+      '### 第三卷：灵魂相认与大唐攻坚（111～155章，已完成）',
+      '### 第四卷：书肆二期与大婚盛典（156～205章，部分已完成至第173章）',
+      '- 已完成至第173章《温室试制桑皮纸》；桑皮纸试制阶段收尾须在第174～177章完成。',
+      '### 第五卷：敦煌抢救与归国终局（第206～250章，待续写）',
+    ].join('\n'),
+  };
+  // 表格行没有“章”不算；阶段收尾那句不带卷也不算；四卷取最大值 250
+  assert.equal(plannedVolumeEndChapter(project([], [master])), 250);
+  assert.equal(plannedVolumeEndChapter(project([], [])), undefined);
 });
 
 test('resolveOutlineGenerationIntent 默认以上一章正文为依据、上一章章纲为格式', () => {

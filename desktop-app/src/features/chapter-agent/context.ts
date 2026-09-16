@@ -21,15 +21,6 @@ const contextDocumentKinds = new Set(['章节快照', '人物状态', '伏笔追
 /** 默认创作指令写的是“推进”而不是“悬念”：旧默认“在结尾留下自然的悬念”会让模型每章都在同一场景里再埋一个小钩子 */
 export const defaultChapterInstruction = '按总纲的“本章位置”把主线推进到本阶段的下一步：开头一到三段承接上一章后就离开那个场景，本章相对上一章要有明确的时间或地点位移；结尾停在能继续发展的行动、发现或风险上，不为制造悬念另埋新线。';
 
-/** 总纲里最大的章号区间上限：连续创作写到这里就停 */
-export const outlineFinalChapterNumber = (project: Project): number | undefined => {
-  let final: number | undefined;
-  for (const range of outlineChapterRanges(project)) {
-    if (final === undefined || range.to > final) final = range.to;
-  }
-  return final;
-};
-
 const chapterRangePattern = /第\s*(\d{1,4})\s*[～~\-—–至到]\s*(\d{1,4})\s*章/gu;
 
 /** 总纲里写的全部章号区间（卷与阶段都算） */
@@ -39,14 +30,15 @@ const outlineChapterRanges = (project: Project): Array<{ from: number; to: numbe
   .filter(range => Number.isFinite(range.from) && Number.isFinite(range.to) && range.to >= range.from);
 
 /**
- * 本章所在的阶段区间：取总纲里包含本章、跨度最小的那个区间（阶段比卷小）
- * 只有卷级区间、跨度太大时，只规划从本章起的八章，节拍表太长模型反而写虚
+ * 阶段节拍表要规划到哪几章：总纲里有覆盖本章的区间就用它（阶段比卷小）
+ * 只有卷级区间、跨度太大时，只规划从本章起的八章；总纲根本没写 178 章以后的区间时同样往后规划八章，
+ * 否则作者得为了写下一章先在总纲里塞一段“第X～Y章”
  */
-export const stageRangeFor = (project: Project, chapterNumber: number): { from: number; to: number } | undefined => {
+export const stageRangeFor = (project: Project, chapterNumber: number): { from: number; to: number } => {
   const containing = outlineChapterRanges(project)
     .filter(range => chapterNumber >= range.from && chapterNumber <= range.to)
     .sort((left, right) => (left.to - left.from) - (right.to - right.from))[0];
-  if (!containing) return undefined;
+  if (!containing) return { from: chapterNumber, to: chapterNumber + 7 };
   if (containing.to - containing.from + 1 <= 12) return containing;
   return { from: chapterNumber, to: Math.min(containing.to, chapterNumber + 7) };
 };
@@ -73,6 +65,14 @@ const autoSelectCards = (project: Project, haystack: string, limit = 8): Knowled
   .sort((left, right) => right.score - left.score)
   .slice(0, limit)
   .map(entry => entry.card);
+
+/**
+ * 本次入场卡片：勾了就用勾的，没勾自己挑——懒人化就是这一条，不选也不会缺人物素材
+ * 章纲生成与正文写作共用同一套规矩，免得一边自动一边空手
+ */
+export const effectiveCards = (project: Project, selectedCardIds: number[], haystack: string): KnowledgeCard[] => (selectedCardIds.length
+  ? project.cards.filter(card => selectedCardIds.includes(card.id))
+  : autoSelectCards(project, haystack));
 
 export interface ChapterWriteContextInput {
   project: Project;
@@ -108,9 +108,7 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
   // 阶段节拍表不当普通章纲带：它单独走 stageBeats，运行时只取本章那一行
   const outlines = project.outlines.filter(outline => !outline.title.startsWith('阶段节拍｜') && (outline.kind === '世界观与作品设定' || outline.kind === '总纲'
     || outline.id === boundOutline?.id || input.extraOutlineIds.includes(outline.id)));
-  const cards = input.selectedCardIds.length
-    ? project.cards.filter(card => input.selectedCardIds.includes(card.id))
-    : autoSelectCards(project, `${boundOutline?.content || ''}\n${(previousChapter?.content || '').slice(-8000)}\n${input.instruction}`);
+  const cards = effectiveCards(project, input.selectedCardIds, `${boundOutline?.content || ''}\n${(previousChapter?.content || '').slice(-8000)}\n${input.instruction}`);
   const skills = [
     ...input.skills,
     ...(writingStyle ? [{ name: `style-${writingStyle.id}`, category: 'write', description: writingStyle.description, tags: [...writingStyle.tags, '文风'], content: writingStyle.content }] : []),

@@ -4595,3 +4595,69 @@ select.input {
 /* 懒人连续创作：章数输入与开始/停止按钮并排 */
 .agent-continuous-count { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-3); white-space: nowrap; }
 .agent-continuous-count input { width: 56px; min-width: 0; padding: 4px 6px; }
+
+/* 旧章批量审查：每章一行，行内直接给出问题清单与修订入口 */
+.agent-review-list { display: grid; gap: 6px; max-height: 320px; overflow-y: auto; padding-top: 6px; border-top: 1px solid var(--line); }
+.agent-review-row { display: grid; gap: 4px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+.agent-review-row.active { border-color: var(--accent-2-fg); }
+.agent-review-row.error { border-color: var(--warn-line); }
+.agent-review-row-title { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.agent-review-row-title strong { color: var(--text-2); font-size: 12px; }
+.agent-review-row-title small { color: var(--text-3); }
+.agent-review-issues { margin: 0; padding-left: 18px; color: var(--text-2); font-size: 12px; line-height: 1.5; }
+
+/* 写作操作台：润色续写、连续创作、旧章审查共用一个二级面板，避免右侧栏被拉开 */
+.writing-console-modal { width: min(900px, 94vw); max-height: 86vh; }
+.writing-console-body { display: grid; gap: 14px; overflow-y: auto; }
+.writing-console-body > .agent-task-section { display: grid; gap: 8px; }
+.writing-console-body .agent-continuous-count { font-size: 12px; }
+/* 操作台里地方够，输入框放宽：右侧栏那点宽度才是要拉开才看得见的原因 */
+.writing-console-body .agent-continuous-count input { width: 84px; padding: 6px 8px; }
+.writing-console-body .agent-review-list { max-height: 46vh; }
+.writing-console-body .agent-instruction-heading,
+.writing-console-body .agent-card-picker-title { font-size: 12px; }
+.agent-review-error { color: var(--warn-fg, #8a5b1c); }
+
+/* 写作操作台：可拖动、可缩放，区间显示章名，不再挤成两个看不见的数字框 */
+.writing-console-overlay { align-items: center; justify-content: center; }
+.writing-console-modal { position: relative; width: min(900px, 94vw); height: min(780px, 88vh); max-height: none; }
+.writing-console-header { cursor: move; user-select: none; touch-action: none; gap: 10px; }
+.writing-console-drag-hint { margin-left: auto; color: var(--text-3); font-size: 11px; cursor: inherit; }
+.writing-console-resize {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  touch-action: none;
+  background:
+    linear-gradient(135deg, transparent 46%, var(--line-strong) 46%, var(--line-strong) 54%, transparent 54%),
+    linear-gradient(135deg, transparent 68%, var(--line-strong) 68%, var(--line-strong) 76%, transparent 76%);
+}
+.writing-console-range { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); }
+.writing-console-range-field { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.writing-console-range-field .console-number { width: 104px; padding: 6px 8px; font-size: 15px; text-align: center; }
+.writing-console-range-hint { flex-basis: 100%; color: var(--text-3); font-size: 12px; }
+
+/* 跨章同源问题：聚成小标签，一点就勾上涉及的章 */
+.agent-review-clusters { display: grid; gap: 6px; }
+.agent-cluster-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.agent-cluster-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.agent-cluster-chip small { color: var(--text-3); font-size: 11px; }
+.agent-cluster-chip:hover { border-color: var(--accent-2-fg); }
+.agent-review-batch { display: grid; gap: 8px; padding-top: 6px; border-top: 1px solid var(--line); }
+.agent-review-batch textarea { width: 100%; resize: vertical; font-size: 13px; }
+.agent-review-check { display: inline-flex; align-items: center; }
+.agent-review-row-title { align-items: center; }

@@ -31,7 +31,7 @@ export interface OutlineNode {
   status: 'planned' | 'writing' | 'completed';
 }
 
-export type OutlineKind = '总纲' | '章纲' | '世界观与作品设定';
+export type OutlineKind = '总纲' | '章纲' | '世界观与作品设定' | '审查报告';
 
 export interface OutlineDocument {
   id: number;

@@ -148,6 +148,83 @@ describe("chapter continuity context", () => {
     expect(chapterDraftMaxTokens(200)).toBe(2000);
   });
 
+  it("审查提出一致性问题时按意见定点修订一次，不再只把意见显示给作者", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = JSON.stringify((JSON.parse(String(init?.body || "{}")) as Record<string, unknown>).messages || "");
+      const content = messages.includes("五段写作任务书")
+        ? JSON.stringify({ plan: "1. 本章推进：回院交样。", handoff: "交样。" })
+        : messages.includes("待审查章节")
+          ? JSON.stringify({ consistent: false, issues: ["第 178 章的试印结论写成了已定，本章又当未定处理", "姜冷月称呼与第 176 章不一致"], suggestions: ["把“试印结论已定”改成“试印结论待刻坊回话”"], advances: true, progress: "推进到交样" })
+          // 修订请求靠那句作者修订指令认出来
+          : messages.includes("按以下一致性审查意见修订本章")
+            ? JSON.stringify({ content: "修订后的正文：她把试印结论盖了章。" })
+            : JSON.stringify({ content: "初稿：试印结论仍未定。".repeat(400), title: "交样", summary: "交样。" });
+      return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "revise-project", title: "试讲与婚帖" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "revise-project",
+      projectTitle: "穿成恶人前夫后，我只想安静等死",
+      chapterId: "179",
+      instruction: "继续写本章",
+    });
+
+    expect(result.draftContent).toBe("修订后的正文：她把试印结论盖了章。");
+    expect(String(result.draftContent)).not.toContain("{");
+    const reviseRequest = requests.find(body => JSON.stringify(body.messages || "").includes("按以下一致性审查意见修订本章"));
+    expect(reviseRequest).toBeTruthy();
+    const reviseMessages = JSON.stringify(reviseRequest?.messages || "");
+    // 审查意见与审查给出的具体修法都必须进提示词，并带上书名；修订输出预算按正文长短算，不能再用短回复的默认值
+    expect(reviseMessages).toContain("第 178 章的试印结论写成了已定");
+    expect(reviseMessages).toContain("把“试印结论已定”改成“试印结论待刻坊回话”");
+    expect(reviseMessages).toContain("穿成恶人前夫后");
+    expect(Number(reviseRequest?.max_tokens)).toBeGreaterThan(4000);
+    // 面板上要能看到“已经改过了”，而意见本身仍然保留给作者看
+    expect(result.reviewResult?.revised).toBe(true);
+    expect(result.reviewResult?.issues).toHaveLength(2);
+    expect(result.reviewResult?.suggestions.join("")).toContain("已按审查意见定点修订一次（问题 2 条，建议 1 条）");
+    store.close();
+  });
+
+  it("定点修订没产出正文时保留初稿，并如实记进 errors", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const messages = JSON.stringify((JSON.parse(String(init?.body || "{}")) as Record<string, unknown>).messages || "");
+      const content = messages.includes("五段写作任务书")
+        ? JSON.stringify({ plan: "1. 本章推进：交样。", handoff: "交样。" })
+        : messages.includes("待审查章节")
+          ? JSON.stringify({ consistent: false, issues: ["时间线与前章矛盾"], suggestions: [], advances: true })
+          : messages.includes("按以下一致性审查意见修订本章")
+            ? JSON.stringify({ content: "" })
+            : JSON.stringify({ content: "初稿正文。", title: "交样", summary: "交样。" });
+      return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "revise-empty-project", title: "修订空结果测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "revise-empty-project",
+      chapterId: "3",
+      instruction: "继续写本章",
+    });
+
+    expect(result.draftContent).toBe("初稿正文。");
+    expect(result.reviewResult?.revised).toBeUndefined();
+    expect(result.errors.some(item => item.includes("定点修订"))).toBe(true);
+    store.close();
+  });
+
   it("puts the immediate previous chapter ending ahead of ordinary context", async () => {
     const requests: Array<Record<string, unknown>> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {

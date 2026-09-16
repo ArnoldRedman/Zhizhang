@@ -27,7 +27,7 @@ const modelParamMethods = [
   "gateway.usage", "settings.diagnose", "models.list", "models.test", "project.generate",
   "skill.write", "github.commit.describe", "memory.write", "ranking.analyze", "book.dismantle", "book.style.distill",
   "book.rewrite", "book.adapt", "text.transform", "project.agent.chat", "card.write",
-  "outline.write", "chapter.write",
+  "outline.write", "chapter.write", "chapter.review",
 ] as const;
 
 /**
@@ -57,7 +57,7 @@ const optionalId = z.preprocess(
 // 章节修订和删除必须指向一个已存在的章节，不能像新增那样留空
 const requiredId = z.coerce.number().int().positive();
 const cardTypes = ['角色卡', '物品卡', '地点卡', '势力卡', '金手指卡'] as const;
-const outlineKinds = ['总纲', '章纲', '世界观与作品设定'] as const;
+const outlineKinds = ['总纲', '章纲', '世界观与作品设定', '审查报告'] as const;
 const memoryKinds = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'] as const;
 const graphNodeTypes = ['chapter', 'card', 'outline', 'entity'] as const;
 // 整章文本改写的三种口径，直接对应 text.transform 的同名模式；批量润色和批量去 AI 味都走这一条

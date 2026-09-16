@@ -504,10 +504,12 @@ function splitOutlineSections(normalized: string): OutlineSection[] {
 /** 总纲里写“后面还要交付什么”的段落：分卷与阶段规划，是模型唯一能拿到的未来节点 */
 const forwardOutlineHeading = /(分卷|卷规划|卷纲|第[一二三四五六七八九十\d]+卷|阶段规划|阶段推进|主线推进|剧情推进|推进路线|节点规划)/u;
 const endingOutlineHeading = /(结局|大结局|终章|完结|尾声)/u;
-/** 核对清单、格式说明这类流程性段落：占着“下一步”的位置却没写任何剧情 */
-const metaOutlineHeading = /(核对|待确认|说明|格式|清单|检查|附录|流程|方法|边界)/u;
-/** 卷标题里手写的章号区间（第156～205章）：有它就能按当前章号精确定位，不用猜 */
-const chapterRangeHeading = /第\s*(\d{1,4})\s*[～~\-—至]\s*(\d{1,4})\s*章/u;
+/** 核对清单、格式说明、卖点定位这类流程性段落：占着“下一步”的位置却没写任何剧情 */
+const metaOutlineHeading = /(核对|待确认|说明|格式|清单|检查|附录|流程|方法|边界|卖点|爽点|爽感|套路|定位|题材|基调|差异)/u;
+/** 卷与阶段标题里手写的章号区间：有它就能按当前章号精确定位，不用猜
+ * “第”可省：实测很多总纲写成“### 第四卷：书肆二期与大婚盛典（156～205章）”，旧写法要求“第156”才认，
+ * 定位不到就退回词面打分，“接下来必须推进”会落在“市场常见套路与本书差异”这种卖点段落上，模型拿营销表当本章终点 */
+const chapterRangeHeading = /(?:第\s*)?(\d{1,4})\s*[～~\-—–至到]\s*(\d{1,4})\s*章/u;
 
 /** 取某个标题及其子标题正文；同级或更浅的标题就是下一段了 */
 function outlineSubtreeText(sections: OutlineSection[], startIndex: number, used?: Set<number>): string {
@@ -553,10 +555,23 @@ function compactVolumeByStage(volumeText: string, chapterNumber: number | undefi
   const stages = blocks.filter((block): block is Extract<VolumeBlock, { kind: "stage" }> => block.kind === "stage");
   if (!stages.length || chapterNumber === undefined) return { text: compactText(volumeText, maxBytes), position: "", atVolumeEnd: false };
   const currentStage = stages.find(stage => chapterNumber >= stage.from && chapterNumber <= stage.to);
-  const nextStage = currentStage ? stages[stages.indexOf(currentStage) + 1] : stages.find(stage => stage.from > chapterNumber);
-  const ordinal = currentStage ? chapterNumber - currentStage.from + 1 : 0;
-  const total = currentStage ? currentStage.to - currentStage.from + 1 : 0;
-  const left = currentStage ? currentStage.to - chapterNumber : 0;
+  // 本章不在总纲列出的任何阶段区间内（《穿成恶人前夫后》第178章起就是这种情况：卷区间 156～205，
+  // 但卷内只列到第174～177章）：这时按阶段压缩没有意义，反而会把卷内的“关键节点”“埋伏”跟着非当前阶段一起压掉，
+  // 整卷原文给出去，只把“本章在哪一段”说清楚
+  if (!currentStage) {
+    const laterStage = stages.find(stage => stage.from > chapterNumber);
+    return {
+      text: compactText(volumeText, maxBytes),
+      position: laterStage
+        ? `本章不在总纲已列出的阶段区间内；下一阶段「${stageTitle(laterStage)}」从第 ${laterStage.from} 章开始`
+        : `本章不在总纲已列出的阶段区间内（本卷已列出的阶段到第 ${Math.max(...stages.map(stage => stage.to))} 章为止）；这几章的事件顺序以章纲或阶段节拍表为准`,
+      atVolumeEnd: false,
+    };
+  }
+  const nextStage = stages[stages.indexOf(currentStage) + 1];
+  const ordinal = chapterNumber - currentStage.from + 1;
+  const total = currentStage.to - currentStage.from + 1;
+  const left = currentStage.to - chapterNumber;
   const rendered = blocks.map(block => {
     if (block.kind === "text") return block.lines.join("\n");
     if (block === currentStage) return `【当前阶段：本章是本阶段第 ${ordinal}/${total} 章${left === 0 ? "，也是最后一章" : `，之后还剩 ${left} 章`}】\n${block.lines.join("\n")}`;
@@ -564,12 +579,10 @@ function compactVolumeByStage(volumeText: string, chapterNumber: number | undefi
     // 其他阶段只留标题行：已完成阶段的细节再多也不是本章的事，更后面的阶段更不能提前写
     return block.lines[0];
   }).map(part => part.trim()).filter(Boolean).join("\n\n");
-  const position = currentStage
-    ? `本章位于阶段「${stageTitle(currentStage)}」：第 ${ordinal}/${total} 章${left === 0
-      ? `，是本阶段最后一章——必须在本章内收束本阶段，并把故事推进到${nextStage ? `下一阶段「${stageTitle(nextStage)}」` : "下一卷"}的起点`
-      : `，本阶段的推进要摊在这 ${total} 章里，本章只走其中一步，之后还剩 ${left} 章`}`
-    : nextStage ? `本章不在总纲已列出的阶段区间内；下一阶段「${stageTitle(nextStage)}」从第 ${nextStage.from} 章开始` : "";
-  return { text: compactText(rendered, maxBytes), position, atVolumeEnd: Boolean(currentStage) && !nextStage };
+  const position = `本章位于阶段「${stageTitle(currentStage)}」：第 ${ordinal}/${total} 章${left === 0
+    ? `，是本阶段最后一章——必须在本章内收束本阶段，并把故事推进到${nextStage ? `下一阶段「${stageTitle(nextStage)}」` : "下一卷"}的起点`
+    : `，本阶段的推进要摊在这 ${total} 章里，本章只走其中一步，之后还剩 ${left} 章`}`;
+  return { text: compactText(rendered, maxBytes), position, atVolumeEnd: !nextStage };
 }
 
 /**

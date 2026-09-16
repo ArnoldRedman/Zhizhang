@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { boundChapterOutlineFor, buildChapterWriteContext, outlineFinalChapterNumber, stageBeatsFor, stageRangeFor } from './context.ts';
+import { boundChapterOutlineFor, buildChapterWriteContext, effectiveCards, stageBeatsFor, stageRangeFor } from './context.ts';
 import type { Chapter, ChapterMemory, MemoryDocument, OutlineDocument, Project } from '../../domain/project.ts';
 import type { Skill } from '../../domain/skill.ts';
 
@@ -44,18 +44,26 @@ test('没勾卡片时按上一章正文与章纲里出现的卡名自动带入�
   assert.deepEqual((context.params.cards as Array<{ id: number }>).map(item => item.id), [3, 1]);
 });
 
-test('outlineFinalChapterNumber 取总纲里最大的章号区间上限', () => {
-  assert.equal(outlineFinalChapterNumber(project()), undefined);
-  const current = project({ outlines: [{ ...outline(12, '总纲', '总纲'), content: '## 第一卷（第1～40章）\n## 第六卷（第206～250章）' }] });
-  assert.equal(outlineFinalChapterNumber(current), 250);
+test('effectiveCards 没勾卡片时自动挑（金手指卡固定带入），勾了只用勾的', () => {
+  const current = project({
+    chapters: [chapter(1, '沈砚在温室里试制桑皮纸。'), chapter(2)],
+    cards: [...project().cards, { id: 3, type: '金手指卡', title: '修复之眼', content: '', createdAt: now, updatedAt: now }],
+  });
+  const auto = effectiveCards(current, [], '沈砚把纸样压在窗台上').map(card => card.title);
+  assert.ok(auto.includes('沈砚'));
+  assert.ok(auto.includes('修复之眼'));
+  assert.ok(!auto.includes('灯塔'));
+  assert.deepEqual(effectiveCards(current, [2], '沈砚把纸样压在窗台上').map(card => card.title), ['灯塔']);
 });
 
-test('stageRangeFor 取包含本章、跨度最小的区间；只有大卷时只规划八章', () => {
+test('stageRangeFor 取包含本章、跨度最小的区间；大卷与没写进总纲的章都只规划往后八章', () => {
   const master = { ...outline(12, '总纲', '总纲'), content: '## 第五卷（第156～205章）\n- **第171～177章**\n- **第178～185章：研究沉淀**' };
   const current = project({ outlines: [master] });
   assert.deepEqual(stageRangeFor(current, 180), { from: 178, to: 185 });
   assert.deepEqual(stageRangeFor(current, 190), { from: 190, to: 197 });
-  assert.equal(stageRangeFor(current, 300), undefined);
+  // 总纲没写 178 章以后的区间也要能规划，否则作者得为了下一章先去总纲里塞一段“第X～Y章”
+  assert.deepEqual(stageRangeFor(project(), 179), { from: 179, to: 186 });
+  assert.deepEqual(stageRangeFor(current, 300), { from: 300, to: 307 });
 });
 
 test('阶段节拍表按标题区间匹配本章，进 stageBeats 而不进普通章纲列表', () => {

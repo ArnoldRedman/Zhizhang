@@ -14,6 +14,40 @@ export const chapterNumberFromText = (value: string) => {
   return parseChapterNumber(match[1]) ?? undefined;
 };
 
+/**
+ * 已备章纲写到第几章：显示给作者看“还能连写到哪”，也只认作者看得见、改得动的章纲
+ * 只认标题里的章号，不看正文：章纲正文里常常提到“承接第 173 章”这类句子，拿正文当依据会把终点算高
+ * 阶段节拍表的标题是区间（阶段节拍｜第174～177章），chapterNumberFromText 会对它返回 undefined
+ */
+export const plannedThroughChapterNumber = (project: Project): number | undefined => {
+  let planned: number | undefined;
+  for (const outline of project.outlines) {
+    if (outline.kind !== '章纲') continue;
+    const number = chapterNumberFromText(outline.title);
+    if (number !== undefined && (planned === undefined || number > planned)) planned = number;
+  }
+  return planned;
+};
+
+/**
+ * 总纲里按卷写明的章号上限（“### 第四卷：…（156～205章）”“| 第一卷 | 1～67章 |”），也就是全书的计划末章
+ * 只认带“卷”的那一行里的区间：总纲正文里到处都有“须在第X～Y章完成”这种句子，拿全部区间取最大值会把边界算错，
+ * 连续创作写到这里就停，作者改总纲卷区间就是改全书的结局边界
+ */
+export const plannedVolumeEndChapter = (project: Project): number | undefined => {
+  let end: number | undefined;
+  for (const outline of project.outlines) {
+    if (outline.kind !== '总纲') continue;
+    for (const line of outline.content.split('\n')) {
+      const match = /(?:第\s*)?(\d{1,4})\s*[～~\-—–至到]\s*(\d{1,4})\s*章/u.exec(line);
+      if (!line.includes('卷') || !match) continue;
+      const to = Number(match[2]);
+      if (Number.isFinite(to) && (end === undefined || to > end)) end = to;
+    }
+  }
+  return end;
+};
+
 /** Old chapter outlines may not have a chapterId. Recover it from their title
  * before an agent run, rather than letting the model infer a chapter from
  * unrelated outline history. */

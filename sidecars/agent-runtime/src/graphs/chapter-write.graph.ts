@@ -5,6 +5,8 @@ import { ModelApiClient, type ApiUsage, type ApiWireMode, type ChatMessage } fro
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { StreamAccumulator } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, masterOutlineBytes, storyLedgerBytes, tailText, type ContextReport } from "../context/context-optimizer.js";
+import { chapterRevisePrompt, wholeChapterTokenBudget } from "../application/text-prompts.js";
+import { chapterReviewRequest, normalizeChapterReviewResult } from "../application/chapter-review.js";
 // 标题拆分与补全是纯文本处理，批量补标题也要用同一套判定，统一放在 application 层
 import { applyDraftChapterTitle, cleanChapterTitleName, splitChapterTitleHeading } from "../application/chapter-titles.js";
 
@@ -41,7 +43,7 @@ const intentLabels: Record<string, string> = {
 
 // Keep these prompts byte-for-byte stable. Compatible providers can reuse this
 // prefix on successive chapter runs instead of reprocessing the common rules.
-const chapterAgentSystemPrompt = `你是专业长篇网络小说创作 Agent。只根据作者提供的作品资料工作，不编造与资料冲突的设定。
+export const chapterAgentSystemPrompt = `你是专业长篇网络小说创作 Agent。只根据作者提供的作品资料工作，不编造与资料冲突的设定。
 
 写作原则：
 1. 服从章节任务、细纲、人物状态、时间线和已确认设定，资料冲突时以“已确认记忆”和作者任务为准。
@@ -63,7 +65,9 @@ function unwrapChapterDraft(value: unknown, depth = 0): string {
   try {
     const parsed = JSON.parse(text) as Record<string, unknown>;
     const nested = typeof parsed.draftContent === "string" ? parsed.draftContent : typeof parsed.content === "string" ? parsed.content : "";
-    return nested ? unwrapChapterDraft(nested, depth + 1) : stripPreambleAffirmation(value.trim());
+    // 信封里就是空的：不能退回原始 JSON 串当正文，否则 {"content":""} 会被当成一整章正文存进去
+    if (!nested.trim()) return "";
+    return unwrapChapterDraft(nested, depth + 1);
   } catch {
     return stripPreambleAffirmation(value.trim());
   }
@@ -112,10 +116,7 @@ function chapterTitleFromEnvelope(value: unknown, depth = 0): string {
   }
 }
 
-const chapterReviewSystemPrompt = `你是长篇小说一致性编辑。审查时只依据给出的约束、总纲位置、故事账本与章节正文，不做文风重写，也不虚构问题。
 
-重点检查三件事。一是一致性：人物状态、已知信息、时间线、实体关系、物品归属和剧情因果。二是推进：本章相对故事账本里的前文是否推进了新的事件或节点，有没有把账本里已发生的事件重新写了一遍。三是位置与事件线：对照总纲里的“本章位置”和“本章节拍”，本章主体是否就是节拍定的那件事、是否走到了当前阶段应到的一步；位置说明本章是阶段最后一章而正文没有收束本阶段，或者本章主体仍停留在上一章的地点、同一时间段与同一件事的枝节里，advances 都记为 false。再对照账本近期几章：若本章主事件仍是同一条事件线（同一份文件、同一次签字或交涉、同一个物件、同一个悬案）的下一个枝节，而节拍或作者任务没有要求本章继续这条线，也记 advances=false，并在 repeatedEvents 里写明“仍在×××这条线上”。作者任务或章纲明确要求本章留在同一场景时不算停留。
-返回严格 JSON 对象，不要代码围栏或解释：{"consistent":true,"issues":["明确矛盾"],"suggestions":["可执行修订建议"],"advances":true,"progress":"一句话说明本章把故事推进到了哪里","repeatedEvents":["与前文重复的事件"]}。没有明确问题时 issues、suggestions 和 repeatedEvents 返回空数组。`;
 
 const chapterPlanSystemPrompt = `你是长篇网络小说主编。先为下一章制作一份短小、可执行的写作计划，不写正文，不输出隐藏思考。
 只依据给定资料。先对照总纲与故事账本判断本章处在全书哪一段、必须把主线推进到哪个节点，再承接上一章结尾；承接只是开头几段的衔接，不是本章的全部内容。返回严格 JSON 对象：{"plan":"人类可读的 Markdown 计划","handoff":"下一章交接"}。plan 字段必须直接是普通 Markdown 文字，绝不能在 plan 字段中再次嵌套 JSON、JSON 字符串、代码围栏或字段对象。
@@ -268,6 +269,8 @@ export const ChapterState = Annotation.Root({
   /** 项目设置的单章目标字数，缺省 3000 */
   targetWords: Annotation<number | undefined>,
   outline: Annotation<string | undefined>,
+  /** 书名：审后定点修订要用它写“修订《某书》第 N 章”，不然提示词里只能写“未命名小说” */
+  projectTitle: Annotation<string | undefined>,
   previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string; ending?: string }> | undefined>,
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
@@ -298,6 +301,8 @@ export const ChapterState = Annotation.Root({
     advances?: boolean;
     progress?: string;
     repeatedEvents?: string[];
+    /** 审查提出一致性问题后是否已按意见定点修订过一次 */
+    revised?: boolean;
   } | undefined>,
   errors: Annotation<string[]>({
     reducer: (prev, next) => [...prev, ...next],
@@ -606,28 +611,21 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         };
       }
 
-      // 构建审查 prompt
-      const contextSection = state.retrievedContext.length > 0
-        ? `\n## 已知背景信息\n${state.retrievedContext.join("\n\n")}\n`
-        : "";
-      const cardsSection = state.cards?.length
-        ? `\n## 本章引用卡片状态\n${state.cards.map(card => `${card.title}：${compactText(card.content, 260)}`).join("\n")}`
-        : "";
-      const graphSection = state.knowledgeGraph
-        ? `\n## 知识图谱约束\n${state.knowledgeGraph}\n`
-        : "";
-      // 审查也要看到总纲位置与账本：没有前文事件清单和“本章位置”，"是否推进、是否停在原地"就只能靠猜
-      const directionSection = storyDirectionPacket(state);
-      const ledgerSection = directionSection ? `\n${directionSection}\n` : "";
-
-      const reviewConstraints = `${cardsSection}${graphSection}${ledgerSection}${contextSection}`;
-      const reviewDraft = compactText(state.draftContent, 10000);
-      const reviewPrompt = `## 约束摘要\n${reviewConstraints || "（暂无额外约束）"}\n\n## 待审查章节\n${reviewDraft}`;
-      const stablePacket = stableProjectPacket(state);
-      const session = splitSessionContext(state.sessionContext);
-      const reviewInstruction = chapterReviewSystemPrompt;
+      // 审查提示词与批量审查旧章共用一份（application/chapter-review.ts），改一处两边都生效
+      const { messages: reviewMessages, inputBytes: reviewInputBytes } = chapterReviewRequest({
+        agentSystemPrompt: chapterAgentSystemPrompt,
+        worldSetting: state.worldSetting,
+        writingStyle: state.writingStyle,
+        chapterBeat: state.chapterBeat,
+        masterOutline: state.masterOutline,
+        storyLedger: state.storyLedger,
+        cards: state.cards,
+        knowledgeGraph: state.knowledgeGraph,
+        retrievedContext: state.retrievedContext,
+        draftContent: state.draftContent,
+        sessionContext: state.sessionContext,
+      });
       const previousReport = state.contextReport;
-      const reviewInputBytes = byteLength(chapterAgentSystemPrompt) + byteLength(stablePacket) + byteLength(session.summary) + byteLength(reviewPrompt) + byteLength(session.recent) + byteLength(reviewInstruction);
       const contextReport = previousReport ? {
         ...previousReport,
         reviewInputBytes,
@@ -635,14 +633,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
 
       let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
       try {
-        response = await client.chat([
-          { role: "system", content: chapterAgentSystemPrompt },
-          { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
-          ...(session.summary ? [{ role: "user" as const, content: session.summary }] : []),
-          { role: "user", content: reviewPrompt },
-          ...(session.recent ? [{ role: "user" as const, content: session.recent }] : []),
-          { role: "user", content: reviewInstruction },
-        ], { response_format: { type: "json_object" }, max_tokens: 2000 });
+        response = await client.chat(reviewMessages, { response_format: { type: "json_object" }, max_tokens: 2000 });
       } catch (error) {
         // 审查失败不能拖垮已经写好的整章正文：如实标注审查未完成，正文照常交给作者
         const message = error instanceof Error ? error.message : String(error);
@@ -657,16 +648,8 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.progress("review", 95, "审查完成");
 
       try {
-        const result = JSON.parse(response.content);
         return {
-          reviewResult: {
-            consistent: result.consistent ?? true,
-            issues: result.issues || [],
-            suggestions: result.suggestions || [],
-            advances: typeof result.advances === "boolean" ? result.advances : true,
-            progress: typeof result.progress === "string" ? result.progress.trim() : "",
-            repeatedEvents: Array.isArray(result.repeatedEvents) ? result.repeatedEvents.filter((item: unknown): item is string => typeof item === "string" && item.trim().length > 0) : [],
-          },
+          reviewResult: normalizeChapterReviewResult(response.content),
           contextReport,
           upstreamUsage: addUsage(state.upstreamUsage, response.usage),
         };
@@ -710,6 +693,45 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         return { errors: [`重写阶段失败：${message}`] };
       }
     })
+    // 审查指出一致性问题（人物不对、时间线矛盾、设定冲突）时，按意见定点修订一次
+    // 以前这些意见只显示给作者看，正文一个字不改；整章重起草代价大又会把写得好的部分一起换掉，
+    // 所以走“指令没要求的地方保持原样”的修订，而不是再写一遍
+    .addNode("revise", async (state: ChapterStateType) => {
+      const review = state.reviewResult;
+      const issues = (review?.issues || []).map(item => String(item).trim()).filter(Boolean);
+      // 审查给出的修改建议往往写了具体改法（“把×××换成×××”），只带 issues 等于让模型自己重新想一遍怎么改
+      const suggestions = (review?.suggestions || []).map(item => String(item).trim()).filter(Boolean);
+      if (!state.draftContent || (!issues.length && !suggestions.length)) return {};
+      const count = issues.length + suggestions.length;
+      emitter?.progress("review", 97, `正在按审查意见定点修订一次：${count} 条`);
+      emitter?.context("draft", "按审查意见定点修订", { source: "ConsistencyChecker", status: "selected", items: count });
+      const instruction = [
+        "按以下一致性审查意见修订本章，逐条落到正文里；意见没点到的地方保持原样：",
+        ...issues.map((item, index) => `${index + 1}. ${item}`),
+        ...(suggestions.length ? ["", "审查给出的修改建议（按它改，不要另起主意）：", ...suggestions.map(item => `- ${item}`)] : []),
+      ].join("\n");
+      const prompt = chapterRevisePrompt({ projectTitle: state.projectTitle, chapterTitle: state.chapterTitle, instruction, content: state.draftContent });
+      try {
+        const response = await client.chatStream([{ role: "user", content: prompt }], {
+          temperature: 0.6,
+          max_tokens: wholeChapterTokenBudget(state.draftContent),
+          retryAttempts: 3,
+        }, chunk => emitter?.chunk(chunk));
+        // 模型经常把正文包在 {"content": "..."} 信封里（和其他节点一样要拆）
+        const content = unwrapChapterDraft(response.content).replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim();
+        // 修订没产出正文就保留初稿：宁可在报告里写明“修订未完成”，也不能把整章弄丢
+        if (!content) return { errors: ["审查后的定点修订没有返回正文，已保留初稿"] };
+        return {
+          draftContent: content,
+          reviewResult: { ...review, revised: true, suggestions: [...(review?.suggestions || []), `已按审查意见定点修订一次（问题 ${issues.length} 条，建议 ${suggestions.length} 条）`] },
+          upstreamUsage: addUsage(state.upstreamUsage, response.usage),
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        emitter?.progress("review", 98, `定点修订失败，保留初稿：${message}`);
+        return { errors: [`审查后的定点修订失败：${message}`] };
+      }
+    })
     .addEdge("__start__", "prewrite")
     .addEdge("prewrite", "intent")
     .addEdge("intent", "retrieve")
@@ -717,8 +739,18 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     .addEdge("continuity", "plan")
     .addEdge("plan", "draft")
     .addEdge("draft", "review")
-    .addConditionalEdges("review", (state: ChapterStateType) => (state.reviewResult?.advances === false || (state.reviewResult?.repeatedEvents?.length || 0) > 0 ? "repair" : "done"), { repair: "repair", done: "__end__" })
-    .addEdge("repair", "__end__");
+    .addConditionalEdges("review", (state: ChapterStateType) => {
+      const review = state.reviewResult;
+      if (!review) return "done";
+      // 没推进、重复前文：整章按下一个节点重起草（两套问题同时出现时只走这一条，不叠两次改写）
+      if (review.advances === false || (review.repeatedEvents?.length || 0) > 0) return "repair";
+      // 其余一致性问题：定点修订一次，改完不再审，避免反复改
+      // 只看 issues：审查失败时也会写一条“审查未完成”的说明到 suggestions，那不是要改正文的理由
+      if ((review.issues?.length || 0) > 0) return "revise";
+      return "done";
+    }, { repair: "repair", revise: "revise", done: "__end__" })
+    .addEdge("repair", "__end__")
+    .addEdge("revise", "__end__");
 
   return graph.compile();
 }

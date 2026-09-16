@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createChapterGraph, selectSkillsByIntent, type SkillDefinition } from "./graphs/chapter-write.graph.js";
+import { createChapterGraph, chapterAgentSystemPrompt, selectSkillsByIntent, type SkillDefinition } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
 import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
@@ -7,6 +7,8 @@ import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutli
 import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, stageBeatSheetProtocol, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
+import { outlineWriteTargetContext, stageBeatContentFor } from "./application/outline-target.js";
+import { chapterReviewRequest, normalizeChapterReviewResult } from "./application/chapter-review.js";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
 import { applyDraftChapterTitle, detectChapterNumberStyle, generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
 import { planChapterSplits } from "./application/chapter-split.js";
@@ -172,12 +174,17 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           .filter(memory => memory.chapterNumber > 0)
           .sort((left, right) => left.chapterNumber - right.chapterNumber)
           .slice(-6);
+        // 章纲写的是哪一章、从哪接、按谁的格式：从标题里的章号算，和界面路径同一套
+        const targetContext = outlineWriteTargetContext(request.title, chapters, outlines);
         const result = await delegateResult("outline", "outline.write", {
           ...delegateBase("outline"),
           outlineId: request.targetId,
           kind: request.kind,
           existingContent: String(target?.content || ""),
           instruction: request.instruction,
+          ...targetContext,
+          // 本章已有阶段节拍表就一并带入：章纲必须围着节拍里本章那一行写，两条路径的资料要一致
+          stageBeats: stageBeatContentFor(outlines, targetContext.targetChapter?.number),
           cards: projectList("cards"),
           knowledgeGraph: projectKnowledgeGraph,
           worldSetting: outlines.filter(item => String(item.kind || "") === "世界观与作品设定")
@@ -189,7 +196,9 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         });
         const content = String(result.content || "").trim();
         if (!content) throw new Error("大纲智能体没有返回内容");
-        return { type: "outline.upsert" as const, summary: request.summary, targetId: request.targetId, kind: request.kind, title: request.title, content };
+        // 标题已带章号的章纲顺手绑到对应章节上：新建的章纲只有标题能做依据，绑好章号后读写都不会错位
+        const chapterId = targetContext.targetChapter?.id || undefined;
+        return { type: "outline.upsert" as const, summary: request.summary, targetId: request.targetId, kind: request.kind, title: request.title, content, chapterId };
       };
 
       const delegateCard = async (request: ProjectAgentCardRequest) => {
@@ -648,6 +657,42 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       // 节拍表是一张表，不走章纲的标题去重；只剥代码围栏
       return { id: req.id, result: { content: kind === "章纲" && !isBeatSheet ? normalizeChapterOutlineOutput(response.content) : response.content.trim().replace(/^```(?:markdown|md)?\s*/iu, "").replace(/```$/u, "").trim() } };
     }
+    if (req.method === "chapter.review") {
+      // 批量审查旧章：正文已经存在，只跑审查那一步，不重写正文
+      const { projectId, instruction, outline, outlines, activeOutlineId, cards, previousChapters, memories, memoryDocuments, knowledgeGraph, existingContent, chapterNumber, totalChapters, contextWindow, writingStyle, stageBeats } = req.params ?? {};
+      if (!projectId) return { id: req.id, error: { code: -32602, message: "Missing required params" } };
+      const content = String(existingContent || "").trim();
+      if (!content) return { id: req.id, error: { code: -32602, message: "缺少要审查的正文" } };
+      // 组装与写正文时同一份资料：总纲位置、故事账本、卡片、节拍都一致，“有没有推进”才判得出来
+      const prepared = prepareChapterInput({
+        instruction: String(instruction || ""), outline, outlines, activeOutlineId, cards, previousChapters,
+        memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills,
+        contextWindowKTokens: Number(contextWindow) || undefined,
+        chapterPosition: {
+          number: Number(chapterNumber) > 0 ? Number(chapterNumber) : undefined,
+          total: Number(totalChapters) >= 0 ? Number(totalChapters) : undefined,
+        },
+      });
+      const { messages } = chapterReviewRequest({
+        agentSystemPrompt: chapterAgentSystemPrompt,
+        worldSetting: prepared.worldSetting,
+        writingStyle: writingStyle && typeof writingStyle === "object"
+          ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) }
+          : undefined,
+        chapterBeat: chapterBeatText(stageBeats, Number(chapterNumber) > 0 ? Number(chapterNumber) : undefined),
+        masterOutline: prepared.masterOutline,
+        storyLedger: prepared.storyLedger,
+        cards: prepared.cards,
+        knowledgeGraph: prepared.knowledgeGraph,
+        draftContent: content,
+        chapterNumber: Number(chapterNumber) > 0 ? Number(chapterNumber) : undefined,
+        totalChapters: Number(totalChapters) >= 0 ? Number(totalChapters) : undefined,
+      });
+      const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
+      const response = await client.chat(messages, { response_format: { type: "json_object" }, max_tokens: 2000 });
+      return { id: req.id, result: { reviewResult: normalizeChapterReviewResult(response.content), usage: response.usage } };
+    }
+
     if (req.method === "chapter.write") {
       const {
         projectId,
@@ -813,6 +858,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         });
         const result = await graph.invoke({
           projectId: normalizedProjectId,
+          projectTitle: String(projectTitle || ""),
           chapterId: String(chapterId),
           instruction: String(instruction),
           worldSetting: prepared.worldSetting,
@@ -854,7 +900,9 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         // 计划是一次性产物，下一章会重新生成，把它当“已确认结论”回喂只会把模型拉回上一章的写法
         const reviewRecord = resultRecord.reviewResult as Record<string, unknown> | undefined;
         const reviewIssues = Array.isArray(reviewRecord?.issues) ? reviewRecord.issues.map(item => String(item)).filter(Boolean).join("；") : "";
-        const handoff = [resultRecord.summary, reviewIssues ? `待修正：${reviewIssues}` : ""].filter(Boolean).join("\n");
+        // 审查后已经按意见定点修订过的，不要再把同一批意见当“待修正”丢给下一章：那句会误导下一章的写法
+        const pendingIssues = reviewRecord?.revised ? "" : reviewIssues;
+        const handoff = [resultRecord.summary, pendingIssues ? `待修正：${pendingIssues}` : ""].filter(Boolean).join("\n");
         if (handoff) {
           const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes, `chapter:${String(chapterId)}`);
           novelSessionCache.set(sessionKey, nextChapterSession.state);
