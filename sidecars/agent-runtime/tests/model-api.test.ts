@@ -281,15 +281,34 @@ describe("model client configuration", () => {
       .rejects.toThrow("模型输出被截断（max_tokens=8）");
   });
 
-  it("explains when a gateway returns reasoning without visible content", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+  it("诊断只有推理的响应，不猜额度耗尽、不重复请求或泄露内容", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       model: "gpt-test",
       choices: [{ message: { reasoning_content: "内部推理" }, finish_reason: "stop" }],
     }), { status: 200 }));
 
     await expect(new ModelApiClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
-      .chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
-      .rejects.toThrow("只返回了推理内容");
+      .chat([{ role: "user", content: "私有小说正文" }], { max_tokens: 1234, retryAttempts: 3 }))
+      .rejects.toThrow("响应未明确标记额度耗尽");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const diagnostic = JSON.stringify(log.mock.calls);
+    expect(diagnostic).toContain("max_tokens=1234");
+    expect(diagnostic).toContain("finish_reason=stop");
+    expect(diagnostic).toContain("推理长度=4");
+    expect(diagnostic).not.toMatch(/内部推理|私有小说正文|test-key/);
+  });
+
+  it("结构化工具调用不会被误判为推理耗尽，未知别名仍保留 JSON 参数", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: null, tool_calls: [{ type: "function", function: { name: "open", arguments: "{}" } }] }, finish_reason: "tool_calls" }],
+    }), { status: 200 }));
+    await expect(new ModelApiClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "custom-reasoner" })
+      .chat([{ role: "user", content: "检查章节" }], { response_format: { type: "json_object" }, retryAttempts: 2 }))
+      .rejects.toThrow("未请求的结构化工具调用");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body)).response_format).toEqual({ type: "json_object" });
   });
 
   it("finishes an SSE response on finish_reason even when the relay keeps the connection open", async () => {

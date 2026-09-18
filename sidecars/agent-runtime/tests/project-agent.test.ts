@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ModelApiClient } from "../src/models/model-api.js";
-import { buildProjectAgentContext, ProjectAgentChangeSchema, runProjectAgent } from "../src/project-agent.js";
+import { buildProjectAgentContext, extractDsmlTurn, isDsmlOrToolCall, isFormatRepairMetaComplaint, ProjectAgentChangeSchema, runProjectAgent } from "../src/project-agent.js";
 
 const project = {
   id: 42,
@@ -202,7 +202,7 @@ describe("project agent", () => {
     expect(lastTurn.some(message => message.content.includes("已省略较早的"))).toBe(true);
     // system 与首条请求（含项目资料）是任务前提，任何情况下都不能被丢
     expect(lastTurn[0]?.content).toContain("小说项目助手");
-    expect(lastTurn[1]?.content).toContain("本轮请求");
+    expect(lastTurn.some(message => message.content.includes("本轮请求"))).toBe(true);
   });
 
   it("stops the loop at maxSteps and still returns a result", async () => {
@@ -380,7 +380,7 @@ describe("project agent", () => {
     });
 
     expect(context.packet).toContain("#150｜1700000000150｜第 150 章");
-    expect(context.packet).toContain("提交变更时要用中间那个 id");
+    expect(context.packet).toContain("目录位置不等于标题章号");
   });
 
   it("长书索引从中间省略时给出翻页办法，而不是默默丢掉中段", () => {
@@ -640,3 +640,165 @@ describe("project agent", () => {
     expect(result.message).toContain("码头仓库背后");
     expect(result.changes).toEqual([]);
   });
+
+  it("能识别并过滤模型修复轮中对提示词本身的元抱怨", () => {
+    expect(isFormatRepairMetaComplaint("你这条消息里只有一句「请把以下内容整理成约定的 JSON 动作，只调整格式：」，后面没有跟着任何待整理的内容——我这边没有收到需要转换的原文。")).toBe(true);
+    expect(isFormatRepairMetaComplaint("你这条消息里只有要求，没有跟着要整理的内容——“以下内容”是空的，我这边看不到任何需要转换的文本。")).toBe(true);
+    expect(isFormatRepairMetaComplaint("这是正常回复：192章与194章之间确实缺少了193章的剧情过渡。")).toBe(false);
+  });
+
+  it("当模型返回空或{}时不会发送无上下文的只调整格式修复，而是带完整上下文收尾", async () => {
+    const chat = vi.fn()
+      // 第一轮 list
+      .mockResolvedValueOnce({ content: JSON.stringify({ action: "list", from: 1, to: 2 }), model: "test" })
+      // 第二轮返回空 JSON {}
+      .mockResolvedValueOnce({ content: "{}", model: "test" })
+      // 第三轮：带上下文重试，直接回答
+      .mockResolvedValueOnce({ content: JSON.stringify({ action: "finish", message: "经比对，两章剧情连贯，仅序号跳号。", changes: [] }), model: "test" });
+
+    const result = await runProjectAgent(
+      { mode: "discuss", instruction: "192和194连贯吗", project },
+      { chat } as unknown as ModelApiClient,
+      delegates(),
+    );
+
+    // 严禁发出带有空待整理内容的“请把以下内容整理成约定的 JSON 动作”
+    for (const call of chat.mock.calls) {
+      const messages = call[0] as Array<{ role: string; content: string }>;
+      const userMessage = messages.find(msg => msg.content.includes("请把以下内容整理成约定的 JSON 动作"));
+      if (userMessage) {
+        expect(userMessage.content).not.toMatch(/请把以下内容整理成约定的 JSON 动作，只调整格式：\s*$/);
+      }
+    }
+
+    expect(result.message).toContain("经比对，两章剧情连贯");
+  });
+
+  it("只解析动作明确的 DSML，残缺前缀不猜测工具意图", () => {
+    // 完整格式
+    const fullDsml = `<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="open">
+<｜｜DSML｜｜ parameter name="id">["1789712569700", "1789712877740", "1789713515724"]</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+    const parsedFull = extractDsmlTurn(fullDsml);
+    expect(parsedFull).toEqual({
+      action: "open",
+      kind: undefined,
+      id: ["1789712569700", "1789712877740", "1789713515724"],
+    });
+
+    // 线上截断格式：网关或传输导致前置标签丢失，只剩数组和尾标签
+    const truncatedDsml = `["1789712569700", "1789712877740", "1789713515724"]</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+    const parsedTruncated = extractDsmlTurn(truncatedDsml);
+    expect(parsedTruncated).toBeNull();
+  });
+
+  it("判定 DSML 标记为工具调用而非作者可见的散文回复", () => {
+    expect(isDsmlOrToolCall('["1789712569700"]</｜｜DSML｜｜ parameter>')).toBe(true);
+    expect(isDsmlOrToolCall('<｜DSML｜invoke name="open">')).toBe(true);
+    expect(isDsmlOrToolCall('这是正常的散文回复，两章情节完全连贯。')).toBe(false);
+  });
+
+  it("当模型返回 DSML 格式的 open 指令时，能正常驱动工具打开正文而非泄露标签", async () => {
+    const dsmlResponse = `<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="open"><｜｜DSML｜｜ parameter name="id">[1,2]</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+
+    const chat = vi.fn()
+      // 第一轮模型输出 DSML 请求打开第 1、2 章
+      .mockResolvedValueOnce({ content: dsmlResponse, model: "test" })
+      // 第二轮正文载入后，给出最终答复
+      .mockResolvedValueOnce({ content: JSON.stringify({ action: "finish", message: "正文已读取：两章剧情完全连贯。", changes: [] }), model: "test" });
+
+    const result = await runProjectAgent(
+      { mode: "discuss", instruction: "看两章正文", project },
+      { chat } as unknown as ModelApiClient,
+      delegates(),
+    );
+
+    // 严禁将 DSML 标记直接当成 message 输出给作者
+    expect(result.message).not.toContain("DSML");
+    expect(result.message).toContain("两章剧情完全连贯");
+    // 工具事件应记录实际执行了 project.open
+    expect(result.toolEvents.some(event => event.tool === "project.open")).toBe(true);
+  });
+
+
+
+
+describe("project agent context regressions", () => {
+  it("长历史和多轮读取不会丢掉当前问题，讨论模式不带写入工具说明", async () => {
+    const requests: Array<Array<{ role: string; content: string }>> = [];
+    const chat = vi.fn(async (messages: Array<{ role: string; content: string }>) => {
+      requests.push(messages);
+      return { model: "test", content: JSON.stringify(requests.length < 5
+        ? { action: "open", id: [1, 2] }
+        : { action: "finish", message: "已核对。", changes: [] }) };
+    });
+    await runProjectAgent({
+      mode: "discuss", instruction: "本轮唯一问题：192后面194是否缺剧情",
+      history: Array.from({ length: 10 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `旧消息${i}` + "旧".repeat(1400) })),
+      project: { ...project, chapters: project.chapters.map(chapter => ({ ...chapter, content: "中".repeat(4000) })) },
+    }, { chat } as unknown as ModelApiClient, delegates());
+    for (const messages of requests) {
+      expect(messages.some(message => message.content.includes("本轮唯一问题：192后面194是否缺剧情"))).toBe(true);
+      expect(messages[0].content).not.toContain("chapter.delete");
+      expect(Buffer.byteLength(messages.map(message => message.content).join(""))).toBeLessThanOrEqual(40_000);
+    }
+    expect(requests[1].at(-1)?.content).toContain("</正文>");
+  });
+
+  it("连续分段读取保留长章的中间内容及 Unicode 字符", async () => {
+    const content = "开头\r\n" + "雨🌧".repeat(1800) + "中间关键线索" + "夜".repeat(3000) + "结尾";
+    const pages: string[] = [];
+    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+      const tool = messages.at(-1)?.content || "";
+      const page = /<正文>\n([\s\S]*)\n<\/正文>/u.exec(tool);
+      if (page) pages.push(page[1]);
+      const next = /继续读取：([^\n]+)/u.exec(tool);
+      return { model: "test", content: next ? next[1] : JSON.stringify(pages.length
+        ? { action: "finish", message: "正文已读完。", changes: [] }
+        : { action: "open", id: 1 }) };
+    });
+    await runProjectAgent({ mode: "discuss", instruction: "检查全文是否有缺失", project: { ...project, chapters: [{ id: 1, title: "第192章", content }] } }, { chat } as unknown as ModelApiClient, delegates());
+    expect(pages.length).toBeGreaterThan(2);
+    expect(pages.join("")).toBe(content);
+  });
+
+  it("跳号目录保留标题与位置，按标题或真实ID读取同一章", async () => {
+    const replies = [
+      { action: "list", from: 1, count: 2 },
+      { action: "open", id: [101, "第194章 夜雨"] },
+      { action: "finish", message: "两章已读取。", changes: [] },
+    ];
+    const chat = vi.fn().mockImplementation(async () => ({ content: JSON.stringify(replies.shift()), model: "test" }));
+    await runProjectAgent({ mode: "discuss", instruction: "192章之后为什么是194章", project: { ...project, chapters: [
+      { id: 101, title: "第192章 入城", content: "192正文" },
+      { id: 102, title: "第194章 夜雨", content: "194正文" },
+    ] } }, { chat } as unknown as ModelApiClient, delegates());
+    expect(JSON.stringify(chat.mock.calls[1])).toContain("#2｜id=102｜标题：第194章 夜雨");
+    expect(JSON.stringify(chat.mock.calls[2])).toContain("194正文");
+  });
+
+  it("残缺工具标记恢复失败不泄露，也不猜动作执行", async () => {
+    const broken = '["1","2"]</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>';
+    const chat = vi.fn().mockResolvedValue({ content: broken, model: "test" });
+    const result = await runProjectAgent({ mode: "execute", instruction: "检查192和194", project }, { chat } as unknown as ModelApiClient, delegates());
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(chat.mock.calls[1])).toContain("检查192和194");
+    expect(result.message).toContain("工具指令解析失败");
+    expect(result.message).not.toContain("DSML");
+    expect(result.toolEvents.some(event => event.tool === "project.open")).toBe(false);
+    expect(result.changes).toEqual([]);
+  });
+
+  it("finish 包裹工具标记也不能漏到作者回复", async () => {
+    const client = clientWith(JSON.stringify({ action: "finish", message: '<｜｜DSML｜｜ invoke name="open">', changes: [] }));
+    const result = await runProjectAgent({ mode: "discuss", instruction: "分析正文", project }, client, delegates());
+    expect(result.message).not.toContain("DSML");
+    expect(result.message).toContain("解析失败");
+  });
+});

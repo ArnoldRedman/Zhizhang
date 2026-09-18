@@ -109,8 +109,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 const isQuotaExceeded = (value: string): boolean => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/i.test(value);
 
 function supportsOpenAIJsonMode(model: string): boolean {
-  // Gemini's OpenAI-compatible adapters commonly reject response_format at
-  // the upstream gateway, even though a plain chat completion works.
+  // 保留已知 Gemini 网关兼容行为，不根据 reasoner 等别名猜测 JSON 能力
   return !/^gemini(?:[-:/]|$)/iu.test(model.trim());
 }
 
@@ -322,6 +321,7 @@ export interface ChatOptions {
   max_tokens?: number;
   response_format?: { type: "json_object" | "text" };
   retryAttempts?: number;
+  reasoningMode?: "off" | "auto" | "minimal" | "low" | "medium" | "high" | "max";
 }
 
 export interface ApiUsage {
@@ -437,7 +437,7 @@ function extractText(value: unknown): string {
  * 这类失败是确定性的，重试只会重复消耗额度；用 ApiRequestError 标记为不重试，
  * 否则会被当成网络抖动，最后包成误导的“无法连接 API 中转服务”。
  */
-function emptyCompletionError(data: Record<string, unknown>, maxTokens: number): ApiRequestError {
+function emptyCompletionError(data: Record<string, unknown>, maxTokens: number, model: string): ApiRequestError {
   const choice = Array.isArray(data.choices) && data.choices[0] && typeof data.choices[0] === "object"
     ? data.choices[0] as Record<string, unknown>
     : undefined;
@@ -445,13 +445,20 @@ function emptyCompletionError(data: Record<string, unknown>, maxTokens: number):
     ? choice.message as Record<string, unknown>
     : undefined;
   const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : "";
-  if (finishReason === "length") {
-    return new ApiRequestError(`模型输出被截断（max_tokens=${maxTokens}），请重试或提高输出上限`, 200);
-  }
   const reasoningLength = [message?.reasoning_content, message?.reasoning]
-    .find(value => typeof value === "string");
-  if (typeof reasoningLength === "string" && reasoningLength.length > 0) {
-    return new ApiRequestError("模型只返回了推理内容，没有正文；请关闭推理模式或提高输出上限", 200);
+    .reduce<number>((sum, value) => sum + (typeof value === "string" ? value.length : 0), 0);
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls.length : message?.function_call ? 1 : 0;
+  // 只记录字段统计，不把密钥、请求正文或推理内容写入日志
+  const diagnostic = `模型=${model}，接口=openai-compatible，max_tokens=${maxTokens}，finish_reason=${finishReason || "未提供"}，正文长度=${extractText(message?.content).length}，推理长度=${reasoningLength}，工具调用数=${toolCalls}`;
+  console.error(`[model-api] 空正文响应：${diagnostic}`);
+  if (finishReason === "length") {
+    return new ApiRequestError(`模型输出被截断（max_tokens=${maxTokens}），请重试或提高输出上限；${diagnostic}`, 200);
+  }
+  if (toolCalls > 0) {
+    return new ApiRequestError(`模型返回了未请求的结构化工具调用，没有正文；请检查模型或中转的工具协议转换。${diagnostic}`, 200);
+  }
+  if (reasoningLength > 0) {
+    return new ApiRequestError(`模型只返回了推理内容，没有正文；响应未明确标记额度耗尽，请检查模型或中转兼容性。${diagnostic}`, 200);
   }
   const topKeys = Object.keys(data).slice(0, 12).join(",");
   const choiceKeys = choice ? Object.keys(choice).slice(0, 12).join(",") : "";
@@ -774,7 +781,7 @@ export class ModelApiClient {
   ): Promise<{ content: string; model: string; usage?: ApiUsage }> {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
     const mode = this.wireMode;
-    const reasoningMode = this.config.reasoningMode;
+    const reasoningMode = options.reasoningMode ?? this.config.reasoningMode;
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
     // Anthropic rejects a thinking budget that is not strictly below max_tokens.
     // OpenAI 兼容接口的思考 token 和正文共用 max_tokens，所以给思考额外留额度；
@@ -829,7 +836,7 @@ export class ModelApiClient {
           const data = await response.json() as Record<string, unknown>;
           if (mode === "anthropic") {
             const content = anthropicText(data.content);
-            if (!content) throw emptyAnthropicError(data, maxTokens);
+            if (!content.trim()) throw emptyAnthropicError(data, maxTokens);
             const anthropicUsage = parseUsage(data.usage);
             recordRuntimeUsage(anthropicUsage);
             return { content, model: typeof data.model === "string" ? data.model : model, usage: anthropicUsage };
@@ -838,7 +845,7 @@ export class ModelApiClient {
           const firstChoice = choices[0];
           const firstMessage = firstChoice?.message as Record<string, unknown> | undefined;
           const content = extractText(firstMessage?.content) || extractText(firstChoice?.text);
-          if (!content) throw emptyCompletionError(data, maxTokens);
+          if (!content.trim()) throw emptyCompletionError(data, Number(JSON.parse(body).max_tokens), model);
           const usage = parseUsage(data.usage);
           recordRuntimeUsage(usage);
           this.noteReasoning(model, usage);
@@ -848,9 +855,9 @@ export class ModelApiClient {
         const detail = await response.text();
         const retryable = [408, 429, 500, 502, 503, 504, 524].includes(response.status) && !isQuotaExceeded(detail);
         if (retryable && attempt < maxAttempts) {
-          // Some upstream OpenAI-compatible adapters turn unsupported optional
-          // fields into a 503. Retry the same task once with only core fields.
           if (response.status === 503 && attempt === 1) {
+            // Some upstream OpenAI-compatible adapters turn unsupported optional
+            // fields into a 503. Retry the same task once with only core fields.
             try {
               const compatibilityBody = JSON.parse(body) as Record<string, unknown>;
               delete compatibilityBody.response_format;
@@ -889,7 +896,7 @@ export class ModelApiClient {
     const mode = this.wireMode;
     const endpoint = this.endpoints().chat;
     const dispatcher = proxyDispatcherFor(endpoint, this.config);
-    const reasoningMode = this.config.reasoningMode;
+    const reasoningMode = options.reasoningMode ?? this.config.reasoningMode;
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
     // OpenAI 兼容接口的思考 token 和正文共用 max_tokens，所以给思考额外留额度；
     // 没开推理时不能凭空加（会改掉调用方明确指定的 max_tokens）

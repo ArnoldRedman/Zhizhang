@@ -1293,7 +1293,19 @@ function App() {
   const [consoleFrame, setConsoleFrame] = useState<{ x: number; y: number; width: number; height: number } | null>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem('writing-console-frame') || 'null');
-      if (saved && typeof saved.x === 'number' && typeof saved.y === 'number' && typeof saved.width === 'number' && typeof saved.height === 'number') return saved;
+      if (saved && typeof saved.x === 'number' && typeof saved.y === 'number' && typeof saved.width === 'number' && typeof saved.height === 'number') {
+        // 若此前受 max-width: 500px 限制存成了窄尺寸，恢复到更合理的预设宽度
+        const width = saved.width <= 560
+          ? Math.min(900, Math.max(520, window.innerWidth - 64))
+          : Math.max(520, Math.min(window.innerWidth - 32, saved.width));
+        const height = Math.max(320, Math.min(window.innerHeight - 32, saved.height));
+        return {
+          x: Math.min(Math.max(-width + 160, saved.x), window.innerWidth - 80),
+          y: Math.min(Math.max(0, saved.y), window.innerHeight - 48),
+          width,
+          height,
+        };
+      }
     } catch {
       // 存档坏了就用居中默认值，不值得打断打开面板
     }
@@ -1301,22 +1313,42 @@ function App() {
   });
   const consoleModalRef = useRef<HTMLDivElement | null>(null);
   const consoleDragRef = useRef<{ mode: 'move' | 'resize'; startX: number; startY: number; frame: { x: number; y: number; width: number; height: number } } | null>(null);
+  const consoleDragEndTimeRef = useRef(0);
+  const consoleOverlayPointerDownRef = useRef(false);
 
   /** 拖标题栏移动、拖右下角缩放：先把当前矩形固定成内联样式，之后按位移算新值 */
   const startConsoleDrag = (mode: 'move' | 'resize') => (event: React.PointerEvent<HTMLElement>) => {
     // 标题栏里有按钮，点按钮不该带着窗口跑
-    if ((event.target as HTMLElement).closest('button')) return;
+    if ((event.target as HTMLElement).closest('button')) {
+      return;
+    }
     const rect = consoleModalRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    if (!rect) {
+      return;
+    }
     event.preventDefault();
+    event.stopPropagation();
+    const currentTarget = event.currentTarget;
+    try {
+      currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // 忽略不支持指针捕获的环境
+    }
     const frame = { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
     setConsoleFrame(frame);
+    let hasMoved = false;
     consoleDragRef.current = { mode, startX: event.clientX, startY: event.clientY, frame };
+
     const move = (moveEvent: PointerEvent) => {
       const drag = consoleDragRef.current;
-      if (!drag) return;
+      if (!drag) {
+        return;
+      }
       const dx = moveEvent.clientX - drag.startX;
       const dy = moveEvent.clientY - drag.startY;
+      if (!hasMoved && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) {
+        hasMoved = true;
+      }
       const next = drag.mode === 'move'
         ? {
           ...drag.frame,
@@ -1326,14 +1358,34 @@ function App() {
         }
         : {
           ...drag.frame,
-          width: Math.max(560, Math.min(1800, drag.frame.width + dx)),
-          height: Math.max(320, Math.min(window.innerHeight, drag.frame.height + dy)),
+          // 缩放支持横向拉宽或收拢，最小 520px，最大不超过屏幕剩余可用区
+          width: Math.max(520, Math.min(Math.max(520, window.innerWidth - drag.frame.x), drag.frame.width + dx)),
+          height: Math.max(320, Math.min(Math.max(320, window.innerHeight - drag.frame.y), drag.frame.height + dy)),
         };
       setConsoleFrame(next);
     };
+
     const up = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
+      try {
+        currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // 忽略
+      }
+      if (hasMoved) {
+        consoleDragEndTimeRef.current = Date.now();
+        // 捕获阶段拦截松手瞬间产生的原生 click，防止遮罩将拖拽判定为背景点击而误关
+        const stopClick = (clickEvent: MouseEvent) => {
+          clickEvent.stopPropagation();
+          clickEvent.preventDefault();
+          window.removeEventListener('click', stopClick, true);
+        };
+        window.addEventListener('click', stopClick, true);
+        setTimeout(() => {
+          window.removeEventListener('click', stopClick, true);
+        }, 200);
+      }
       consoleDragRef.current = null;
       setConsoleFrame(current => {
         if (current) {
@@ -1346,6 +1398,7 @@ function App() {
         return current;
       });
     };
+
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
   };
@@ -4975,6 +5028,20 @@ function App() {
         const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const drafted = await requestChapterDraft(project, inserted.chapter, runId);
         if (!drafted.result.draftContent?.trim()) throw new Error(`第 ${number} 章没有生成出正文`);
+        const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
+        const upper = Math.floor(target * 1.2);
+        const actual = countNovelCharacters(drafted.result.draftContent);
+        if (actual < target || actual > upper) {
+          // 未达标不自动采用，也不丢草稿；保存本章和章纲后暂停，作者可手动处理
+          project = drafted.project;
+          await applyProjectChange(project);
+          setAgentDraft(drafted.result);
+          setAgentDisplayContent(drafted.result.draftContent);
+          setAgentDraftTitle(applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''));
+          await finishAgentRun(`第 ${number} 章字数未达标，已保留待处理草稿`);
+          stopReason = `第 ${number} 章正文 ${actual} 字，要求 ${target}～${upper} 字，草稿已保留，未自动采用`;
+          break;
+        }
         const applied = applyAgentDraft(drafted.project, inserted.chapter, drafted.result.draftContent, applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''), drafted.result.summary);
         project = applied.project;
         setActiveChapter(applied.chapter);
@@ -8017,14 +8084,37 @@ function App() {
       )}
 
       {/* 写作统计：作者视角的日更数据，不是 token 账单 */}
-        {showWritingConsole && editingProject && <div className="modal-overlay writing-console-overlay" onClick={() => setShowWritingConsole(false)}>
+        {showWritingConsole && editingProject && <div
+          className="modal-overlay writing-console-overlay"
+          onPointerDown={event => {
+            consoleOverlayPointerDownRef.current = event.target === event.currentTarget;
+          }}
+          onClick={event => {
+            // 只有当真正点击在遮罩本身且不是刚拖拽松手时才关闭面板
+            const wasJustDragging = Date.now() - consoleDragEndTimeRef.current < 300;
+            if (event.target === event.currentTarget && consoleOverlayPointerDownRef.current && !wasJustDragging) {
+              setShowWritingConsole(false);
+            }
+            consoleOverlayPointerDownRef.current = false;
+          }}
+        >
           <div
             ref={consoleModalRef}
             className="modal writing-console-modal"
             role="dialog"
             aria-modal="true"
             aria-label="写作操作台"
-            style={consoleFrame ? { position: 'fixed', left: consoleFrame.x, top: consoleFrame.y, width: consoleFrame.width, height: consoleFrame.height, maxHeight: 'none' } : undefined}
+            style={consoleFrame ? {
+              position: 'fixed',
+              left: consoleFrame.x,
+              top: consoleFrame.y,
+              width: consoleFrame.width,
+              height: consoleFrame.height,
+              minWidth: 520,
+              minHeight: 320,
+              maxWidth: 'none',
+              maxHeight: 'none',
+            } : undefined}
             onClick={event => event.stopPropagation()}
           >
             <div className="modal-header writing-console-header" onPointerDown={startConsoleDrag('move')}>

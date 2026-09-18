@@ -1,3 +1,4 @@
+import { chapterCharacterCount } from "@zhizhang/contracts";
 import { StateGraph, Annotation } from "@langchain/langgraph";
 import type { BaseMessage } from "@langchain/core/messages";
 import { StoryStore } from "../storage/story-store.js";
@@ -389,7 +390,7 @@ function chapterDraftPrompts(state: ChapterStateType, contextWindowKTokens?: num
   const repairInstruction = repair
     ? `\n\n## 本次是重写（首版被判定为没有推进主线）\n首版重复或停留的地方：${repair.repeatedEvents.join("；") || "与上一章高度重复"}${repair.progress ? `；首版只推进到：${repair.progress}` : ""}\n重写时必须先收束上一章留下的事件，再把时间或地点推进到“接下来必须推进”的节点；上一章最后一段的动作不得再作为本章主体。`
     : "";
-  const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作约 ${targetWords} 字正文（不少于 ${Math.round(targetWords * 0.8)} 字，不超过 ${Math.round(targetWords * 1.2)} 字）：${continuityInstruction}；本章主体必须是计划里的新推进，不能连续多章停在同一地点、同一件事里，故事账本中已发生的事件不得再写一遍；章节细纲若把整章都安排在上一章的场景里、与总纲“本章位置”冲突，保留细纲的事件要点，但场景与时间必须按“本章位置”推进；不要复述计划或解释过程；content 直接从正文第一句开始，不要以“我会”“我将”“接下来会”等承诺性语句开头。${repairInstruction}`;
+  const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作约 ${targetWords} 字正文（不少于 ${targetWords} 字，不超过 ${Math.round(targetWords * 1.2)} 字）：${continuityInstruction}；本章主体必须是计划里的新推进，不能连续多章停在同一地点、同一件事里，故事账本中已发生的事件不得再写一遍；章节细纲若把整章都安排在上一章的场景里、与总纲“本章位置”冲突，保留细纲的事件要点，但场景与时间必须按“本章位置”推进；不要复述计划或解释过程；content 直接从正文第一句开始，不要以“我会”“我将”“接下来会”等承诺性语句开头。${repairInstruction}`;
   return {
     messages: [
       { role: "system", content: chapterAgentSystemPrompt },
@@ -633,7 +634,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
 
       let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
       try {
-        response = await client.chat(reviewMessages, { response_format: { type: "json_object" }, max_tokens: 2000 });
+        response = await client.chat(reviewMessages, { response_format: { type: "json_object" }, max_tokens: 4000 });
       } catch (error) {
         // 审查失败不能拖垮已经写好的整章正文：如实标注审查未完成，正文照常交给作者
         const message = error instanceof Error ? error.message : String(error);
@@ -732,6 +733,34 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         return { errors: [`审查后的定点修订失败：${message}`] };
       }
     })
+    // 所有审查、重写和定点修订之后统一验收，最多调整一次，保留未达标草稿供作者处理
+    .addNode("length", async (state: ChapterStateType) => {
+      const target = Math.round(state.targetWords && state.targetWords > 0 ? state.targetWords : 3000);
+      const upper = Math.floor(target * 1.2);
+      if (!state.draftContent) return {};
+      const originalCount = chapterCharacterCount(state.draftContent);
+      if (!originalCount || (originalCount >= target && originalCount <= upper)) return {};
+      emitter?.progress("review", 98, `正文 ${originalCount} 字，目标 ${target}～${upper} 字，正在调整一次`);
+      const instruction = `本次仅调整正文长度：当前 ${originalCount} 字，必须达到 ${target}～${upper} 字（去掉空白后计数，包含标点，不含标题）。${originalCount < target ? "在本章既有事件内补充具体动作、对话和必要细节，不得重复灌水或提前写下一章剧情" : "压缩重复表达和冗余描写，保留关键事件、因果和章末衔接"}。保持人物设定、剧情走向和审查修正，仅返回完整正文。`;
+      try {
+        const prompt = chapterRevisePrompt({ projectTitle: state.projectTitle, chapterTitle: state.chapterTitle, instruction, content: state.draftContent });
+        const response = await client.chat([{ role: "user", content: prompt }], {
+          temperature: 0.4, max_tokens: chapterDraftMaxTokens(upper, config.contextWindowKTokens), retryAttempts: 1,
+        });
+        const content = splitChapterTitleHeading(unwrapChapterDraft(response.content)).content;
+        const count = chapterCharacterCount(content);
+        // 空输出不能覆盖原稿；有正文但仍不达标时保留调整稿并明确报错
+        const draftContent = count ? content : state.draftContent;
+        const actual = count || originalCount;
+        return {
+          draftContent,
+          upstreamUsage: addUsage(state.upstreamUsage, response.usage),
+          ...(actual >= target && actual <= upper ? {} : { errors: [`字数未达标：正文 ${actual} 字，要求 ${target}～${upper} 字，已调整一次，草稿已保留`] }),
+        };
+      } catch (error) {
+        return { errors: [`字数调整失败：${error instanceof Error ? error.message : String(error)}；原稿 ${originalCount} 字已保留，要求 ${target}～${upper} 字`] };
+      }
+    })
     .addEdge("__start__", "prewrite")
     .addEdge("prewrite", "intent")
     .addEdge("intent", "retrieve")
@@ -748,9 +777,10 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       // 只看 issues：审查失败时也会写一条“审查未完成”的说明到 suggestions，那不是要改正文的理由
       if ((review.issues?.length || 0) > 0) return "revise";
       return "done";
-    }, { repair: "repair", revise: "revise", done: "__end__" })
-    .addEdge("repair", "__end__")
-    .addEdge("revise", "__end__");
+    }, { repair: "repair", revise: "revise", done: "length" })
+    .addEdge("repair", "length")
+    .addEdge("revise", "length")
+    .addEdge("length", "__end__");
 
   return graph.compile();
 }

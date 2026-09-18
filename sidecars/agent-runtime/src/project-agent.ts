@@ -89,8 +89,7 @@ const INVENTORY_CHAPTER_TAIL = 60;
 
 /**
  * 章节清单行
- * 必须带上「第几章」的序号：章节 id 是创建时的时间戳，作者说的是“第 150 章”，
- * 没有序号模型就只能靠标题猜，而标题正好可能还是占位的“第 N 章”。
+ * 同时保留目录位置、真实ID与原始标题，章号错乱时不能用位置替代标题章号
  * 章数过多时只列首尾，中间让模型用 list 动作按序号翻，而不是被 compactText 从中间无声截断。
  */
 function chapterInventoryLine(chapters: Array<Record<string, unknown>>, activeChapterId: unknown): string {
@@ -102,7 +101,7 @@ function chapterInventoryLine(chapters: Array<Record<string, unknown>>, activeCh
   if (rows.length <= INVENTORY_CHAPTER_HEAD + INVENTORY_CHAPTER_TAIL) return `章节（${rows.length}）：${rows.join("；")}`;
   const elided = rows.length - INVENTORY_CHAPTER_HEAD - INVENTORY_CHAPTER_TAIL;
   return [
-    `章节（${rows.length}，条目格式为 #序号｜id｜标题）：`,
+    `章节（${rows.length}，条目格式为 #目录位置｜真实ID｜原始标题）：`,
     rows.slice(0, INVENTORY_CHAPTER_HEAD).join("；"),
     `；……中间 ${elided} 章未列出，需要时用 {"action":"list","kind":"章节","from":序号,"count":数量} 按序号翻；`,
     rows.slice(-INVENTORY_CHAPTER_TAIL).join("；"),
@@ -122,7 +121,7 @@ function projectInventory(project: Record<string, unknown>, activeChapterId: unk
     `状态：${text(project.status) || "writing"}`,
     `主角：${[project.protagonist1, project.protagonist2].map(text).filter(Boolean).join("、") || "暂无"}`,
     `作品简介：${compactText(project.synopsis || "暂无", 1800)}`,
-    `章节条目格式为 #序号｜id｜标题，作者说的“第 150 章”对应 #150，提交变更时要用中间那个 id`,
+    `章节条目格式为 #目录位置｜真实ID｜原始标题。目录位置不等于标题章号；按标题确认作者所指章节，提交变更时使用真实ID。`,
     chapterInventoryLine(chapters, activeChapterId),
     `大纲（${outlines.length}）：${outlines.map(item => `${String(item.id)}=${text(item.kind)}｜${text(item.title)}`).join("；")}`,
     `卡片（${cards.length}）：${cards.map(item => `${String(item.id)}=${text(item.type)}｜${text(item.title)}`).join("；")}`,
@@ -236,7 +235,7 @@ const agentTurnSchema = z.union([
   // 按序号翻目录：长篇的章节表不可能整表进提示词，作者又常按“第几章”说话
   z.object({ action: z.literal("list"), kind: z.string().max(40).optional(), from: z.coerce.number().int().optional(), to: z.coerce.number().int().optional(), count: z.coerce.number().int().optional() }),
   // id 允许给数组：一次要读十章时逐章 open 会把步数预算耗光，最后什么都没做成
-  z.object({ action: z.literal("open"), kind: z.string().max(40).optional(), id: z.union([z.string(), z.number(), z.array(z.union([z.string(), z.number()])).min(1).max(OPEN_BATCH_LIMIT)]) }),
+  z.object({ action: z.literal("open"), kind: z.string().max(40).optional(), id: z.union([z.string(), z.number(), z.array(z.union([z.string(), z.number()])).min(1).max(OPEN_BATCH_LIMIT)]), offset: z.number().int().nonnegative().optional() }),
   z.object({ action: z.literal("finish"), message: z.string().min(1).max(5000), changes: z.array(z.unknown()).max(16).default([]) }),
 ]);
 
@@ -289,6 +288,7 @@ function clampFinishTurn(parsed: Record<string, unknown>): Record<string, unknow
     || (!action && (typeof parsed.message === "string" || changeTypeNames.has(String(parsed.type || ""))));
   if (!looksFinish) return null;
   const message = typeof parsed.message === "string" ? parsed.message : "";
+  if (isDsmlOrToolCall(message) || isFormatRepairMetaComplaint(message)) throw new Error("回复包含未执行的工具标记或格式修复说明");
   const changes = Array.isArray(parsed.changes) ? parsed.changes : [];
   if (message.length <= 5000) {
     return { ...parsed, action: "finish", message: message || "已生成待确认变更。", changes };
@@ -296,9 +296,80 @@ function clampFinishTurn(parsed: Record<string, unknown>): Record<string, unknow
   return { ...parsed, action: "finish", message: `${message.slice(0, 4800)}\n\n（后文过长已截断，如需完整内容请说一次继续）`, changes };
 }
 
+/** 判定文本是否包含未解析的 DSML 或工具调用标记，避免将工具调用片段误当作散文答复 */
+export function isDsmlOrToolCall(text: string): boolean {
+  return /DSML|tool_calls?|<[｜|]{1,2}|<\/[｜|]{1,2}|invoke\s+name=|parameter\s+name=/iu.test(text);
+}
+
+/**
+ * 识别 DeepSeek 等模型原生输出的 DSML (DeepSeek Markup Language) 工具调用标记
+ * 并将其解析为标准的 ProjectAgentTurn 动作
+ */
+export function extractDsmlTurn(value: string): Record<string, unknown> | null {
+  if (!/DSML/iu.test(value)) return null;
+
+  // 提取 invoke 名称，兼容 <｜｜DSML｜｜ invoke name="open"> 与 <｜DSML｜invoke name="project.open"> 等变体
+  const invokeMatch = /<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\s+name=["']?([^"'>\s]+)["']?/iu.exec(value);
+  let action = invokeMatch ? invokeMatch[1].trim().replace(/^project\./iu, "") : "";
+
+  // 提取所有 parameter 参数
+  const params: Record<string, unknown> = {};
+  const paramRegex = /<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter\s+name=["']?([^"'>\s]+)["']?[^>]*>([\s\S]*?)<\/[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter>/giu;
+  let match: RegExpExecArray | null;
+  while ((match = paramRegex.exec(value)) !== null) {
+    const key = match[1].trim();
+    const rawVal = match[2].trim();
+    try {
+      params[key] = JSON.parse(rawVal);
+    } catch {
+      params[key] = rawVal;
+    }
+  }
+
+  // 缺少动作名或出现多个调用时不猜测意图，交给带上下文的格式恢复
+  if (!action || (value.match(/invoke\s+name=/giu) || []).length !== 1) return null;
+
+  if (action === "open") {
+    const id = params.id ?? params.ids;
+    if (!id) return null;
+    return {
+      action: "open",
+      kind: typeof params.kind === "string" ? params.kind : undefined,
+      id,
+      ...(params.offset === undefined ? {} : { offset: Number(params.offset) }),
+    };
+  }
+
+  if (action === "list") {
+    return {
+      action: "list",
+      kind: typeof params.kind === "string" ? params.kind : undefined,
+      from: params.from !== undefined ? Number(params.from) : undefined,
+      to: params.to !== undefined ? Number(params.to) : undefined,
+      count: params.count !== undefined ? Number(params.count) : undefined,
+    };
+  }
+
+  if (action === "search") {
+    const query = typeof params.query === "string" ? params.query : String(params.query ?? "");
+    if (!query) return null;
+    return { action: "search", query };
+  }
+
+  if (action === "finish") {
+    return {
+      action: "finish",
+      message: typeof params.message === "string" ? params.message : "",
+      changes: Array.isArray(params.changes) ? params.changes : [],
+    };
+  }
+
+  return { action, ...params };
+}
+
 function parseAgentTurn(value: string): ProjectAgentTurn {
-  const parsed = extractJsonObject(value);
-  if (!parsed) throw new Error("回包里找不到 JSON 对象");
+  const parsed = isDsmlOrToolCall(value) ? extractDsmlTurn(value) : extractJsonObject(value);
+  if (!parsed) throw new Error("回包里找不到 JSON 对象或可执行动作");
   // 先把超长 finish 归一成合法形状，长大纲回复就不会在 zod 校验时被整轮拒绝
   const clamped = clampFinishTurn(parsed);
   const source = clamped ?? parsed;
@@ -320,7 +391,12 @@ function parseAgentTurn(value: string): ProjectAgentTurn {
   return agentTurnSchema.parse(source);
 }
 
-// 全量文档表：search 只回标题和片段，正文要等 open 才完整取出，避免一次把整本书塞进提示词
+/** 识别模型修复轮里对“请把以下内容整理成约定的 JSON 动作”提示词本身的元抱怨，防止其作为正式回复呈现给作者 */
+export function isFormatRepairMetaComplaint(text: string): boolean {
+  return /只调整格式|待整理的内容|没有收到需要转换的原文|以下内容.*是空的|看不到任何需要转换|没有跟着任何待整理/u.test(text);
+}
+
+// 全量文档表：search 只回标题和片段，正文通过 open 分段读取
 function projectDocuments(project: Record<string, unknown>): ProjectDocument[] {
   const entry = (kind: string, id: unknown, title: string, content: string, ordinal?: number): ProjectDocument =>
     ({ kind, id: String(id ?? ""), title: title || "未命名", content, score: 0, ordinal });
@@ -363,26 +439,36 @@ function findDocument(documents: ProjectDocument[], kind: string | undefined, id
 }
 
 /**
- * 取出资料全文，支持一次取多份
- * 多份时按份数摊薄单份预算：作者让改十章，一次全量取十章正文会把请求体顶爆，
- * 但逐章取又要耗掉十轮步数，摊薄后两头都不撞。
+ * 按预算连续读取正文，支持批量；长文返回续读游标，不能静默省略中间剧情
  */
-function runOpen(documents: ProjectDocument[], kind: string | undefined, ids: string[]): string {
+function runOpen(documents: ProjectDocument[], kind: string | undefined, ids: string[], offset = 0): string {
   const wanted = ids.slice(0, OPEN_BATCH_LIMIT);
   const perDocument = Math.max(1200, Math.floor(OPEN_TOTAL_BUDGET / Math.max(1, wanted.length)));
   const sections = wanted.map(id => {
     const document = findDocument(documents, kind, id);
     if (!document) return `## 未找到 ${kind ? `${kind}｜` : ""}${id}\n请对照项目索引里的 id 重试。`;
-    const head = `## ${document.kind}｜${document.id}｜${document.ordinal ? `#${document.ordinal}｜` : ""}${document.title}`;
-    return `${head}\n${compactText(document.content, Math.min(8_000, perDocument))}`;
+    const head = `## ${document.kind}｜${document.id}｜${document.ordinal ? `目录位置 #${document.ordinal}｜` : ""}标题：${document.title}`;
+    // 按 Unicode 字符连续读取，游标不受中文、换行或 emoji 的编码长度影响
+    const characters = Array.from(document.content);
+    if (offset > characters.length) return `${head}\n读取位置 ${offset} 超出正文范围（共 ${characters.length} 字符），请从 offset=0 重读。`;
+    const limit = Math.min(8_000, perDocument);
+    let end = offset;
+    let bytes = 0;
+    while (end < characters.length && bytes + byteLength(characters[end]) <= limit) {
+      bytes += byteLength(characters[end]);
+      end += 1;
+    }
+    const next = end < characters.length
+      ? `本次仅为正文分段，尚未读完；继续读取：${JSON.stringify({ action: "open", kind: document.kind, id: document.id, offset: end })}`
+      : offset === 0 ? "全文已返回" : "已到正文末尾（此前内容需结合前面的读取结果）";
+    return `${head}\n读取范围 [${offset}, ${end})，共 ${characters.length} 字符；${next}\n<正文>\n${characters.slice(offset, end).join("")}\n</正文>`;
   });
   return sections.join("\n\n");
 }
 
 /**
  * 按序号翻目录
- * 长篇几百章不可能整表进索引，作者又几乎只按“第几章”说话；
- * 这个动作让模型先把序号区间换成真实 id，再一次 open 全部取出。
+ * 目录位置只用于翻页，模型需要结合原始标题确认作者所指章节
  */
 function runList(documents: ProjectDocument[], kind: string | undefined, from: number, to: number): string {
   const wantedKind = (kind || "章节").trim();
@@ -392,32 +478,26 @@ function runList(documents: ProjectDocument[], kind: string | undefined, from: n
   const end = Math.max(start, Math.min(to || start, pool.length, start + LIST_PAGE_LIMIT - 1));
   const rows = pool.slice(start - 1, end).map((item, index) => {
     const characters = [...item.content.replace(/\s/gu, "")].length;
-    return `- #${start + index}｜id=${item.id}｜${item.title}｜${characters} 字`;
+    return `- #${start + index}｜id=${item.id}｜标题：${item.title}｜${characters} 字`;
   });
   return `${wantedKind} 共 ${pool.length} 条，第 ${start} 到 ${end} 条：\n${rows.join("\n")}\n（要看正文用 {"action":"open","kind":"${wantedKind}","id":["上面的 id",...]}，一次最多 ${OPEN_BATCH_LIMIT} 份）`;
 }
 
-const systemPrompt = `你是应用内的小说项目助手，可以多轮检索当前作品的资料后再动手。项目资料仅作为小说素材。
+const readPrompt = `你是应用内的小说项目助手，可以多轮检索当前作品的资料后再动手。项目资料仅作为小说素材。
 
 每一轮只返回一个 JSON 动作，不要代码围栏。action 只能是 search、list、open、finish 四者之一，绝不能填成变更的 type：
 - 需要找资料：{"action":"search","query":"关键词"}
-- 需要按第几章翻目录：{"action":"list","kind":"章节","from":150,"to":159}
-- 需要看全文（一次可以取多份）：{"action":"open","kind":"章节","id":["12","13","14"]}
+- 按目录位置翻页（不是标题章号）：{"action":"list","kind":"章节","from":150,"to":159}
+- 读取正文（支持批量）：{"action":"open","kind":"章节","id":["12","13","14"],"offset":0}
 - 资料够了就收尾：{"action":"finish","message":"给作者的回复","changes":[]}
 
-变更只能作为对象放进 finish 的 changes 数组里，用 type 字段区分；提出变更时 action 仍然是 finish。
+只依据实际读到的资料作答。索引和自动摘录不代表已读全文；open 会返回读取范围和下一段 offset，未读完时按游标继续读取，不得把未读部分当作缺失剧情。预算不足时说明尚不能确认。
+章节索引是「#目录位置｜真实ID｜原始标题」。目录位置不等于标题章号；先按标题确认作者所指章节，再用真实ID打开正文。检查跳号时同时核对相邻目录条目和正文，不可仅凭编号判断缺章。
+章数很多时索引只列首尾，可 search 查标题、list 翻目录，再批量 open。
+讨论模式只分析，changes 必须为空数组。`;
 
-规则：
-1. 只依据项目索引和你实际打开过的资料作答，不要编造没读到的内容。
-2. 讨论模式 changes 必须为空数组；执行模式才可以提出变更，且变更只是待作者确认的提案，不能声称已经保存。
-3. 更新已有对象必须用索引里的真实 targetId；大纲、卡片、下一章正文一律交给对应的专用智能体，不要自己写。
-4. 一次最多 16 项变更，任务大就分批，并在 message 里说明本轮范围。
-5. 不确定就先 search、list 或 open，不要靠猜。
-6. 检索轮次有限：作者说“第几章到第几章”时，先用一次 list 把序号换成 id，再用一次 open 批量取正文，不要一章一轮地打开。
-
-章节索引条目格式是「#序号｜id｜标题」：作者说的“第 150 章”对应 #150，但所有变更的 targetId 必须填中间那个真实 id。
-章数很多时索引只列首尾，中间的章用 list 按序号翻。
-
+const executePrompt = `执行模式可提出待作者确认的变更，不能声称已经保存。更新已有对象必须使用真实 targetId，一次最多 16 项。
+变更放进 finish 的 changes 数组，用 type 区分；action 仍为 finish。
 changes 里每一项只能是下列十一种之一，字段必须原样铺平，不要自己包一层 patch 或 data：
 {"type":"project.update","summary":"修改简介","patch":{"synopsis":"..."}}
 {"type":"outline.write","summary":"重写总纲","targetId":1,"kind":"总纲","title":"...","instruction":"要改成什么样"}
@@ -483,14 +563,14 @@ function runTurnTool(documents: ProjectDocument[], turn: Exclude<ProjectAgentTur
   if (turn.action === "list") {
     const kind = turn.kind || "章节";
     const from = turn.from || 1;
-    const to = turn.to || turn.from || 1;
+    const to = turn.to ?? (from + Math.max(1, turn.count ?? 1) - 1);
     return { label: `翻阅${kind}第 ${from} 到 ${to} 条`, result: runList(documents, turn.kind, from, to) };
   }
   const ids = (Array.isArray(turn.id) ? turn.id : [turn.id]).map(item => String(item));
   const label = ids.length > 1
     ? `打开 ${turn.kind ? `${turn.kind}｜` : ""}${ids.length} 份资料（${ids.slice(0, 3).join("、")}${ids.length > 3 ? "…" : ""}）`
     : `打开 ${turn.kind ? `${turn.kind}｜` : ""}${ids[0]}`;
-  return { label, result: runOpen(documents, turn.kind, ids) };
+  return { label, result: runOpen(documents, turn.kind, ids, turn.offset) };
 }
 
 /**
@@ -500,7 +580,8 @@ function runTurnTool(documents: ProjectDocument[], turn: Exclude<ProjectAgentTur
  * 无论上游阈值是多少，请求体无上限增长本身就是 bug。
  * ponytail: 固定上限并从中间丢旧工具结果；若以后需要更长的检索链，再改为按轮次摘要压缩
  */
-const REQUEST_BODY_LIMIT = 40_000;
+// 为预算结束提示和一次格式恢复预留空间
+const REQUEST_BODY_LIMIT = 37_000;
 
 /**
  * 单轮修订章数上限
@@ -552,37 +633,38 @@ function changeIdentity(change: { type: string; summary: string; targetId?: numb
   return `${change.summary}${target}`;
 }
 
-function boundedMessages(messages: AgentMessage[]): AgentMessage[] {
+function boundedMessages(system: AgentMessage, request: AgentMessage, context: string, history: AgentMessage[], turns: AgentMessage[]): AgentMessage[] {
   const size = (list: AgentMessage[]) => list.reduce((sum, message) => sum + byteLength(message.content), 0);
-  if (size(messages) <= REQUEST_BODY_LIMIT) return messages;
-
-  // system 和首条请求（含项目资料）是任务前提，不能丢
-  const head = messages.slice(0, 2);
-  const rest = messages.slice(2);
-  let budget = REQUEST_BODY_LIMIT - size(head);
-
-  // 从新到旧保留检索轮次，旧的先丢；模型当前在看的是最后一轮
-  const kept: AgentMessage[] = [];
-  for (let index = rest.length - 1; index >= 0 && budget > 0; index -= 1) {
-    const message = rest[index];
-    const bytes = byteLength(message.content);
-    if (bytes <= budget) {
+  // 本轮问题与最新工具结果必须完整保留，旧历史和自动摘录让出预算
+  const latest = turns.slice(-2);
+  const required = [system, request, ...latest];
+  if (size(required) > REQUEST_BODY_LIMIT) throw new Error("本轮问题与最新读取结果超过上下文预算，请缩小单次读取范围");
+  let budget = REQUEST_BODY_LIMIT - size(required) - 300;
+  const packet = compactText(context, Math.min(12_000, budget));
+  budget -= byteLength(packet);
+  const keepRecent = (items: AgentMessage[]): AgentMessage[] => {
+    const kept: AgentMessage[] = [];
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const bytes = byteLength(items[index].content);
+      if (bytes > budget) break;
+      kept.unshift(items[index]);
       budget -= bytes;
-      kept.unshift(message);
-      continue;
     }
-    // 最近一轮工具结果单条就超预算时截断保留，而不是整条丢掉
-    if (!kept.length && budget > 500) {
-      kept.unshift({ role: message.role, content: compactText(message.content, budget - 200) });
-    }
-    break;
+    return kept;
+  };
+  // 旧工具结果按动作与结果成对保留，避免裁出孤立的工具指令
+  const older: AgentMessage[] = [];
+  for (let index = turns.length - 4; index >= 0; index -= 2) {
+    const pair = turns.slice(index, index + 2);
+    const bytes = size(pair);
+    if (bytes > budget) break;
+    older.unshift(...pair);
+    budget -= bytes;
   }
-
-  const dropped = rest.length - kept.length;
-  const notice: AgentMessage[] = dropped > 0
-    ? [{ role: "user", content: `（为控制请求体大小，已省略较早的 ${dropped} 段检索记录；如需要请重新 search 或 open。）` }]
-    : [];
-  return [...head, ...notice, ...kept];
+  const keptHistory = keepRecent(history);
+  const dropped = history.length + turns.length - keptHistory.length - older.length - latest.length;
+  const notice: AgentMessage[] = dropped > 0 ? [{ role: "user", content: `已省略较早的 ${dropped} 条历史或检索消息；需要其原文时请重新读取，不能声称仍掌握全部内容。` }] : [];
+  return [system, ...keptHistory, ...(packet ? [{ role: "user" as const, content: packet }] : []), request, ...notice, ...older, ...latest];
 }
 
 export async function runProjectAgent(
@@ -600,14 +682,17 @@ export async function runProjectAgent(
   const toolEvents: ProjectAgentToolEvent[] = [{
     tool: "project.context",
     status: "complete",
-    message: `已载入项目索引与 ${context.sources.length} 份相关资料`,
+    message: `已载入项目索引与 ${context.sources.length} 份资料摘录`,
   }];
 
-  const messages: AgentMessage[] = [
-    { role: "system", content: systemPrompt },
-    ...history,
-    { role: "user", content: `模式：${input.mode === "execute" ? "执行（可提出待确认变更）" : "讨论（禁止提出变更）"}\n\n## 当前项目资料\n${context.packet}\n\n## 本轮请求\n${input.instruction}` },
-  ];
+  const system: AgentMessage = { role: "system", content: input.mode === "execute" ? `${readPrompt}
+
+${executePrompt}` : readPrompt };
+  const request: AgentMessage = { role: "user", content: `模式：${input.mode === "execute" ? "执行" : "讨论"}
+
+## 本轮请求
+${input.instruction}` };
+  const messages: AgentMessage[] = [];
 
   // ponytail: 步数、工具输出和请求体都是硬上限，够用就停；需要更深的检索再把上限做成设置项
   // 默认 8 轮：list 翻目录 + 批量 open 之后还要留出改主意重新检索的余量，6 轮在跨章任务上刚好不够
@@ -619,35 +704,35 @@ export async function runProjectAgent(
   for (let step = 0; step < maxSteps && !plan; step += 1) {
     const mustFinish = step === maxSteps - 1 || toolOutputUsed >= toolOutputBudget;
     const turnMessages = mustFinish
-      ? [...boundedMessages(messages), { role: "user" as const, content: "检索预算已用尽，请直接返回 finish 动作。" }]
-      : boundedMessages(messages);
+      ? [...boundedMessages(system, request, `## 项目索引与资料摘录
+${context.packet}`, history, messages), { role: "user" as const, content: "检索预算已用尽，请直接返回 finish 动作。" }]
+      : boundedMessages(system, request, `## 项目索引与资料摘录
+${context.packet}`, history, messages);
     const response = await client.chat(turnMessages, { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 12_000, retryAttempts: 2 });
 
     let turn: ProjectAgentTurn;
     try {
       turn = parseAgentTurn(response.content);
-    } catch (rawError) {
-      const rawErrorText = rawError instanceof Error ? rawError.message : String(rawError);
-      // 先试模型修复轮：只修格式不补事实；修不好就把原文当成纯文本回复收尾，不让一次格式抖动毁掉整轮
-      let repaired: Awaited<ReturnType<typeof client.chat>> | null = null;
-      try {
-        repaired = await client.chat([
-          { role: "system", content: systemPrompt },
-          { role: "user", content: `请把以下内容整理成约定的 JSON 动作，只调整格式：\n${compactText(response.content, 6000)}` },
-        ], { response_format: { type: "json_object" }, temperature: 0, max_tokens: 12_000, retryAttempts: 1 });
-        turn = parseAgentTurn(repaired.content);
-      } catch {
-        // 两轮都没解析成动作时，看原文里有没有正文可用：纯散文回复（比如直接写出来的大纲）
-        // 当成 finish 的 message 收尾，别把已经写好的内容丢掉；只剩错误信息才走引导重试的兑底话
-        const prose = response.content.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "").trim();
-        const usableProse = prose.length >= 40 ? compactText(prose, 4800) : "";
-        turn = {
-          action: "finish",
-          message: usableProse || `这轮回复没能解析成可执行的变更（${compactText(rawErrorText, 160)}）。多半是内容太长被截断：把范围说小一些，或明确说“交给章节智能体处理”再试一次。`,
-          changes: [],
-        };
+    } catch {
+      const rawProse = response.content.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "").trim();
+      if (input.mode === "discuss" && rawProse.length >= 40 && !/^[{\[]/u.test(rawProse) && !rawProse.includes('"action"') && !isDsmlOrToolCall(rawProse) && !isFormatRepairMetaComplaint(rawProse)) {
+        turn = { action: "finish", message: compactText(rawProse, 4800), changes: [] };
+      } else {
+        // 唯一的格式恢复轮保留原任务与已读资料，不把残缺指令当作分析结论
+        try {
+          const repaired = await client.chat([
+            ...turnMessages,
+            { role: "user", content: `上一轮未返回有效动作。请依据本轮请求和已读资料返回一个合法 JSON 动作；资料不足可继续检索。待修复输出：
+${compactText(rawProse, 2000) || "（空）"}` },
+          ], { response_format: { type: "json_object" }, temperature: 0, max_tokens: 12_000, retryAttempts: 1 });
+          turn = parseAgentTurn(repaired.content);
+        } catch {
+          toolEvents.push({ tool: "project.format", status: "error", message: "工具指令解析失败，格式恢复未成功" });
+          return { message: "本轮工具指令解析失败，未能完成分析，也未生成变更。请重试。", changes: [], toolEvents };
+        }
       }
     }
+
 
     if (turn.action === "finish") {
       plan = turn;
@@ -659,7 +744,10 @@ export async function runProjectAgent(
     toolEvents.push({ tool: `project.${turn.action}`, status: "complete", message: label });
     input.onStep?.({ kind: turn.action === "search" ? "search" : "open", message: label });
     messages.push({ role: "assistant", content: JSON.stringify(turn) });
-    messages.push({ role: "user", content: `工具结果（${label}）：\n${result}` });
+    messages.push({
+      role: "user",
+      content: `工具结果（${label}）：\n${result}\n\n（若根据上述资料已足够解答作者请求，请直接返回 {"action":"finish","message":"你的详细分析与回复","changes":[]} 收尾；若还需其他资料，可继续使用 search/list/open）`,
+    });
   }
 
   if (!plan) return { message: "本轮检索没有收敛出结论，请换个说法再试一次。", changes: [], toolEvents };

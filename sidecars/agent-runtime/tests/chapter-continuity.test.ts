@@ -111,7 +111,7 @@ describe("chapter continuity context", () => {
         : messages.includes("待审查章节")
           ? JSON.stringify({ consistent: true, issues: [], suggestions: [], advances: false, progress: "仍停在值班室门前", repeatedEvents: ["门内第三声敲击"] })
           // 重写请求靠任务里的“本次是重写”认出来
-          : messages.includes("本次是重写")
+          : messages.includes("本次是重写") || messages.includes("本次仅调整正文长度")
             ? JSON.stringify({ content: "第二天清晨，林砚已经站在城门口。", title: "出城", summary: "推进到出城。" })
             : JSON.stringify({ content: "门外又响起了第三声敲击。", title: "第三声", summary: "又把门前戏写了一遍。" });
       return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
@@ -158,7 +158,7 @@ describe("chapter continuity context", () => {
         : messages.includes("待审查章节")
           ? JSON.stringify({ consistent: false, issues: ["第 178 章的试印结论写成了已定，本章又当未定处理", "姜冷月称呼与第 176 章不一致"], suggestions: ["把“试印结论已定”改成“试印结论待刻坊回话”"], advances: true, progress: "推进到交样" })
           // 修订请求靠那句作者修订指令认出来
-          : messages.includes("按以下一致性审查意见修订本章")
+          : messages.includes("按以下一致性审查意见修订本章") || messages.includes("本次仅调整正文长度")
             ? JSON.stringify({ content: "修订后的正文：她把试印结论盖了章。" })
             : JSON.stringify({ content: "初稿：试印结论仍未定。".repeat(400), title: "交样", summary: "交样。" });
       return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
@@ -343,5 +343,56 @@ describe("chapter graph degrades instead of failing the whole chapter", () => {
     expect(result.reviewResult?.suggestions[0]).toContain("审查未完成");
     expect(result.errors.some(item => item.includes("审查阶段失败"))).toBe(true);
     store.close();
+  });
+});
+
+
+describe("最终字数验收", () => {
+  afterEach(() => vi.restoreAllMocks());
+  it.each([90, 150])("%i 字的初稿只调整一次，最终落在目标范围", async initial => {
+    let adjustments = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body || "{}"));
+      const messages = JSON.stringify(body.messages);
+      let content: string;
+      if (messages.includes("本次仅调整正文长度")) {
+        adjustments += 1;
+        content = "文".repeat(110);
+      } else if (messages.includes("待审查章节")) {
+        content = JSON.stringify({ consistent: true, issues: [], suggestions: [] });
+      } else if (messages.includes("五段写作任务书")) {
+        content = JSON.stringify({ plan: "推进本章事件" });
+      } else {
+        content = JSON.stringify({ content: "文".repeat(initial) });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "length", title: "字数测试" });
+    try {
+      const result = await createChapterGraph({ store, apiKey: "test", baseURL: "https://relay.test/v1", model: "test" }).invoke({ projectId: "length", chapterId: "1", instruction: "写本章", targetWords: 100 });
+      expect(adjustments).toBe(1);
+      expect(result.draftContent).toBe("文".repeat(110));
+    } finally { store.close(); }
+  });
+
+  it("调整仍不足时保留草稿并报告，不循环重写", async () => {
+    let adjustments = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const messages = JSON.stringify(JSON.parse(String(init?.body || "{}")).messages);
+      if (messages.includes("本次仅调整正文长度")) adjustments += 1;
+      const content = messages.includes("待审查章节") ? JSON.stringify({ consistent: true, issues: [], suggestions: [] })
+        : messages.includes("五段写作任务书") ? JSON.stringify({ plan: "推进本章事件" })
+        : JSON.stringify({ content: "文".repeat(50) });
+      return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "short", title: "字数测试" });
+    try {
+      const result = await createChapterGraph({ store, apiKey: "test", baseURL: "https://relay.test/v1", model: "test" }).invoke({ projectId: "short", chapterId: "1", instruction: "写本章", targetWords: 100 });
+      expect(adjustments).toBe(1);
+      expect(result.draftContent).toBe("文".repeat(50));
+      expect(result.errors.join(" ")).toContain("字数未达标");
+    } finally { store.close(); }
   });
 });

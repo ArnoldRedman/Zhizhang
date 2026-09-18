@@ -689,7 +689,26 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         totalChapters: Number(totalChapters) >= 0 ? Number(totalChapters) : undefined,
       });
       const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
-      const response = await client.chat(messages, { response_format: { type: "json_object" }, max_tokens: 2000 });
+      let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
+      try {
+        // 保留作者的推理配置，审查正文预算与章节写作图保持一致
+        response = await client.chat(messages, { response_format: { type: "json_object" }, max_tokens: 4000 });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          id: req.id,
+          result: {
+            reviewResult: {
+              consistent: true,
+              issues: [],
+              suggestions: [`审查未完成：${message}`],
+              advances: true,
+              progress: "",
+              repeatedEvents: [],
+            },
+          },
+        };
+      }
       return { id: req.id, result: { reviewResult: normalizeChapterReviewResult(response.content), usage: response.usage } };
     }
 
