@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cardSearchTerms, findCardRecentMentions, refreshCardStatesForProject } from './cards.ts';
+import { cardSearchTerms, findCardRecentMentions, refreshCardStatesForProject, stripHeuristicCardStates } from './cards.ts';
 import type { Chapter, KnowledgeCard, Project } from './project.ts';
 
 const now = '2026-01-01T00:00:00.000Z';
@@ -50,16 +50,30 @@ test('findCardRecentMentions 从最后一章往前找，带出原文片段', () 
   assert.ok(mentions[0].snippet.includes('沈妄'));
 });
 
-test('refreshCardStatesForProject 写入当前状态与状态历史，并把章节节点连上', () => {
+test('refreshCardStatesForProject 只维护章节到卡片的引用边，不再把正文片段写进卡片状态', () => {
   const chapters = [chapter(1, '沈妄推开门。'), chapter(2, '沈妄在书肆修补古籍。')];
-  const refreshed = refreshCardStatesForProject(project({ chapters, cards: [card(1, '沈妄'), card(2, '查无此人')] }));
+  const refreshed = refreshCardStatesForProject(project({ chapters, cards: [card(1, '沈妄', { currentState: '体检正常，决定明日去书肆' }), card(2, '查无此人')] }));
   const shen = refreshed.cards.find(item => item.id === 1)!;
-  const ghost = refreshed.cards.find(item => item.id === 2)!;
-  assert.match(shen.currentState || '', /第 2 章《第 2 章》出现“沈妄”/);
-  assert.equal(shen.stateHistory?.length, 1);
-  assert.match(ghost.currentState || '', /未检索到可定位/);
-  assert.ok(refreshed.graphEdges.some(edge => edge.label === '状态引用'));
-  // 同一个正文重复刷新不该无限堆积状态历史
-  const again = refreshCardStatesForProject(refreshed);
-  assert.equal(again.cards.find(item => item.id === 1)!.stateHistory?.length, 1);
+  // 记忆提炼写进去的真状态必须原样留着：以前这里会被"第 2 章出现"沈妄"：……"的随机摘录盖掉
+  assert.equal(shen.currentState, '体检正常，决定明日去书肆');
+  assert.equal(shen.stateHistory, undefined);
+  assert.ok(refreshed.graphEdges.some(edge => edge.label === '状态引用' && edge.target === 'card:1'));
+  assert.ok(!refreshed.graphEdges.some(edge => edge.target === 'card:2'), '正文里没出现的卡不连边');
+});
+
+test('stripHeuristicCardStates 清掉旧版按正文片段写进去的状态，真状态与真历史保留', () => {
+  const heuristic = '第 204 章《第 204 章 越过书房门槛》出现“沈妄”：起眼。医生已经在写下一份病历';
+  const cards = [
+    card(1, '沈妄', { currentState: heuristic, stateHistory: [
+      { chapterId: 203, chapterTitle: '第 203 章', status: 'updated', changes: '决定不回应法务处截图', updatedAt: now },
+      { chapterId: 204, chapterTitle: '第 204 章', status: '本章出现', changes: heuristic, updatedAt: now },
+    ] }),
+    card(2, '姜冷月', { currentState: '追问拆信时间', stateHistory: [] }),
+  ];
+  const cleaned = stripHeuristicCardStates(cards);
+  assert.equal(cleaned[0].currentState, '决定不回应法务处截图', '状态退回最近一条真实变化');
+  assert.equal(cleaned[0].stateHistory?.length, 1);
+  assert.equal(cleaned[1], cards[1], '没有残留的卡原样返回');
+  const untouched = [cards[1]];
+  assert.equal(stripHeuristicCardStates(untouched), untouched, '没有残留时返回同一个数组');
 });

@@ -94,7 +94,12 @@ const collectCardMentions = (project: Project, terms: string[], limit: number) =
   return mentions.slice(0, limit);
 };
 
-/** 按正文重新定位卡片状态；只处理 cardIds 指定的卡（不传就是全部） */
+/**
+ * 按正文重新关联卡片与章节；只处理 cardIds 指定的卡（不传就是全部）
+ * 以前这里还把卡名最后一次出现处前后二百字塞进"当前状态"和"状态历史"，写的是"第 N 章《…》出现"沈妄"：起眼。医生已经在写……"
+ * 这种随机片段：它既不是状态也不是性格，还会把记忆提炼写进去的真状态覆盖掉，模型看到的主角就只剩这段废话。
+ * 现在只维护图谱里"章节 → 卡片"的引用边，卡片状态一律由记忆提炼（cardUpdates）和作者手改
+ */
 export const refreshCardStatesForProject = (project: Project, cardIds?: Set<number>): Project => {
   const now = new Date().toISOString();
   const targetCards = cardIds ? project.cards.filter(card => cardIds.has(card.id)) : project.cards;
@@ -106,26 +111,31 @@ export const refreshCardStatesForProject = (project: Project, cardIds?: Set<numb
       graphNodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type });
     }
   });
-  const cards = project.cards.map(card => {
-    if (!targetCards.some(target => target.id === card.id)) return card;
-    const recentMentions = findCardRecentMentions(project, card, 3);
-    const mention = recentMentions[0] ?? null;
-    const status = mention ? '最近出现' : '未在正文中定位';
-    const changes = mention
-      ? recentMentions.map(item => `第 ${project.chapters.findIndex(chapter => chapter.id === item.chapter.id) + 1} 章《${item.chapter.title}》出现“${item.matchedTerm}”：${item.snippet}`).join('\n')
-      : '当前全文未检索到可定位的卡片名称或关键词。';
-    const lastEntry = card.stateHistory?.[card.stateHistory.length - 1];
-    const stateHistory = lastEntry?.changes === changes ? (card.stateHistory || []) : [
-      ...(card.stateHistory || []),
-      { chapterId: mention?.chapter.id ?? 0, chapterTitle: mention?.chapter.title ?? '全文检索', status, changes, updatedAt: now },
-    ].slice(-30);
-    for (const item of recentMentions) {
+  for (const card of targetCards) {
+    for (const item of findCardRecentMentions(project, card, 3)) {
       const chapterNodeId = `chapter:${item.chapter.id}`;
       if (!graphNodes.some(node => node.id === chapterNodeId)) graphNodes.push({ id: chapterNodeId, label: item.chapter.title, type: 'chapter' });
       const edgeId = `${chapterNodeId}->card:${card.id}:状态引用`;
       upsertKnowledgeGraphEdge(graphEdges, { id: edgeId, source: chapterNodeId, target: `card:${card.id}`, label: '状态引用', weight: 0.88, updatedAt: now });
     }
-    return { ...card, currentState: changes, stateHistory, updatedAt: now };
+  }
+  return { ...project, graphNodes, graphEdges, updatedAt: now };
+};
+
+/** 旧版按正文片段写进去的卡片状态：形状固定，读档时按它认出来清掉，别让这些废话继续占着"当前状态" */
+const heuristicCardState = /出现“[^”]*”：|当前全文未检索到可定位/u;
+
+/** 清掉旧版启发式写进卡片的状态与历史；没有这种残留时原样返回，不制造无关差异 */
+export const stripHeuristicCardStates = (cards: KnowledgeCard[]): KnowledgeCard[] => {
+  let changed = false;
+  const cleaned = cards.map(card => {
+    const stateIsHeuristic = heuristicCardState.test(card.currentState || '');
+    const history = (card.stateHistory || []).filter(item => !heuristicCardState.test(item.changes || ''));
+    if (!stateIsHeuristic && history.length === (card.stateHistory || []).length) return card;
+    changed = true;
+    // 状态被清空后退回最近一条真实变化，卡片面板上不至于一片空白
+    const currentState = stateIsHeuristic ? (history[history.length - 1]?.changes || '') : card.currentState;
+    return { ...card, currentState, stateHistory: history };
   });
-  return { ...project, cards, graphNodes, graphEdges, updatedAt: now };
+  return changed ? cleaned : cards;
 };

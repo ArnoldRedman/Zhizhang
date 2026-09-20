@@ -9,11 +9,11 @@ import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, Ch
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile, buildGraphRelationIndex, computeGraphLayout, noGraphNodes, noGraphEdges, type GraphRelationSummary } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories } from './domain/memory';
-import { cardSearchTerms, refreshCardStatesForProject } from './domain/cards';
+import { cardSearchTerms, refreshCardStatesForProject, stripHeuristicCardStates } from './domain/cards';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
-import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
+import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
 import { buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
@@ -138,6 +138,39 @@ const buildReviewClusters = (items: LegacyReviewItem[], cards: Array<{ title: st
     .slice(0, 10);
 };
 
+const authorNotesDocumentTitle = '给作者｜待答';
+
+/**
+ * 把模型这一章的【给作者】和审查意见追加进"给作者｜待答"文档（大纲页里能看，kind 复用审查报告）
+ * 连续创作不为一句疑问停下来，作者有空再看；同一章重跑时先删掉这一章的旧条目，不堆重复
+ */
+const appendAuthorNotes = (project: Project, number: number, chapterTitle: string, notes: string[], review?: AgentReviewResult): Project => {
+  const items = [
+    ...notes.map(note => `- ${note}`),
+    ...(review?.issues || []).map(issue => `- 审查指出：${issue}`),
+    ...(review?.suggestions || []).filter(item => !item.startsWith('审查未完成')).map(item => `- 审查建议：${item}`),
+  ];
+  if (!items.length) return project;
+  const now = new Date().toISOString();
+  const existing = project.outlines.find(outline => outline.title === authorNotesDocumentTitle);
+  const heading = `## 第 ${number} 章 ${chapterTitle.replace(/^第\s*\d+\s*章\s*/u, '')}`.trim();
+  const previous = (existing?.content || `# ${authorNotesDocumentTitle}\n\n模型写作时拿不准、想和作者商量的事，按章记在这里。回复可以写进创作指令，或补进卡片、总纲，模型会照着改；处理过的条目直接删掉。\n`)
+    .split(/\n(?=## )/u)
+    .filter(section => !section.startsWith(heading))
+    .join('\n');
+  const content = `${previous.trimEnd()}\n\n${heading}\n${items.join('\n')}\n`;
+  const document: OutlineDocument = {
+    id: existing?.id ?? Date.now(),
+    kind: '审查报告',
+    title: authorNotesDocumentTitle,
+    content,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+  };
+  const outlines = existing ? project.outlines.map(outline => outline.id === existing.id ? document : outline) : [...project.outlines, document];
+  return { ...project, outlines, updatedAt: now };
+};
+
 const formatReviewReport = (number: number, chapterTitle: string, result: AgentReviewResult): string => [
   `# 审查报告｜第 ${number} 章 ${chapterTitle.replace(/^第\s*\d+\s*章\s*/u, '')}`,
   '',
@@ -172,6 +205,8 @@ interface AgentDraftResult {
   chapterTitle?: string;
   summary?: string;
   chapterPlan?: string;
+  /** 模型写在末尾的【给作者】：拿不准的设定、想商量的走向 */
+  authorNotes?: string[];
   prewriteCheck?: { blockers: string[]; warnings: string[]; summary: string };
   reviewResult?: AgentReviewResult;
   retrievedContext?: string[];
@@ -277,6 +312,7 @@ interface AgentChatMessage { role: 'user' | 'assistant'; content: string; create
 interface AgentMemoryResult {
   summary?: string;
   keywords?: string[];
+  relationshipState?: string[];
   characterStateChanges?: string[];
   knowledgeChanges?: string[];
   foreshadowingChanges?: string[];
@@ -637,7 +673,7 @@ const normalizeStoredProject = (value: unknown): Project => {
     chapters,
     outline: Array.isArray(project.outline) ? project.outline : [],
     outlines: Array.isArray(project.outlines) ? project.outlines : [],
-    cards: Array.isArray(project.cards) ? project.cards : [],
+    cards: stripHeuristicCardStates(Array.isArray(project.cards) ? project.cards : []),
     memories,
     memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, memories),
     graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
@@ -1409,7 +1445,7 @@ function App() {
   const savedReviewItems: LegacyReviewItem[] = useMemo(() => {
     if (!editingProject) return [];
     return editingProject.outlines
-      .filter(outline => outline.kind === '审查报告')
+      .filter(outline => outline.kind === '审查报告' && outline.title.startsWith('审查报告｜'))
       .map(outline => {
         const match = /第\s*(\d+)\s*章/u.exec(outline.title);
         const number = match ? Number(match[1]) : 0;
@@ -3882,14 +3918,13 @@ function App() {
     const refreshedProject = refreshCardStatesForProject(searchProject, new Set(targetCards.map(card => card.id)));
     setEditingProject(refreshedProject);
     setProjects(current => current.map(project => project.id === refreshedProject.id ? refreshedProject : project));
-    setNotice({ title: cardId === undefined ? '卡片状态已更新' : '卡片状态已更新', content: `已全文检索并更新 ${targetCards.length} 张卡片的最近出现状态。` });
+    setNotice({ title: '卡片关联已更新', content: `已按正文重新关联 ${targetCards.length} 张卡片与章节；卡片状态由章节记忆提炼与手改维护，不再按正文片段覆盖。` });
   };
 
   const buildProjectWithChapterMemory = (project: Project, chapter: Chapter, memoryPatch: Partial<ChapterMemory>) => {
     const hasContent = chapter.content.trim().length > 0;
     const updatedChapters = project.chapters.map(item => item.id === chapter.id ? chapter : item);
     const chapterNodeId = `chapter:${chapter.id}`;
-    const chapterNumber = project.chapters.findIndex(item => item.id === chapter.id) + 1;
     const mentionedCards = project.cards.filter(card => cardSearchTerms(card).some(term => chapter.content.includes(term)));
     const referencedCards = project.cards.filter(card => selectedCardIds.includes(card.id) || mentionedCards.some(item => item.id === card.id));
     const graphNodes = [...project.graphNodes];
@@ -3918,16 +3953,8 @@ function App() {
         graphEdges.push({ id: `${chapterNodeId}->${target}`, source: chapterNodeId, target, label: '章节主角', weight: 0.92, sourceChapterId: chapter.id, updatedAt: new Date().toISOString() });
       });
     }
-    const cards = project.cards.map(card => {
-      if (!hasContent || !referencedCards.some(item => item.id === card.id)) return card;
-      const matchedTerm = cardSearchTerms(card).find(term => chapter.content.includes(term)) || card.title;
-      const position = chapter.content.lastIndexOf(matchedTerm);
-      const snippet = position >= 0 ? chapter.content.slice(Math.max(0, position - 70), Math.min(chapter.content.length, position + matchedTerm.length + 150)).replace(/\s+/gu, ' ').trim() : '';
-      const changes = `第 ${chapterNumber} 章《${chapter.title}》出现“${matchedTerm}”：${snippet}`;
-      const lastEntry = card.stateHistory?.[card.stateHistory.length - 1];
-      const stateHistory = lastEntry?.changes === changes ? (card.stateHistory || []) : [...(card.stateHistory || []), { chapterId: chapter.id, chapterTitle: chapter.title, status: '本章出现', changes, updatedAt: new Date().toISOString() }].slice(-30);
-      return { ...card, currentState: changes, stateHistory, updatedAt: new Date().toISOString() };
-    });
+    // 卡片状态不再按正文片段改写：那段"第 N 章出现"沈妄"：……"的随机摘录把记忆提炼写进去的真状态全盖掉了
+    const cards = project.cards;
     const existingMemory = project.memories.find(memory => memory.chapterId === chapter.id);
     const memories = hasContent ? [
       ...project.memories.filter(memory => memory.chapterId !== chapter.id),
@@ -4369,6 +4396,8 @@ function App() {
     const number = project.chapters.findIndex(item => item.id === chapter.id) + 1;
     if (stageBeatsFor(project, number)) return project;
     if (boundChapterOutlineFor(project, chapter)) return project;
+    // 作者在总纲里逐章写了条目的，那就是本章的节拍，不再让模型按八章一段重新拆一遍
+    if (masterOutlineHasChapterEntry(project, number)) return project;
     const range = stageRangeFor(project, number);
     const message = `正在按总纲与故事账本规划第 ${range.from}～${range.to} 章的逐章节拍`;
     setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
@@ -5029,21 +5058,22 @@ function App() {
         const drafted = await requestChapterDraft(project, inserted.chapter, runId);
         if (!drafted.result.draftContent?.trim()) throw new Error(`第 ${number} 章没有生成出正文`);
         const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
-        const upper = Math.floor(target * 1.2);
         const actual = countNovelCharacters(drafted.result.draftContent);
-        if (actual < target || actual > upper) {
-          // 未达标不自动采用，也不丢草稿；保存本章和章纲后暂停，作者可手动处理
+        // 字数不再是停下的理由：差几百字就中断，"懒人连续创作"就从来跑不完。只有正文明显残缺（不到目标一半，多半是被截断）才停下留草稿
+        if (actual < target * 0.5) {
           project = drafted.project;
           await applyProjectChange(project);
           setAgentDraft(drafted.result);
           setAgentDisplayContent(drafted.result.draftContent);
           setAgentDraftTitle(applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''));
-          await finishAgentRun(`第 ${number} 章字数未达标，已保留待处理草稿`);
-          stopReason = `第 ${number} 章正文 ${actual} 字，要求 ${target}～${upper} 字，草稿已保留，未自动采用`;
+          await finishAgentRun(`第 ${number} 章正文明显过短，已保留待处理草稿`);
+          stopReason = `第 ${number} 章正文只有 ${actual} 字（目标 ${target} 字），可能被截断，草稿已保留，未自动采用`;
           break;
         }
         const applied = applyAgentDraft(drafted.project, inserted.chapter, drafted.result.draftContent, applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''), drafted.result.summary);
         project = applied.project;
+        // 模型的疑问汇总到一份"给作者｜待答"文档里，写作不中断，作者有空再看
+        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.authorNotes || [], drafted.result.reviewResult);
         setActiveChapter(applied.chapter);
         setAgentDraft(null);
         setAgentDisplayContent('');
@@ -7180,8 +7210,8 @@ function App() {
                     {(agentDraft.recognizedIntent || agentDraft.selectedSkills?.length) && <div className="agent-intent-result"><span>识别意图：{agentDraft.recognizedIntent || '章节创作与续写'}</span>{agentDraft.selectedSkills?.map(skill => <b key={skill}>{skills.find(item => item.name === skill)?.displayName || skill}</b>)}</div>}
                     {agentDraft.prewriteCheck && <div className={`agent-prewrite-check ${agentDraft.prewriteCheck.blockers.length ? 'warning' : 'passed'}`}><strong>{agentDraft.prewriteCheck.summary}</strong>{agentDraft.prewriteCheck.blockers.map(item => <span key={`block-${item}`}>阻断：{item}</span>)}{agentDraft.prewriteCheck.warnings.map(item => <span key={`warn-${item}`}>提醒：{item}</span>)}</div>}
                     {agentDraft.chapterPlan && <details className="agent-chapter-plan" open>
-                      <summary>下一章执行计划</summary>
-                      <div className="agent-plan-meta">已交给正文节点执行，接受草稿前可先核对承接与钩子。</div>
+                      <summary>这一章的想法</summary>
+                      <div className="agent-plan-meta">正文照着它写；接受草稿前可先看走向对不对。</div>
                       <div className="agent-plan-content">{readableChapterPlan(agentDraft.chapterPlan).split(/\n{2,}/u).map((section, index) => <p key={`${index}-${section.slice(0, 24)}`}>{section}</p>)}</div>
                     </details>}
                     {agentDraft.contextReport && <div className="agent-context-report">
@@ -7212,6 +7242,13 @@ function App() {
                         {agentDraft.reviewResult.suggestions.map(suggestion => <p key={suggestion}>建议：{suggestion}</p>)}
                       </div>
                     )}
+                    {agentDraft.authorNotes?.length ? (
+                      <div className="agent-review warning">
+                        <strong>模型给作者的话</strong>
+                        {agentDraft.authorNotes.map(note => <p key={note}>{note}</p>)}
+                        <p>回复可以写进下一次的创作指令，或补进卡片、总纲；模型会照着改。</p>
+                      </div>
+                    ) : null}
                     <div className="agent-result-actions">
                       <button className="btn-secondary" onClick={() => { setAgentDraft(null); setAgentDraftTitle(''); }}>放弃</button>
                       <button className="btn-primary" onClick={acceptAgentDraft}>接受并写入</button>
@@ -8149,7 +8186,7 @@ function App() {
                     ? <button className="btn-secondary" onClick={() => { continuousAbortRef.current = true; }}>{continuousAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
                     : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runContinuousWriting()}>新建并连续创作</button>}
                 </div>
-                <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '每章自动：新建章节、（本章还没有章纲时，先按总纲往后八章规划逐章节拍，存在大纲页可改）生成章纲、写正文、采用草稿、提炼记忆，再接着写下一章；写满章数、写到总纲按卷写明的末章、出错或点停止为止。'}</p>
+                <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '每章自动：新建章节、生成章纲（总纲没有逐章条目时先规划一段节拍表，存在大纲页可改）、构思、写正文、采用、提炼记忆，再接着写下一章；模型拿不准的事记进大纲页的「给作者｜待答」，不打断写作。写满章数、写到总纲按卷写明的末章、正文明显残缺、出错或点停止为止。'}</p>
               </div>
           </section>
           <section className="agent-task-section">

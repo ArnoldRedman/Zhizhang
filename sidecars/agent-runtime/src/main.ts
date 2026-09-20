@@ -21,7 +21,7 @@ import type { RpcResponse } from "@zhizhang/contracts";
 
 /** 资料组装规则版本：改了预算或裁剪策略就加一
  * 准备结果的缓存 key 只由入参算出，代码变了 key 不变，旧缓存会一直命中、优化完全看不出效果 */
-const contextPipelineVersion = 5;
+const contextPipelineVersion = 6;
 
 /** 阶段节拍表里本章那一行压成一段：本章行是硬目标，前后行只划边界 */
 function chapterBeatText(stageBeats: unknown, chapterNumber: number | undefined): string | undefined {
@@ -88,10 +88,11 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
 {
   "summary": "180 字以内的事件、人物状态和未解决线索",
   "keywords": ["最多 8 个关键词"],
+  "relationshipState": ["人物关系与情绪：谁对谁现在是什么态度、这一章两人之间发生了什么变化、各自的情绪落在哪里；一条一人或一对"],
   "characterStateChanges": ["角色名：持续状态变化"],
   "knowledgeChanges": ["角色名：得知或隐瞒的信息"],
   "foreshadowingChanges": ["伏笔进展"],
-  "foreshadowingItems": [{"text":"跨越多章的长线伏笔；当场就要处理的签字、开箱、答复之类的场景待办不算","status":"active|progressing|resolved|overdue","priority":"high|normal|low","plantedChapter":1,"targetChapter":5}],
+  "foreshadowingItems": [{"text":"只记跨越多章的长线伏笔（身世、旧案、远期承诺、埋下的物证）；没拆的信、没抽的单子、空着的表格这类几章内就会处理的场景待办不算，宁可留空","status":"active|progressing|resolved|overdue","priority":"high|normal|low","plantedChapter":1,"targetChapter":5}],
   "timelineEvents": ["可排序事件"],
   "canonFacts": ["后续必须遵守的事实"],
   "conflicts": ["冲突和结果"],
@@ -539,7 +540,9 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           .filter(Boolean)
           .join("\n\n")}\n请以该固定设定为首章创作和后续章纲承接的边界，未知内容标记为“待揭示”。`
         : "";
-      const outlineSkillName = kind === "总纲" ? "outline-total-planner" : kind === "章纲" ? "小说章纲生成器" : "world-setting-planner";
+      // 章纲不再自动塞"番茄章纲生成器"和六条承接技能：那是 3.5KB 的爽点模板加一堆"不得"，生活流小说也被填成"低调装逼"；
+      // 总纲、世界观仍用各自的生成器技能，作者亲手勾的技能照带
+      const outlineSkillName = kind === "总纲" ? "outline-total-planner" : kind === "章纲" ? "" : "world-setting-planner";
       const skillCatalog = Array.isArray(skills) ? skills
         .filter((skill): skill is Record<string, unknown> => Boolean(skill && typeof skill === "object"))
         .map(item => ({
@@ -558,12 +561,10 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const isNextChapterHandoff = Boolean(targetChapterNumber && sourceChapterNumber === targetChapterNumber - 1);
       const automaticSelection = selectSkillsByIntent(String(instruction || ""), skillCatalog);
       const preferredNames = stringList(preferredSkillNames, 6);
-      const continuityNames = kind === "章纲" && isNextChapterHandoff ? ["章纲承接规范", "next-chapter-plan", "conflict-escalation", "foreshadowing-manager", "ending-hook", "setting-consistency"] : [];
       const matchedSkills = [
-        skillCatalog.find(item => item.name === outlineSkillName),
+        outlineSkillName ? skillCatalog.find(item => item.name === outlineSkillName) : undefined,
         ...skillCatalog.filter(item => preferredNames.includes(item.name)),
-        ...skillCatalog.filter(item => automaticSelection.skills.some(selected => selected.name === item.name) && (item.category === "setup" || continuityNames.includes(item.name))),
-        ...(sourceChapter && isNextChapterHandoff ? skillCatalog.filter(item => continuityNames.includes(item.name)) : []),
+        ...(kind === "章纲" ? [] : skillCatalog.filter(item => automaticSelection.skills.some(selected => selected.name === item.name) && item.category === "setup")),
       ].filter((item, index, list): item is SkillDefinition => Boolean(item) && list.findIndex(candidate => candidate?.name === item?.name) === index).slice(0, 4);
       const recognizedIntent = kind === "章纲" && isNextChapterHandoff
         ? "上一章正文承接并规划下一章"
@@ -574,7 +575,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       emitter.progress("intent", 14, `步骤 1/5：意图识别完成：${recognizedIntent}`);
       emitter.context("intent", `已选技能：${matchedSkills.map(item => item.displayName || item.name).join("、") || "默认大纲规则"}`, { source: "OutlineSkillRouter", status: "selected", items: matchedSkills.length });
       const skillSection = matchedSkills.length
-        ? `\n## 本次匹配技能\n${matchedSkills.map(item => `### ${compactText(item.displayName || item.name || "技能", 80)}\n${compactText(item.content || item.description || "", 700)}`).join("\n\n")}`
+        ? `\n## 本次匹配技能\n${matchedSkills.map(item => `### ${compactText(item.displayName || item.name || "技能", 80)}\n${compactText(item.content || item.description || "", 2400)}`).join("\n\n")}`
         : "";
       const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${worldSettingSection}${skillSection}${graphSection}${cardSection}`;
       const outlineSessionKey = stableHash({ scope: "outline", outlineId: String(outlineId || "active"), sessionId: String(sessionId || "default"), projectTitle, kind, model, apiMode, targetChapterId: targetChapterRecord?.id, sourceChapterId: sourceChapterRecord?.id, formatOutlineId: formatOutlineRecord?.id, stableProjectPacket });
@@ -610,8 +611,8 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const masterOutlineSection = kind === "章纲" ? compactMasterOutline(masterOutline, directionQuery, masterOutlineBytes, Number(ledgerPosition.number) || undefined) : "";
       const ledgerSection = kind === "章纲" ? buildStoryLedger(memoryList, ledgerPosition, storyLedgerBytes) : "";
       const directionSection = masterOutlineSection || ledgerSection
-        ? `## 总纲与故事账本（本章必须沿总纲推进一个新节点；账本里已发生的事不得再作为本章主事件）\n${[
-          masterOutlineSection ? `### 总纲（含推进路线、当前节点与“接下来必须推进”的节点；本章章纲必须推进到那里，更后面的节点不得提前兑现）\n${masterOutlineSection}` : "",
+        ? `## 总纲与故事账本\n${[
+          masterOutlineSection ? `### 总纲（含本章位置与本章条目）\n${masterOutlineSection}` : "",
           ledgerSection ? `### 故事账本\n${ledgerSection}` : "",
         ].filter(Boolean).join("\n\n")}\n\n`
         : "";
@@ -619,22 +620,22 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       // 承接模式只给上一章结尾：以前把上一章全文（两万多字节）标成“唯一正文依据（优先级最高）”交给章纲，
       // 五千多字节的总纲根本压不住它，章纲就整章续写上一章最后一场戏，正文再照着章纲写，于是一件事拖十几章
       const sourceSection = sourceChapterRecord && isNextChapterHandoff
-        ? `## 上一章结尾（承接锚点：目标章只在开场一到三段承接它，之后必须离开这个场景）\n依据模式：${compactText(sourceChapterRecord.mode || "作者指定", 80)}\n第 ${String(sourceChapterRecord.number || "")} 章《${compactText(sourceChapterRecord.title || "未命名", 120)}》结尾原文：\n${tailText(sourceContent, 3200)}\n\n硬性要求：目标章开场只能发生在上述结尾状态之后。上一章已发生的行动、战斗、跟踪发现、资源消耗、人物位置与情绪不得重新规划或倒退；上一章留下的未了事项只在开场收束或一笔带过。目标章的主体必须推进到“总纲与故事账本”标出的本阶段下一步，并写明本章相对上一章的时间跨度与地点位移；开场承接不超过全章两成。上一章的完整事件以故事账本为准，不得引用其他章节正文，不得把历史会话中的旧章节当作事实。`
+        ? `## 上一章结尾\n第 ${String(sourceChapterRecord.number || "")} 章《${compactText(sourceChapterRecord.title || "未命名", 120)}》结尾原文：\n${tailText(sourceContent, 3200)}\n\n目标章从这之后写起；上一章已发生的事不再重演，承接几段后就该发生新的事。上一章的完整事件以故事账本为准。`
         : sourceChapterRecord
         ? `## 唯一正文依据（优先级最高）\n依据模式：${compactText(sourceChapterRecord.mode || "作者指定", 80)}\n第 ${String(sourceChapterRecord.number || "")} 章《${compactText(sourceChapterRecord.title || "未命名", 120)}》正文：\n${compactText(sourceContent, 26000)}\n\n${sourceChapterNumber === targetChapterNumber ? `## 本章复盘规则\n这是“根据本章正文生成本章章纲”。章纲必须忠实概括正文中已发生的事件、人物状态、冲突、伏笔与结尾；不得把正文结尾之后的计划写成已发生事实，也不得使用“下一章承接”规则。` : `## 指定正文参考规则\n这是指定章节正文的参考分析。只提取该正文可证实的事实；不要把它误当作目标章的上一章，也不要强行制造章节承接。`}\n\n章纲事件、人物状态和结尾承接必须来自这段正文；不得引用其他章节正文，不得把历史会话中的旧章节当作事实。`
-        : `## 正文依据\n本次没有提供可用正文。只能生成通用结构，不得声称承接任何具体章节。`;
+        : `## 正文依据\n本次没有提供可用正文，按总纲、账本和作者指令规划。`;
       const formatSection = formatOutlineRecord
-        ? `## 格式参考章纲（仅参考表达密度，不得覆盖固定输出协议）\n参考模式：${compactText(formatOutlineRecord.mode || "上一章章纲格式", 100)}\n${compactText(formatOutlineRecord.title || "参考章纲", 120)}\n${compactText(formatOutlineRecord.content || "", 9000)}\n\n硬性要求：固定输出协议的栏目、顺序和字段名优先；只能参考这份章纲的详略和语气，不得照抄其人物、事件、数字、旧栏目或结尾。`
-        : `## 格式要求\n没有可用的参考章纲，请严格使用“小说章纲生成器”技能定义的固定模板。`;
-      // 本章节拍：阶段节拍表里给本章定的事件，是章纲的硬目标；有它章纲就不能再从上一章末尾往下顺
+        ? `## 上一章章纲（只参考详略与语气，事件与人物以本章依据为准）\n${compactText(formatOutlineRecord.title || "参考章纲", 120)}\n${compactText(formatOutlineRecord.content || "", 6000)}`
+        : "";
+      // 本章节拍：阶段节拍表里给本章定的事件
       const beat = stageBeatLines(stageBeats, targetChapterNumber || undefined);
       const beatSection = beat.current
-        ? `## 本章节拍（阶段节拍表为本章定好的事件，章纲必须围绕它展开，不得改写成上一章事件线的枝节）\n本章：${beat.current}${beat.previous ? `\n上一章（已定或已写）：${beat.previous}` : ""}${beat.next ? `\n下一章（不得提前兑现）：${beat.next}` : ""}\n\n`
+        ? `## 本章节拍（阶段节拍表给本章定的事件）\n本章：${beat.current}${beat.previous ? `\n上一章：${beat.previous}` : ""}${beat.next ? `\n下一章（还没到）：${beat.next}` : ""}\n\n`
         : "";
       if (beatSection) emitter.context("retrieve", "已装载本章节拍", { source: "阶段节拍表", status: "loaded", bytes: byteLength(beatSection), items: 1 });
       const dynamicTask = isBeatSheet
         ? `## 本次大纲任务\n类型：阶段节拍表（第 ${beatFrom}～${beatTo} 章${beatWrittenThrough >= beatFrom ? `，其中第 ${beatFrom}～${beatWrittenThrough} 章已写` : ""}）\n作者指令：${compactText(instruction || "按总纲把本阶段拆成逐章事件", 1800)}\n\n${directionSection}${stageBeatSheetProtocol}\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n只输出节拍表 Markdown。`
-        : `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${beatSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。章纲的核心事件必须是故事账本里没有出现过的新推进${beat.current ? "，并且就是“本章节拍”里定的那件事" : ""}，并在“主线推进”栏写明本章推进的总纲节点与和前文的区别；上一章已经完成的行动不得重新发生。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
+        : `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${beatSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文${kind === "章纲" ? "；这一章要发生一件前文没发生过的事，总纲或节拍有安排就按它" : ""}。不要输出分析过程或前言。`;
       emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
       emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
       emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
@@ -837,6 +838,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           };
           save("summary", "event", "章节摘要", [String(item.summary || "")], 0.82);
           save("character-state", "character_state", "人物状态", stringList(item.characterStateChanges), 1);
+          save("relationship", "character_state", "人物关系与情绪", stringList(item.relationshipState), 0.99);
           save("knowledge", "character_state", "角色认知", stringList(item.knowledgeChanges), 0.98);
           save("foreshadowing", "foreshadowing", "伏笔追踪", stringList(item.foreshadowingChanges), 0.98);
           save("timeline", "timeline", "时间线", stringList(item.timelineEvents), 0.94);
@@ -879,6 +881,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           projectId: normalizedProjectId,
           projectTitle: String(projectTitle || ""),
           chapterId: String(chapterId),
+          chapterNumber: chapterPosition.number,
           instruction: String(instruction),
           worldSetting: prepared.worldSetting,
           masterOutline: prepared.masterOutline,
@@ -915,13 +918,13 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           // 兜底也失败就不要再默默无声：否则章节只能叫“第 N 章”，作者很难发现
           if (!String(resultRecord.chapterTitle || "").trim()) streamEmitter.progress("review", 98, "本章标题没生成出来：接受草稿前请手动填写标题");
         }
-        // 会话只记“这一章写成了什么 + 审查还指出什么问题”，不把计划全文当结论：
-        // 计划是一次性产物，下一章会重新生成，把它当“已确认结论”回喂只会把模型拉回上一章的写法
+        // 会话只记"这一章写成了什么 + 审查还指出什么问题"，不把构思全文当结论：
+        // 构思是一次性产物，下一章会重新想，把它当"已确认结论"回喂只会把模型拉回上一章的写法。
+        // 正文不再回摘要（纯文本输出），改用审查给的"推进到哪里"那一句；真正的章节记忆由 memory.write 提炼
         const reviewRecord = resultRecord.reviewResult as Record<string, unknown> | undefined;
         const reviewIssues = Array.isArray(reviewRecord?.issues) ? reviewRecord.issues.map(item => String(item)).filter(Boolean).join("；") : "";
-        // 审查后已经按意见定点修订过的，不要再把同一批意见当“待修正”丢给下一章：那句会误导下一章的写法
-        const pendingIssues = reviewRecord?.revised ? "" : reviewIssues;
-        const handoff = [resultRecord.summary, pendingIssues ? `待修正：${pendingIssues}` : ""].filter(Boolean).join("\n");
+        const progress = typeof reviewRecord?.progress === "string" ? reviewRecord.progress.trim() : "";
+        const handoff = [progress || String(resultRecord.summary || ""), reviewIssues ? `审查指出：${reviewIssues}` : ""].filter(Boolean).join("\n");
         if (handoff) {
           const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes, `chapter:${String(chapterId)}`);
           novelSessionCache.set(sessionKey, nextChapterSession.state);

@@ -23,6 +23,7 @@ export type MemoryExtractionResult = {
   timelineEvents?: string[];
   canonFacts?: string[];
   conflicts?: string[];
+  relationshipState?: string[];
   endingHook?: string;
 };
 
@@ -65,6 +66,8 @@ export const buildChapterMemoryPatch = (options: {
     timelineEvents: preferAIList(result.timelineEvents, local.timelineEvents, existing?.timelineEvents),
     canonFacts: preferAIList(result.canonFacts, local.canonFacts, existing?.canonFacts),
     conflicts: preferAIList(result.conflicts, local.conflicts, existing?.conflicts),
+    // 人物关系只有模型能提炼，本地启发式给不出；没返回时保留原值
+    relationshipState: asTextList(result.relationshipState, 8).length ? asTextList(result.relationshipState, 8) : (existing?.relationshipState || []),
     endingHook: typeof result.endingHook === 'string' && result.endingHook.trim() ? result.endingHook.trim() : (local.endingHook || existing?.endingHook || ''),
   };
 };
@@ -76,7 +79,7 @@ export const buildMemoryDocuments = (memories: ChapterMemory[], existingDocument
     : '暂无已保存章节记忆。'}\n`;
   const documentContent: Record<MemoryDocumentKind, string> = {
     '章节快照': `# 章节快照\n\n${ordered.length ? ordered.map(memory => `## ${memory.chapterTitle}\n${memory.summary || '暂无摘要'}\n\n关键词：${memory.keywords.join('、') || '暂无'}\n\n人物状态：${memory.characterStateChanges.join('；') || '暂无'}\n认知变化：${memory.knowledgeChanges.join('；') || '暂无'}\n伏笔：${memory.foreshadowingChanges.join('；') || '暂无'}\n时间线：${memory.timelineEvents.join('；') || '暂无'}\n设定事实：${memory.canonFacts.join('；') || '暂无'}\n冲突：${memory.conflicts.join('；') || '暂无'}\n章末钩子：${memory.endingHook || '暂无'}`).join('\n\n---\n\n') : '暂无已保存章节记忆。'}\n`,
-    '人物状态': sections('人物状态', ordered.map(memory => ({ memory, items: memory.characterStateChanges }))),
+    '人物状态': sections('人物状态', ordered.map(memory => ({ memory, items: [...memory.characterStateChanges, ...(memory.relationshipState || []).map(item => `关系与情绪：${item}`)] }))),
     '角色认知': sections('角色认知', ordered.map(memory => ({ memory, items: memory.knowledgeChanges }))),
     '伏笔追踪': sections('伏笔追踪', ordered.map(memory => ({ memory, items: memory.foreshadowingChanges }))),
     '时间线': sections('时间线', ordered.map(memory => ({ memory, items: memory.timelineEvents }))),
@@ -132,6 +135,7 @@ export const normalizeChapterMemory = (memory: Partial<ChapterMemory>, fallbackC
     timelineEvents: asTextList(memory.timelineEvents),
     canonFacts: asTextList(memory.canonFacts),
     conflicts: asTextList(memory.conflicts),
+    relationshipState: asTextList(memory.relationshipState, 8),
     endingHook: typeof memory.endingHook === 'string' ? memory.endingHook : '',
     sourceChapterNumber: typeof memory.sourceChapterNumber === 'number' ? memory.sourceChapterNumber : undefined,
     createdAt: typeof memory.createdAt === 'string' ? memory.createdAt : now,

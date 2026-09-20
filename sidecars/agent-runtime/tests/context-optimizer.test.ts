@@ -124,7 +124,7 @@ describe("story-level context", () => {
     // 第二卷用的是“进城、追查、结盟”，与已写正文零重合，旧做法会把它整个丢掉
     expect(result).toContain("推进路线");
     expect(result).toContain("沈砚进城追查电台来源");
-    expect(result).toContain("接下来必须推进");
+    expect(result).toContain("接下来要推进到");
     expect(result).toContain("三天内找到灯塔守夜人");
     expect(result).not.toContain("母亲仍然活着");
   });
@@ -185,13 +185,15 @@ describe("story-level context", () => {
     expect(current).toContain("【当前卷】\n### 第四卷：书肆二期与大婚盛典");
     expect(current).toContain("关键节点：专著问世；大婚华服试样与仪式；国风盛典");
     expect(current).toContain("埋伏：敦煌特邀函");
-    expect(current).toContain("本章不在总纲已列出的阶段区间内（本卷已列出的阶段到第 177 章为止）");
-    // 卖点段落既不能变成“当前节点”，也不能变成“接下来必须推进”
+    // "须在第174～177章完成"是正文里的一句话，不是阶段标题：以前被当成阶段，本章位置就标成了"第 2/4 章"这种假位置
+    expect(current).not.toContain("本章位于阶段");
+    expect(current).toContain("桑皮纸试制阶段收尾须在第174～177章完成");
+    // 卖点段落既不能变成"当前节点"，也不能变成"接下来要推进到"
     expect(current).not.toContain("| 穿越后依靠系统逆袭");
-    expect(current).not.toContain("接下来必须推进");
+    expect(current).not.toContain("接下来要推进到");
     // 已完成的第三卷只留标题，但卷内阶段标在第四章上时仍能定位
     const inside = compactMasterOutline(outline, "沈妄在纸行对案", 5600, 175);
-    expect(inside).toContain("本章位于阶段「已完成至第173章《温室试制桑皮纸》；桑皮纸试制阶段收尾须在第174～177章完成。」：第 2/4 章");
+    expect(inside).not.toContain("本章位于阶段");
   });
 
   it("compactMasterOutline 在当前卷里按章号定位阶段并标出本章位置，阶段最后一章要求收束并进入下一阶段", () => {
@@ -222,7 +224,7 @@ describe("story-level context", () => {
     expect(last).toContain("本章位置：第五卷：栖迟文脉（第156～205章）；本章位于阶段「第171～177章」：第 7/7 章，是本阶段最后一章");
     expect(last).toContain("下一阶段「第178～185章：研究沉淀与生活回落」");
     expect(last).toContain("【当前阶段：本章是本阶段第 7/7 章，也是最后一章】");
-    expect(last).toContain("【下一阶段：本章不得提前兑现它的事件，只能为它做过渡】\n- **第178～185章：研究沉淀与生活回落**");
+    expect(last).toContain("【下一阶段：本章还没到这里】\n- **第178～185章：研究沉淀与生活回落**");
     // 其他阶段只留标题行；伏笔矩阵不再被当成“当前节点”
     expect(last).toContain("- **第186～195章：专著影响扩展**");
     expect(last).not.toContain("《古籍微痕通论》逐渐形成社会影响");
@@ -231,7 +233,7 @@ describe("story-level context", () => {
     // 卷中只给下一卷的标题，细节留给卷末
     expect(last).toContain("【下一卷】\n## 第六卷：大美敦煌（第206～250章）");
     const middle = compactMasterOutline(outline, "沈妄整理记录", 5600, 180);
-    expect(middle).toContain("本章位于阶段「第178～185章：研究沉淀与生活回落」：第 3/8 章，本阶段的推进要摊在这 8 章里，本章只走其中一步，之后还剩 5 章");
+    expect(middle).toContain("本章位于阶段「第178～185章：研究沉淀与生活回落」：第 3/8 章，本阶段还剩 5 章，本章走其中一步");
   });
 
   it("leadText 只取开头并在句末收口，不留裁剪标记", () => {
@@ -241,7 +243,7 @@ describe("story-level context", () => {
 
   // 症状：账本把上一章刚埋的场景待办（签字没落、封条起翘）和长线伏笔混成一份“必须回收”的清单，
   // 下一章为了逐条回收就整章留在原地；摘要按头尾拼接，每行中间都插着裁剪标记；预算装不下的更早章节直接消失
-  it("buildStoryLedger 把上一两章的未了事项与长线伏笔分开列，事件行只取摘要开头，更早的章只列标题", () => {
+  it("buildStoryLedger 只列埋了三章以上的长线伏笔，场景待办不进账本；事件行只取摘要开头，更早的章只列标题", () => {
     const memories = Array.from({ length: 30 }, (_, index) => ({
       chapterNumber: index + 1,
       title: `第 ${index + 1} 章 标题${index + 1}`,
@@ -253,9 +255,9 @@ describe("story-level context", () => {
     const ledger = buildStoryLedger(memories, { number: 30, total: 29 }, 3000);
     expect(ledger).toContain("长线伏笔");
     expect(ledger).toContain("旧电台频率");
-    expect(ledger).toContain("上一两章留下的未了事项");
-    expect(ledger.indexOf("长线伏笔")).toBeLessThan(ledger.indexOf("上一两章留下的未了事项"));
-    expect(ledger).toContain("签字笔悬在中止权条款上没落下");
+    // 第 29 章刚埋的"签字笔没落下"是场景待办：以前单列成"未了事项"，下一章就为了它整章留在原地
+    expect(ledger).not.toContain("未了事项");
+    expect(ledger).not.toContain("签字笔悬在中止权条款上没落下");
     expect(ledger).not.toContain("已按相关性与预算裁剪");
     expect(ledger).toContain("- 第 29 章 标题29：");
     expect(ledger).toContain("抄进笔记本。…");
@@ -271,8 +273,12 @@ describe("story-level context", () => {
     ], { number: 4, total: 3 }, 2400);
     expect(ledger).toContain("当前正在写第 4 章，全书已有 3 章");
     expect(ledger.indexOf("第 2 章")).toBeLessThan(ledger.indexOf("第 3 章"));
-    expect(ledger).toContain("不得再写一遍");
-    expect(ledger).toContain("[active] 钥匙能开灯塔地下室（埋于第 3 章，计划第 6 章回收）");
+    expect(ledger).toContain("这些已经写过了");
+    // 第 3 章刚埋的钥匙在第 4 章还是场景待办，不列；到第 6 章才算长线
+    expect(ledger).not.toContain("钥匙能开灯塔地下室");
+    expect(buildStoryLedger([
+      { chapterNumber: 3, title: "第三章", summary: "沈砚确认门外是守夜人。", foreshadowingItems: [{ text: "钥匙能开灯塔地下室", status: "active", plantedChapter: 3, targetChapter: 6 }] },
+    ], { number: 6, total: 5 }, 2400)).toContain("[active] 钥匙能开灯塔地下室（埋于第 3 章，计划第 6 章回收）");
     expect(ledger).not.toContain("摩斯码");
   });
 
@@ -282,8 +288,8 @@ describe("story-level context", () => {
     const ledger = buildStoryLedger([
       { chapterNumber: 2, title: "第二章", summary: "阁楼电台亮起。", foreshadowingChanges: ["电台里的摩斯码还没译完"], foreshadowingItems: [] },
       { chapterNumber: 3, title: "第三章", summary: "守夜人出现。", foreshadowingChanges: ["守夜人递来一把钥匙。"], foreshadowingItems: [{ text: "钥匙能开地下室", status: "resolved" }] },
-    ], { number: 4, total: 3 }, 2400);
-    expect(ledger).toContain("未了事项");
+    ], { number: 6, total: 5 }, 2400);
+    expect(ledger).toContain("长线伏笔");
     expect(ledger).toContain("第 2 章：电台里的摩斯码还没译完");
     expect(ledger).toContain("第 3 章：守夜人递来一把钥匙。");
   });
@@ -304,7 +310,7 @@ describe("story-level context", () => {
   it("contextBudgetBytes 跟着窗口走，128K 窗口不再只装 18KB", () => {
     const budget = contextBudgetBytes(128);
     expect(budget).toBeGreaterThan(48 * 1024);
-    expect(budget).toBeLessThan(80 * 1024);
+    expect(budget).toBeLessThan(100 * 1024);
     expect(contextBudgetBytes(1024)).toBe(256 * 1024);
     // 调用方显式给小预算时仍然听它的（记忆提炼、图书路径靠这个控制成本）
     expect(contextBudgetBytes(128, 20, 8)).toBe(20 * 1024);

@@ -18,10 +18,18 @@ import { chapterBoundToOutline } from '../outline/model.ts';
 /** 进入运行时检索库的聚合文档：角色认知/冲突/章节快照靠逐章记忆覆盖，任务书只带这四份 */
 const contextDocumentKinds = new Set(['章节快照', '人物状态', '伏笔追踪', '时间线', '设定事实']);
 
-/** 默认创作指令写的是“推进”而不是“悬念”：旧默认“在结尾留下自然的悬念”会让模型每章都在同一场景里再埋一个小钩子 */
-export const defaultChapterInstruction = '按总纲的“本章位置”把主线推进到本阶段的下一步：开头一到三段承接上一章后就离开那个场景，本章相对上一章要有明确的时间或地点位移；结尾停在能继续发展的行动、发现或风险上，不为制造悬念另埋新线。';
+/** 默认创作指令只说要写什么：以前那句塞满"承接后离开场景、时间位移、不埋新线"，模型照着写出来的就是流水账 */
+export const defaultChapterInstruction = '按总纲和前文写这一章该发生的事，人物按各自的性格行动。';
 
 const chapterRangePattern = /第\s*(\d{1,4})\s*[～~\-—–至到]\s*(\d{1,4})\s*章/gu;
+
+/**
+ * 总纲里有没有给这一章单独写条目（"#### 第204章 《西北来的日程表》"这种标题）
+ * 有就不必再生成阶段节拍表：作者已经逐章规划过了，再让模型按八章一段重新拆一遍只会和总纲打架
+ */
+export const masterOutlineHasChapterEntry = (project: Project, chapterNumber: number): boolean => project.outlines
+  .filter(outline => outline.kind === '总纲')
+  .some(outline => new RegExp(`^#{1,6}\\s*(?:第\\s*)?${chapterNumber}\\s*章(?!\\s*[～~\\-—–至到])`, 'mu').test(outline.content));
 
 /** 总纲里写的全部章号区间（卷与阶段都算） */
 const outlineChapterRanges = (project: Project): Array<{ from: number; to: number }> => project.outlines
@@ -145,6 +153,7 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
         timelineEvents: memory.timelineEvents,
         canonFacts: memory.canonFacts,
         conflicts: memory.conflicts,
+        relationshipState: memory.relationshipState || [],
         endingHook: memory.endingHook,
       })),
       memoryDocuments: project.memoryDocuments

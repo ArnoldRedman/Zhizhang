@@ -93,7 +93,7 @@ React 通过 `src/services/agent-client.ts` 调用 Agent RPC，通过 `native-cl
 - `rpc/library-handlers.ts`：书籍、榜单、拆书和文风相关 RPC。
 - `sources/library-service.ts`：Fanqie、千阅、其他书源和榜单抓取。
 
-章节写作仍由 `graphs/chapter-write.graph.ts` 编排，依次完成上下文准备、意图/技能选择、检索、计划、正文、审查和摘要。
+章节写作仍由 `graphs/chapter-write.graph.ts` 编排：上下文准备、检索、承接、构思（一段自由格式的想法）、正文（纯文本，第一行章名）、审查。审查只出报告，不改正文；只有判定“又把前文写了一遍”时换一件事重写一次。模型拿不准的事写成「【给作者】」行，运行时剥出来交给界面，连续创作时汇总进大纲页的“给作者｜待答”。
 
 ## 数据所有权
 

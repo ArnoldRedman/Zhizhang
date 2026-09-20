@@ -124,6 +124,11 @@ test('buildChapterMemoryPatch 用成体系的模型结果覆盖启发式，不�
   });
   assert.equal(kept.foreshadowingItems?.length, 1);
   assert.equal(kept.summary, '新摘要');
+  // 人物关系只有模型能给：返回了就用，没返回保留已有的
+  const related = buildChapterMemoryPatch({ result: { relationshipState: ['沈砚对母亲：从戒备转为想念'] }, local, keywords: [], existing: memory(1) });
+  assert.deepEqual(related.relationshipState, ['沈砚对母亲：从戒备转为想念']);
+  const inherited = buildChapterMemoryPatch({ result: {}, local, keywords: [], existing: { ...memory(1), relationshipState: ['旧关系'] } });
+  assert.deepEqual(inherited.relationshipState, ['旧关系']);
 });
 
 test('recentChapterMemories 只取目标章之前的记忆，按目录顺序排并限制条数', () => {

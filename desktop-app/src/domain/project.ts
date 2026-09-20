@@ -69,6 +69,8 @@ export interface ChapterMemory {
   timelineEvents: string[];
   canonFacts: string[];
   conflicts: string[];
+  /** 人物关系与情绪：谁对谁是什么态度、这一章两人之间变了什么；感情线靠它承接，只记事务的记忆写不出感情 */
+  relationshipState?: string[];
   endingHook: string;
   sourceChapterNumber?: number;
   createdAt: string;
