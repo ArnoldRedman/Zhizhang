@@ -17,8 +17,9 @@
     "typecheck:contracts": "npm --workspace @zhizhang/contracts run typecheck",
     "typecheck:model-protocol": "npm --workspace @zhizhang/model-protocol run typecheck",
     "build:shared": "npm --workspace @zhizhang/contracts run build && npm --workspace @zhizhang/model-protocol run build",
-    "check:rust": "cargo check --manifest-path desktop-app/src-tauri/Cargo.toml",
-    "test:rust": "cargo test --manifest-path desktop-app/src-tauri/Cargo.toml",
+    "prepare:rust-check": "node -e \"require('node:fs').mkdirSync('desktop-app/src-tauri/runtime/agent-runtime', { recursive: true })\"",
+    "check:rust": "npm run prepare:rust-check && cargo check --manifest-path desktop-app/src-tauri/Cargo.toml",
+    "test:rust": "npm run prepare:rust-check && cargo test --manifest-path desktop-app/src-tauri/Cargo.toml",
     "check": "npm run build:shared && npm run test:runtime && npm run typecheck:contracts && npm run typecheck:model-protocol && npm run typecheck:runtime && npm --prefix sidecars/agent-runtime run build && npm --prefix desktop-app run lint && npm --prefix desktop-app run test && npm --prefix desktop-app run build && npm run check:rust && npm run test:rust",
     "dev:agent": "npm --workspace @zhizhang/agent-runtime run dev"
   }
