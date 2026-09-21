@@ -2,6 +2,11 @@ import { z } from "zod";
 
 // 拆章切点的纯函数：运行时、移动端和前端落地共用同一份分段与切点规则，否则同一个 breakAfter 会切在不同地方
 export { allocateChapterParts, chapterCharacterCount, maxChapterParts, minChapterPartCharacters, partsFromBreaks, planBalancedBreaks, planChapterBreaks, splitParagraphs } from "./chapter-split.js";
+// 正文本地验证门与标点归一：运行时在连续创作里按 blocking 决定是否定向修订，桌面端在草稿面板即时显示，两端必须报出同一份结果
+export { classifyEnding, classifyOpening, firstSentence, hasBlocking, lastSentence, lintProse } from "./prose-lint.js";
+export type { LintContext, LintFinding, LintSeverity } from "./prose-lint.js";
+export { detectQuoteStyle, normalizePauses, normalizeQuotes } from "./punctuation.js";
+export type { PunctuationReport, QuoteStyle } from "./punctuation.js";
 
 /**
  * 模型类 RPC 的共享参数形状
@@ -25,7 +30,7 @@ export type ModelRequestParams = z.infer<typeof modelParamsSchema> & Record<stri
 /** 携带模型配置的方法；参数在 registry 处按 modelParamsSchema 校验 */
 const modelParamMethods = [
   "gateway.usage", "settings.diagnose", "models.list", "models.test", "project.generate",
-  "skill.write", "github.commit.describe", "memory.write", "ranking.analyze", "book.dismantle", "book.style.distill",
+  "skill.write", "github.commit.describe", "memory.write", "ranking.analyze", "book.dismantle", "book.style.distill", "book.aggregate",
   "book.rewrite", "book.adapt", "text.transform", "project.agent.chat", "card.write",
   "outline.write", "chapter.write", "chapter.review",
 ] as const;

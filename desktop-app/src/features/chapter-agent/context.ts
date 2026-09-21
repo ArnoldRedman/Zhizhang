@@ -1,7 +1,8 @@
 import type { Chapter, KnowledgeCard, OutlineDocument, Project } from '../../domain/project';
 import type { Skill } from '../../domain/skill';
-import type { WritingStyle } from '../../domain/library';
-import { recentChapterMemories } from '../../domain/memory.ts';
+import type { DismantleAggregate, WritingStyle } from '../../domain/library';
+import { firstSentence, lastSentence } from '@zhizhang/contracts';
+import { buildMemoryDocuments, recentChapterMemories } from '../../domain/memory.ts';
 import { cardSearchTermGroups } from '../../domain/cards.ts';
 import { chapterBoundToOutline } from '../outline/model.ts';
 
@@ -93,6 +94,8 @@ export interface ChapterWriteContextInput {
   extraOutlineIds: number[];
   selectedCardIds: number[];
   writingStyle?: WritingStyle;
+  /** 项目绑定的对标拆书的全书聚合：构思看情绪模块与节奏表，正文只带一段同基调锚点；没绑或没聚合就不传 */
+  benchmark?: DismantleAggregate;
 }
 
 export interface ChapterWriteContext {
@@ -112,6 +115,10 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
   const chapterIndex = project.chapters.findIndex(item => item.id === chapter.id);
   const chapterNumber = chapterIndex + 1;
   const previousChapter = chapterIndex > 0 ? project.chapters[chapterIndex - 1] : undefined;
+  // 重写或审查历史章时，聚合文档只能到本章之前：它们按全书累计，尾部是最新几章，带进去等于把"未来"喂给模型
+  const historical = chapterIndex >= 0 && chapterIndex < project.chapters.length - 1;
+  const priorMemories = recentChapterMemories(project, chapterNumber);
+  const memoryDocuments = historical ? buildMemoryDocuments(priorMemories) : project.memoryDocuments;
   const boundOutline = boundChapterOutlineFor(project, chapter);
   // 阶段节拍表不当普通章纲带：它单独走 stageBeats，运行时只取本章那一行
   const outlines = project.outlines.filter(outline => !outline.title.startsWith('阶段节拍｜') && (outline.kind === '世界观与作品设定' || outline.kind === '总纲'
@@ -140,7 +147,7 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
       skills,
       preferredSkillNames: input.preferredSkillNames.filter(name => input.skills.some(skill => skill.name === name)),
       previousChapters: previousChapter ? [{ id: previousChapter.id, title: previousChapter.title, content: previousChapter.content }] : [],
-      memories: recentChapterMemories(project, chapterNumber).map(memory => ({
+      memories: priorMemories.map(memory => ({
         id: memory.id,
         chapterNumber: memory.chapterNumber,
         title: memory.chapterTitle,
@@ -154,11 +161,35 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
         canonFacts: memory.canonFacts,
         conflicts: memory.conflicts,
         relationshipState: memory.relationshipState || [],
+        readerKnown: memory.readerKnown || [],
+        authorTruth: memory.authorTruth || [],
+        nextChapterPromise: memory.nextChapterPromise || '',
+        newlyIntroduced: memory.newlyIntroduced || [],
         endingHook: memory.endingHook,
       })),
-      memoryDocuments: project.memoryDocuments
+      memoryDocuments: memoryDocuments
         .filter(document => contextDocumentKinds.has(document.kind))
         .map(document => ({ kind: document.kind, title: document.title, content: document.content })),
+      // 验证门与三档审查：档位、引号风格、作者允许的句式来自项目设置；最近几章的开头结尾与上一章承诺从正文和记忆里取
+      reviewMode: project.reviewMode || 'lean',
+      quoteStyle: project.quoteStyle,
+      allowedPhrases: project.allowedPhrases || [],
+      ...recentChapterEcho(project, chapterNumber),
+      previousPromise: previousChapter ? project.memories.find(memory => memory.chapterId === previousChapter.id)?.nextChapterPromise || undefined : undefined,
+      // 对标资料只传写作要用的三样，文风档案已经作为 WritingStyle 单独绑定，不重复带
+      benchmark: input.benchmark ? { anchors: input.benchmark.anchors, emotionModules: input.benchmark.emotionModules, rhythm: input.benchmark.rhythm } : undefined,
     },
+  };
+};
+
+/**
+ * 最近五章的开头句与结尾句
+ * 写作时让模型看见前面几章怎么开怎么收，验证门拿它查同型；只取有正文的章，按时间顺序，最后一项是紧邻上一章
+ */
+export const recentChapterEcho = (project: Project, beforeChapterNumber: number, limit = 5): { recentOpenings: string[]; recentEndings: string[] } => {
+  const previous = project.chapters.slice(Math.max(0, beforeChapterNumber - 1 - limit), Math.max(0, beforeChapterNumber - 1)).filter(chapter => chapter.content.trim());
+  return {
+    recentOpenings: previous.map(chapter => firstSentence(chapter.content)).filter(Boolean),
+    recentEndings: previous.map(chapter => lastSentence(chapter.content)).filter(Boolean),
   };
 };

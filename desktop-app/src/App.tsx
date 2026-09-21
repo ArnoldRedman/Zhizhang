@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ChangeEvent
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
-import { partsFromBreaks, splitParagraphs, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
+import { detectQuoteStyle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
@@ -17,7 +17,7 @@ import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruc
 import { buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
-import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
+import type { DismantleChapter, DismantleBook, DismantleAggregate, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
 import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
@@ -140,15 +140,28 @@ const buildReviewClusters = (items: LegacyReviewItem[], cards: Array<{ title: st
 
 const authorNotesDocumentTitle = '给作者｜待答';
 
+const reviewPerspectiveLabel = (perspective: string): string => ({
+  architect: '结构', character: '人物', prose: '文字', consistency: '一致性', solo: '综合', lint: '验证门',
+} as Record<string, string>)[perspective] || perspective;
+
 /**
  * 把模型这一章的【给作者】和审查意见追加进"给作者｜待答"文档（大纲页里能看，kind 复用审查报告）
  * 连续创作不为一句疑问停下来，作者有空再看；同一章重跑时先删掉这一章的旧条目，不堆重复
  */
-const appendAuthorNotes = (project: Project, number: number, chapterTitle: string, notes: string[], review?: AgentReviewResult): Project => {
+const appendAuthorNotes = (project: Project, number: number, chapterTitle: string, notes: string[], review?: AgentReviewResult, lintFindings: Array<{ type: string; severity: 'blocking' | 'advisory'; line: number; excerpt: string; message: string }> = [], newlyIntroduced: string[] = []): Project => {
+  // 验证门的 blocking 已经合并进审查 findings（source 记 lint），这里按 lintFindings 单独列，结构化项里就不再重复
+  const structured = (review?.findings || []).filter(item => (item.severity === 'S1' || item.severity === 'S2') && item.source !== 'lint');
   const items = [
     ...notes.map(note => `- ${note}`),
-    ...(review?.issues || []).map(issue => `- 审查指出：${issue}`),
-    ...(review?.suggestions || []).filter(item => !item.startsWith('审查未完成')).map(item => `- 审查建议：${item}`),
+    ...(structured.length
+      ? structured.map(item => `- 审查 ${item.severity}${item.location ? `｜${item.location}` : ''}：${item.issue}${item.fix ? `（${item.fix}）` : ''}`)
+      : [
+        ...(review?.issues || []).map(issue => `- 审查指出：${issue}`),
+        ...(review?.suggestions || []).filter(item => !item.startsWith('审查未完成')).map(item => `- 审查建议：${item}`),
+      ]),
+    ...(review?.nextChapterRisks || []).map(item => `- 下一章要接住：${item}`),
+    ...lintFindings.filter(item => item.severity === 'blocking').map(item => `- 验证门未改净｜第 ${item.line} 行｜${item.type}：${item.excerpt}`),
+    ...newlyIntroduced.map(item => `- 本章新出现，要不要建卡：${item}`),
   ];
   if (!items.length) return project;
   const now = new Date().toISOString();
@@ -175,8 +188,10 @@ const formatReviewReport = (number: number, chapterTitle: string, result: AgentR
   `# 审查报告｜第 ${number} 章 ${chapterTitle.replace(/^第\s*\d+\s*章\s*/u, '')}`,
   '',
   `- 审查时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
-  `- 结论：${result.consistent ? '与设定、前文一致' : '发现一致性问题'}${result.advances === false ? '；本章相对前文没有推进' : ''}`,
+  `- 结论：${result.verdict ? `${result.verdict}（${result.mode || 'lean'} 档）` : result.consistent ? '与设定、前文一致' : '发现一致性问题'}${result.advances === false ? '；本章相对前文没有推进' : ''}`,
   ...(result.progress ? [`- 推进到：${result.progress}`] : []),
+  ...(result.perspectives?.length ? [`- 视角：${result.perspectives.map(item => `${reviewPerspectiveLabel(item.perspective)} ${item.verdict}（${item.count}）`).join('，')}`] : []),
+  ...(result.rubric ? [`- 番茄六项：${Object.entries(result.rubric).map(([key, value]) => `${key} ${value}`).join('，')}`] : []),
   '',
   '## 问题',
   ...(result.issues.length ? result.issues.map((item, index) => `${index + 1}. ${item}`) : ['无']),
@@ -184,8 +199,19 @@ const formatReviewReport = (number: number, chapterTitle: string, result: AgentR
   '## 建议',
   ...(result.suggestions.length ? result.suggestions.map((item, index) => `${index + 1}. ${item}`) : ['无']),
   ...(result.repeatedEvents?.length ? ['', '## 重复写过的前文事件', ...result.repeatedEvents.map(item => `- ${item}`)] : []),
+  ...(result.nextChapterRisks?.length ? ['', '## 下一章要接住', ...result.nextChapterRisks.map(item => `- ${item}`)] : []),
   '',
 ].join('\n');
+
+interface AgentReviewFinding {
+  severity: 'S1' | 'S2' | 'S3' | 'S4';
+  category: string;
+  location: string;
+  evidence: string;
+  issue: string;
+  fix: string;
+  source: string;
+}
 
 interface AgentReviewResult {
   consistent: boolean;
@@ -197,6 +223,13 @@ interface AgentReviewResult {
   repeatedEvents?: string[];
   /** 审查提出一致性问题后，已按意见定点修订过一次（改的是同一篇正文，不是又写一遍） */
   revised?: boolean;
+  /** 三档审查的结构化结果；旧报告没有这些字段 */
+  mode?: 'full' | 'lean' | 'solo';
+  verdict?: 'APPROVE' | 'CONCERNS' | 'REJECT';
+  findings?: AgentReviewFinding[];
+  perspectives?: Array<{ perspective: string; verdict: string; count: number }>;
+  nextChapterRisks?: string[];
+  rubric?: Record<string, 'PASS' | 'FAIL'>;
 }
 
 interface AgentDraftResult {
@@ -207,6 +240,8 @@ interface AgentDraftResult {
   chapterPlan?: string;
   /** 模型写在末尾的【给作者】：拿不准的设定、想商量的走向 */
   authorNotes?: string[];
+  /** 本地验证门的结果：句式、标点、开头结尾同型、对话密度 */
+  lintFindings?: Array<{ type: string; severity: 'blocking' | 'advisory'; line: number; excerpt: string; message: string }>;
   prewriteCheck?: { blockers: string[]; warnings: string[]; summary: string };
   reviewResult?: AgentReviewResult;
   retrievedContext?: string[];
@@ -1167,6 +1202,7 @@ function App() {
   const [dismantleRewriteRunning, setDismantleRewriteRunning] = useState(false);
   const [dismantleRewriteInstruction, setDismantleRewriteInstruction] = useState('保留章节的冲突强度和推进节奏，重构为独立原创故事。');
   const [styleDistilling, setStyleDistilling] = useState(false);
+  const [dismantleAggregating, setDismantleAggregating] = useState(false);
   const [styleDraft, setStyleDraft] = useState<WritingStyle | null>(null);
   const [imitationSource, setImitationSource] = useState<{ bookId: string; chapterId?: string } | null>(null);
   const [skills, setSkills] = useState<Skill[]>(() => builtinSkills);
@@ -1500,6 +1536,11 @@ function App() {
   const [continuousCount, setContinuousCount] = useState(3);
   const [continuousWriting, setContinuousWriting] = useState<{ done: number; total: number; message: string } | null>(null);
   const continuousAbortRef = useRef(false);
+  /** 重写旧章：区间、方式（保事件换写法 / 从构思重来）与进度；和连续创作互斥，同一时间只跑一条写作链 */
+  const [rewriteRange, setRewriteRange] = useState<{ from: number; to: number } | null>(null);
+  const [rewriteMode, setRewriteMode] = useState<'keep' | 'redo'>('keep');
+  const [chapterRewrite, setChapterRewrite] = useState<{ done: number; total: number; message: string } | null>(null);
+  const rewriteAbortRef = useRef(false);
   const [outlineSessionId, setOutlineSessionId] = useState(() => loadSessionId('outline'));
   const [cardSessionId, setCardSessionId] = useState(() => loadSessionId('card'));
   const [outlineStreamContent, setOutlineStreamContent] = useState('');
@@ -2867,6 +2908,67 @@ function App() {
     setNotice({ title: '已带入仿写创建', content: '请补充目标小说的书名、简介和分类后创建。只会带入抽象细纲，不会复制原文。' });
   };
 
+  /**
+   * 拆书全书聚合：逐章拆解之上再做一次整书级提炼，产出文风档案（含原文锚点）、情绪模块、节奏表
+   * 文风档案另存一份 WritingStyle 供绑定；锚点、模块、节奏表留在拆书里，写作时按项目绑定的来源拆书召回
+   * 只用已经生成过章纲的章：没拆过的章只有原文，模型看不到结构就只能瞎编
+   */
+  const aggregateDismantleBook = async () => {
+    const book = dismantleBooks.find(item => item.id === activeDismantleBookId);
+    if (!book) return;
+    const analyzed = book.chapters.filter(chapter => chapter.detailedOutline.trim() || chapter.summary.trim());
+    if (analyzed.length < 3) {
+      setNotice({ title: '先生成几章章纲', content: `全书聚合要看逐章拆解，至少要有 3 章已生成章纲（现在 ${analyzed.length} 章）。` });
+      return;
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再做全书聚合。' });
+      return;
+    }
+    setDismantleAggregating(true);
+    try {
+      // 原文只送首中尾三章给模型挑锚点，其余章只送拆解结果：整本原文经 RPC 传一遍既慢又没用
+      const withText = book.chapters.filter(chapter => chapter.sourceContent.trim());
+      const samples = new Set([withText[0], withText[Math.floor(withText.length / 2)], withText[withText.length - 1]].filter(Boolean).map(chapter => chapter.id));
+      const result = await agentRpc<{ styleProfile?: string; anchors?: DismantleAggregate['anchors']; emotionModules?: DismantleAggregate['emotionModules']; rhythm?: string; chapterNumbers?: number[]; droppedAnchors?: number }>('book.aggregate', {
+          bookTitle: book.title,
+          chapters: book.chapters.map(chapter => ({ number: chapter.number, title: chapter.title, summary: chapter.summary, detailedOutline: chapter.detailedOutline, plotBeats: chapter.plotBeats, characterDynamics: chapter.characterDynamics, pacing: chapter.pacing, sourceContent: samples.has(chapter.id) ? chapter.sourceContent : '' })),
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim(),
+          model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+        });
+      const now = new Date().toISOString();
+      const aggregate: DismantleAggregate = {
+        styleProfile: result.styleProfile?.trim() || '',
+        anchors: Array.isArray(result.anchors) ? result.anchors : [],
+        emotionModules: Array.isArray(result.emotionModules) ? result.emotionModules : [],
+        rhythm: result.rhythm?.trim() || '',
+        chapterNumbers: Array.isArray(result.chapterNumbers) ? result.chapterNumbers : analyzed.map(chapter => chapter.number),
+        updatedAt: now,
+      };
+      if (!aggregate.styleProfile && !aggregate.anchors.length && !aggregate.emotionModules.length) throw new Error('智能体没有返回可用的聚合结果');
+      updateDismantleBook(book.id, current => ({ ...current, aggregate, updatedAt: now }));
+      // 文风档案带上原文锚点存成 WritingStyle：绑定到小说后，正文阶段能看到"这一段是怎么写的"
+      if (aggregate.styleProfile) {
+        const anchorsSection = aggregate.anchors.length
+          ? `\n\n## 原文锚点\n${aggregate.anchors.map(anchor => `### ${anchor.tone}${anchor.source ? `｜${anchor.source}` : ''}\n${anchor.point ? `${anchor.point}\n\n` : ''}${anchor.excerpt}`).join('\n\n')}`
+          : '';
+        const styleName = `${book.title}文风档案`;
+        const existing = writingStyles.find(style => style.sourceBookId === book.id && style.name === styleName);
+        const style = normalizeWritingStyle({
+          id: existing?.id || localResourceId('style'), name: styleName, description: `由《${book.title}》${aggregate.chapterNumbers.length} 章拆解聚合而成，含句长分布、对话技法与原文锚点`,
+          tags: ['文风', '对标'], content: `${aggregate.styleProfile}${anchorsSection}`, sourceBookId: book.id, createdAt: existing?.createdAt || now, updatedAt: now,
+        });
+        setWritingStyles(current => existing ? current.map(item => item.id === existing.id ? style : item) : [...current, style]);
+      }
+      setNotice({ title: '全书聚合完成', content: `${aggregate.emotionModules.length} 张情绪模块、${aggregate.anchors.length} 段原文锚点${result.droppedAnchors ? `（${result.droppedAnchors} 段不在原文里，已丢弃）` : ''}；文风档案已存进文风管理。把这本拆书绑定到小说后，写作时会按目标情绪召回。` });
+    } catch (error) {
+      setNotice({ title: '全书聚合失败', content: String(error) });
+    } finally {
+      setDismantleAggregating(false);
+    }
+  };
+
   const bindDismantleToProject = (bookId: string, projectId?: number) => {
     updateDismantleBook(bookId, book => ({ ...book, boundProjectId: projectId, updatedAt: new Date().toISOString() }));
     setProjects(current => current.map(project => project.id === projectId ? { ...project, sourceDismantleBookId: bookId, updatedAt: new Date().toISOString() } : project));
@@ -3897,6 +3999,33 @@ function App() {
     setNotice({ title: '章节目标已更新', content: `当前章节目标设为 ${target} 字，续写上限为 ${Math.floor(target * 1.2)} 字。` });
   };
 
+  /**
+   * 全书引号与停顿标点一次性统一
+   * 这本书的引号在直引号、弯引号、方括号之间漂了八次，正是番茄新规里"标点符号严重错乱"那一条；
+   * 每章先存快照再改，改动为零的章不动
+   */
+  const normalizeBookPunctuation = () => {
+    if (!editingProject) return;
+    const style = editingProject.quoteStyle || detectQuoteStyle(editingProject.chapters.map(chapter => chapter.content).join('\n')) || 'curly';
+    let changed = 0;
+    let unbalanced = 0;
+    const chapters = editingProject.chapters.map(chapter => {
+      if (!chapter.content.trim()) return chapter;
+      const quoted = normalizeQuotes(chapter.content, style);
+      const paused = normalizePauses(quoted.text);
+      unbalanced += quoted.unbalancedLines.length;
+      if (paused.text === chapter.content) return chapter;
+      changed += 1;
+      return { ...pushChapterSnapshot(chapter, '统一标点'), content: paused.text, wordCount: countNovelCharacters(paused.text), updatedAt: new Date().toISOString() };
+    });
+    if (!changed) {
+      setNotice({ title: '标点已经一致', content: `全书引号已是同一风格${unbalanced ? `；${unbalanced} 行引号未闭合，保持原样` : ''}。` });
+      return;
+    }
+    updateEditorProject(project => ({ ...project, chapters, quoteStyle: style, wordCount: chapters.reduce((sum, item) => sum + item.wordCount, 0), updatedAt: new Date().toISOString() }));
+    setNotice({ title: '全书标点已统一', content: `改了 ${changed} 章，旧版本都进了章节历史${unbalanced ? `；${unbalanced} 行引号未闭合，保持原样` : ''}。` });
+  };
+
   const updateCardStatesFromBook = async (cardId?: number) => {
     if (!editingProject) return;
     let searchProject = editingProject;
@@ -4631,7 +4760,7 @@ function App() {
    * 请求章节智能体写一章：本章没有章纲就先自动生成并绑定，再组装资料调 chapter.write
    * 单次运行与连续创作共用；返回带上新章纲的项目与已剥好标题的草稿，界面状态怎么落由调用方决定
    */
-  const requestChapterDraft = async (sourceProject: Project, chapter: Chapter, runId: string): Promise<{ project: Project; result: AgentDraftResult }> => {
+  const requestChapterDraft = async (sourceProject: Project, chapter: Chapter, runId: string, options: { instruction?: string; skipOutline?: boolean } = {}): Promise<{ project: Project; result: AgentDraftResult }> => {
     activeAgentRunRef.current = runId;
     setAgentError('');
     setAgentDraft(null);
@@ -4645,11 +4774,12 @@ function App() {
       : item));
     setAgentProgressPercent(1);
     setAgentProgressMessage('正在启动 Agent Runtime');
-    const { agentSkills, activeStyle } = resolveAgentSkillsAndStyle(sourceProject);
+    const { agentSkills, activeStyle, benchmark } = resolveAgentSkillsAndStyle(sourceProject);
     await invoke<string>('start_agent_runtime');
     // 懒人流程：先保证本章所在阶段有逐章节拍表，再保证本章有章纲；作者只管点一次运行
-    let project = await ensureStageBeats(sourceProject, chapter, runId);
-    if (!boundChapterOutlineFor(project, chapter)) {
+    // 保事件重写旧章时跳过：事件已经由原稿的记忆给定，再生成一份节拍表或章纲只会和它打架
+    let project = options.skipOutline ? sourceProject : await ensureStageBeats(sourceProject, chapter, runId);
+    if (!options.skipOutline && !boundChapterOutlineFor(project, chapter)) {
       const message = '本章还没有章纲，正在按总纲、故事账本和上一章自动生成';
       setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
       setAgentProgressPercent(current => Math.max(current, 2));
@@ -4660,12 +4790,13 @@ function App() {
     const chapterContext = buildChapterWriteContext({
       project,
       chapter,
-      instruction: agentInstruction,
+      instruction: options.instruction || agentInstruction,
       skills: agentSkills,
       preferredSkillNames: selectedAgentSkillNames,
       extraOutlineIds: selectedOutlineIds,
       selectedCardIds,
       writingStyle: activeStyle,
+      benchmark,
     });
     setAgentProgress(items => items.map(item => item.id === 'starting'
       ? { ...item, status: 'active', progress: Math.max(item.progress, 3), message: '运行环境已就绪，正在发送创作任务' }
@@ -4719,7 +4850,7 @@ function App() {
   };
 
   const runChapterAgent = async () => {
-    if (!editingProject || !activeChapter || agentRunning(agentStage) || continuousWriting) return;
+    if (!editingProject || !activeChapter || agentRunning(agentStage) || continuousWriting || chapterRewrite) return;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setAgentError('请先填写 API Saver Key');
       setAgentStage('error');
@@ -4806,7 +4937,9 @@ function App() {
       }
     }
     const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
-    return { agentSkills, activeStyle };
+    // 项目绑定的来源拆书做过全书聚合，写作时才有情绪模块与锚点可召回
+    const benchmark = project.sourceDismantleBookId ? dismantleBooks.find(book => book.id === project.sourceDismantleBookId)?.aggregate : undefined;
+    return { agentSkills, activeStyle, benchmark };
   };
 
   /**
@@ -4840,7 +4973,7 @@ function App() {
     });
   };
 
-  /** 审查报告落盘：存成一份大纲文档（大纲页里能直接打开看，下次加载不会丢） */
+  /** 审查报告落盘：存成一份大纲文档（大纲页里能直接打开看，下次加载不会丢）；验证门结果已由运行时合并进报告的问题与建议 */
   const saveLegacyReviewReport = async (project: Project, chapter: Chapter, result: AgentReviewResult) => {
     const now = new Date().toISOString();
     const number = project.chapters.findIndex(item => item.id === chapter.id) + 1;
@@ -4974,7 +5107,8 @@ function App() {
       ...(sharedNote.trim() ? [`本次统一口径（所有选中章都必须照这条改，改法保持一致）：\n${sharedNote.trim()}`, ''] : []),
       '按以下一致性审查意见修订本章，逐条落到正文里；意见没点到的地方保持原样：',
       ...item.issues.map((text, index) => `${index + 1}. ${text}`),
-      ...(item.suggestions.length ? ['', '审查给出的修改建议（按它改，不要另起主意）：', ...item.suggestions.map(text => `- ${text}`)] : []),
+      // S4 是读感提示（碎句、长段、比喻密度），不进修订指令：让模型按几十条提示改整章，改出来的又是一篇平的
+      ...(item.suggestions.filter(text => !text.startsWith('S4')).length ? ['', '审查给出的修改建议（按它改，不要另起主意）：', ...item.suggestions.filter(text => !text.startsWith('S4')).map(text => `- ${text}`)] : []),
     ].join('\n');
     setReviseStates(current => ({ ...current, [item.number]: { status: 'running', message: '修订中', startedAt: Date.now() } }));
     try {
@@ -5025,7 +5159,7 @@ function App() {
    */
   const runContinuousWriting = async () => {
     const start = editingProjectRef.current;
-    if (!start || agentRunning(agentStage) || continuousWriting) return;
+    if (!start || agentRunning(agentStage) || continuousWriting || chapterRewrite) return;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setNotice({ title: '无法连续创作', content: '请先在设置里填写模型 API Key。' });
       return;
@@ -5073,7 +5207,7 @@ function App() {
         const applied = applyAgentDraft(drafted.project, inserted.chapter, drafted.result.draftContent, applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''), drafted.result.summary);
         project = applied.project;
         // 模型的疑问汇总到一份"给作者｜待答"文档里，写作不中断，作者有空再看
-        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.authorNotes || [], drafted.result.reviewResult);
+        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.authorNotes || [], drafted.result.reviewResult, drafted.result.lintFindings || []);
         setActiveChapter(applied.chapter);
         setAgentDraft(null);
         setAgentDisplayContent('');
@@ -5082,6 +5216,9 @@ function App() {
         setContinuousWriting({ done: done + 1, total, message: `第 ${number} 章：正文已采用，正在提炼记忆` });
         try {
           project = await refineChapterMemory(project, applied.chapter);
+          // 记忆提炼出的"本章新出现"进待答文档：要不要建卡由作者定，不自动生成卡片
+          const introduced = project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || [];
+          if (introduced.length) project = appendAuthorNotes(project, number, applied.chapter.title, [], undefined, [], introduced);
           await applyProjectChange(project);
         } catch (error) {
           // 额度用尽就别再往下撞了；其他失败只影响下一章的承接质量，正文已经保住
@@ -5095,6 +5232,108 @@ function App() {
     }
     setContinuousWriting(null);
     setNotice({ title: '连续创作结束', content: `已写 ${done} 章${stopReason ? `；${stopReason}` : ''}。` });
+  };
+
+  /**
+   * 保事件重写的指令：原稿的事件、时间线、人物变化、章末落点当作本章必须发生的事，只换写法
+   * 事件来自本章记忆；没提炼过记忆的章退回本地摘要，至少把发生了什么说清
+   */
+  const keepEventsInstruction = (project: Project, chapter: Chapter, number: number): string => {
+    const memory = project.memories.find(item => item.chapterId === chapter.id);
+    const summary = memory?.summary?.trim() || buildLocalChapterSummary(chapter.content);
+    return [
+      `重写第 ${number} 章：事件不变，写法全换。下面是原稿已经发生的事，都要保留（顺序可调、可加细节，不加新事件，不写原稿没有的人物）：`,
+      `- 本章大意：${summary}`,
+      ...(memory?.timelineEvents || []).map(item => `- 时间线：${item}`),
+      ...(memory?.characterStateChanges || []).map(item => `- 人物：${item}`),
+      ...(memory?.relationshipState || []).map(item => `- 关系：${item}`),
+      ...(memory?.endingHook?.trim() ? [`- 结尾落点：${memory.endingHook.trim()}`] : []),
+      '',
+      agentInstruction.trim(),
+    ].join('\n');
+  };
+
+  /**
+   * 重写旧章：按新流程（构思、正文、验证门、审查、记忆）把已有的章逐章重写一遍
+   * 保事件：原稿记忆里的事当硬目标，跳过节拍表与章纲生成；从构思重来：原稿作废，走和写新章一样的懒人流程
+   * 每章旧稿进章节历史，重写完立刻提炼记忆，下一章按新记忆承接；逐章串行，停止在本章写完后生效
+   */
+  const runChapterRewrite = async () => {
+    const start = editingProjectRef.current;
+    if (!start || agentRunning(agentStage) || continuousWriting || chapterRewrite) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '无法重写旧章', content: '请先在设置里填写模型 API Key。' });
+      return;
+    }
+    const range = rewriteRange ?? { from: start.chapters.length, to: start.chapters.length };
+    const from = Math.max(1, Math.min(range.from, range.to));
+    const to = Math.min(start.chapters.length, Math.max(range.from, range.to));
+    if (from > to) {
+      setNotice({ title: '无法重写旧章', content: '区间超出正文范围。' });
+      return;
+    }
+    const total = to - from + 1;
+    rewriteAbortRef.current = false;
+    setChapterRewrite({ done: 0, total, message: '准备重写' });
+    let project = start;
+    let done = 0;
+    let stopReason = '';
+    try {
+      for (let number = from; number <= to; number += 1) {
+        if (rewriteAbortRef.current) {
+          stopReason = '作者点了停止';
+          break;
+        }
+        const chapter = project.chapters[number - 1];
+        if (!chapter) break;
+        setActiveChapter(chapter);
+        setChapterRewrite({ done, total, message: `第 ${number} 章：${rewriteMode === 'keep' ? '保事件重写' : '从构思重来'}` });
+        const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const drafted = await requestChapterDraft(project, chapter, runId, rewriteMode === 'keep'
+          ? { instruction: keepEventsInstruction(project, chapter, number), skipOutline: true }
+          : { instruction: `重写第 ${number} 章：原稿作废，从构思重来，按总纲、故事账本和上一章重新安排这一章发生的事。\n${agentInstruction.trim()}` });
+        if (!drafted.result.draftContent?.trim()) throw new Error(`第 ${number} 章没有生成出正文`);
+        const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
+        const actual = countNovelCharacters(drafted.result.draftContent);
+        // 明显残缺的稿不覆盖原稿：留成草稿让作者看，原文一个字不动
+        if (actual < target * 0.5) {
+          project = drafted.project;
+          await applyProjectChange(project);
+          setAgentDraft(drafted.result);
+          setAgentDisplayContent(drafted.result.draftContent);
+          setAgentDraftTitle(applyDraftChapterTitle(chapter.title, drafted.result.chapterTitle || '', { overwrite: rewriteMode === 'redo' }));
+          await finishAgentRun(`第 ${number} 章重写稿明显过短，已保留待处理草稿`);
+          stopReason = `第 ${number} 章重写稿只有 ${actual} 字（目标 ${target} 字），可能被截断，草稿已保留，原稿未动`;
+          break;
+        }
+        // 保事件时章名照旧；从构思重来事件变了，章名跟着重写稿走
+        const title = applyDraftChapterTitle(chapter.title, drafted.result.chapterTitle || '', { overwrite: rewriteMode === 'redo' });
+        const applied = applyAgentDraft(drafted.project, chapter, drafted.result.draftContent, title, drafted.result.summary);
+        project = applied.project;
+        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.authorNotes || [], drafted.result.reviewResult, drafted.result.lintFindings || []);
+        setActiveChapter(applied.chapter);
+        setAgentDraft(null);
+        setAgentDisplayContent('');
+        await finishAgentRun(`第 ${number} 章已重写并写入`);
+        await applyProjectChange(project);
+        done += 1;
+        setChapterRewrite({ done, total, message: `第 ${number} 章：已写入，正在提炼记忆` });
+        try {
+          project = await refineChapterMemory(project, applied.chapter);
+          const introduced = project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || [];
+          if (introduced.length) project = appendAuthorNotes(project, number, applied.chapter.title, [], undefined, [], introduced);
+          await applyProjectChange(project);
+        } catch (error) {
+          if (isQuotaExceededError(error)) throw error;
+          setNotice({ title: `第 ${number} 章记忆未提炼`, content: `${String(error)}。重写稿已保存，下一章只能靠本章摘要承接。` });
+        }
+      }
+    } catch (error) {
+      failAgentRun(error);
+      stopReason = `出错：${String(error)}`;
+    }
+    setChapterRewrite(null);
+    setNotice({ title: '重写旧章结束', content: `已重写 ${done}/${total} 章${stopReason ? `；${stopReason}` : ''}。每章旧稿都在章节历史里，可逐章回退。` });
   };
 
   const acceptAgentDraft = () => {
@@ -6513,6 +6752,28 @@ function App() {
                     <input id="chapter-target-words" className="input" type="number" min="200" step="100" value={chapterTargetWordsDraft} onChange={event => setChapterTargetWordsDraft(event.target.value)} onBlur={updateChapterTargetWords} />
                     <span>字</span>
                   </div>
+                  <div className="chapter-target-row">
+                    <label htmlFor="review-mode">审查档位</label>
+                    <select id="review-mode" className="select" value={editingProject.reviewMode || 'lean'} onChange={event => updateEditorProject(project => ({ ...project, reviewMode: event.target.value as Project['reviewMode'], updatedAt: new Date().toISOString() }))}>
+                      <option value="lean">lean · 结构 + 一致性</option>
+                      <option value="full">full · 加人物与文字视角</option>
+                      <option value="solo">solo · 一次合并审查</option>
+                    </select>
+                  </div>
+                  <div className="chapter-target-row">
+                    <label htmlFor="quote-style">引号风格</label>
+                    <select id="quote-style" className="select" value={editingProject.quoteStyle || ''} onChange={event => updateEditorProject(project => ({ ...project, quoteStyle: (event.target.value || undefined) as Project['quoteStyle'], updatedAt: new Date().toISOString() }))}>
+                      <option value="">按已有正文</option>
+                      <option value="curly">“中文弯引号”</option>
+                      <option value="corner">「方括引号」</option>
+                      <option value="ascii">"直引号"</option>
+                    </select>
+                    <button className="btn-secondary" onClick={normalizeBookPunctuation}>全书统一</button>
+                  </div>
+                  <details className="chapter-target-row">
+                    <summary>允许的句式（验证门不报）</summary>
+                    <textarea className="input" rows={3} placeholder="一行一句原文片段，例如：声音不大，却" value={(editingProject.allowedPhrases || []).join('\n')} onChange={event => updateEditorProject(project => ({ ...project, allowedPhrases: event.target.value.split(/\r?\n/u).map(line => line.trim()).filter(Boolean).slice(0, 60), updatedAt: new Date().toISOString() }))} />
+                  </details>
                   <div className="chapter-jump-row">
                     <input
                       className="input"
@@ -7234,14 +7495,23 @@ function App() {
                     <textarea className="agent-draft-preview" value={agentDisplayContent || agentDraft.draftContent} onChange={(event) => { setAgentDisplayContent(event.target.value); setAgentDraft({ ...agentDraft, draftContent: event.target.value }); }} />
                     {agentDraft.summary && <p className="agent-summary">{agentDraft.summary}</p>}
                     {agentDraft.reviewResult && (
-                      <div className={`agent-review ${agentDraft.reviewResult.consistent && agentDraft.reviewResult.advances !== false ? 'passed' : 'warning'}`}>
-                        <strong>{agentDraft.reviewResult.consistent ? '一致性审查通过' : '发现一致性问题'}{agentDraft.reviewResult.advances === false ? ' · 本章没有推进主线' : ''}{agentDraft.reviewResult.revised ? ' · 已按审查意见修订' : ''}</strong>
+                      <div className={`agent-review ${agentDraft.reviewResult.verdict === 'APPROVE' || (!agentDraft.reviewResult.verdict && agentDraft.reviewResult.consistent && agentDraft.reviewResult.advances !== false) ? 'passed' : 'warning'}`}>
+                        <strong>{agentDraft.reviewResult.verdict ? `审查 ${agentDraft.reviewResult.verdict}（${agentDraft.reviewResult.mode || 'lean'}）` : agentDraft.reviewResult.consistent ? '一致性审查通过' : '发现一致性问题'}{agentDraft.reviewResult.advances === false ? ' · 本章没有推进主线' : ''}{agentDraft.reviewResult.revised ? ' · 已按审查意见修订' : ''}</strong>
+                        {agentDraft.reviewResult.perspectives?.length ? <p>{agentDraft.reviewResult.perspectives.map(item => `${reviewPerspectiveLabel(item.perspective)} ${item.verdict}（${item.count}）`).join(' · ')}</p> : null}
+                        {agentDraft.reviewResult.rubric && <p>番茄六项：{Object.entries(agentDraft.reviewResult.rubric).map(([key, value]) => `${key} ${value === 'FAIL' ? '✗' : '✓'}`).join('，')}</p>}
                         {agentDraft.reviewResult.progress && <p>推进：{agentDraft.reviewResult.progress}</p>}
                         {(agentDraft.reviewResult.repeatedEvents || []).map(event => <p key={`repeat-${event}`}>重复前文：{event}</p>)}
                         {agentDraft.reviewResult.issues.map(issue => <p key={issue}>{issue}</p>)}
                         {agentDraft.reviewResult.suggestions.map(suggestion => <p key={suggestion}>建议：{suggestion}</p>)}
+                        {agentDraft.reviewResult.nextChapterRisks?.length ? <p>下一章要接住：{agentDraft.reviewResult.nextChapterRisks.join('；')}</p> : null}
                       </div>
                     )}
+                    {agentDraft.lintFindings?.length ? (
+                      <details className="agent-chapter-plan">
+                        <summary>验证门 {agentDraft.lintFindings.filter(item => item.severity === 'blocking').length} 条须改 · {agentDraft.lintFindings.filter(item => item.severity === 'advisory').length} 条提示</summary>
+                        <div className="agent-plan-content">{agentDraft.lintFindings.map((item, index) => <p key={`${item.type}-${item.line}-${index}`}>{item.severity === 'blocking' ? '须改' : '提示'}｜第 {item.line} 行｜{item.type}：{item.message}{item.excerpt ? `（${item.excerpt}）` : ''}</p>)}</div>
+                      </details>
+                    ) : null}
                     {agentDraft.authorNotes?.length ? (
                       <div className="agent-review warning">
                         <strong>模型给作者的话</strong>
@@ -7423,12 +7693,21 @@ function App() {
               </aside>
               {activeDismantleBook && <section className="dismantle-detail">
                 <header className="dismantle-detail-header"><div><span>拆书资料</span><h3>{activeDismantleBook.title}</h3><small>{activeDismantleBook.chapters.length} 章 · {activeDismantleBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="dismantle-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_dismantle_location', { bookTitle: activeDismantleBook.title }).catch(error => setNotice({ title: '打开拆书位置失败', content: String(error) }))}>打开位置</button><button className="link-button danger-link" onClick={() => void deleteDismantleBook(activeDismantleBook)}>删除</button></div></header>
-                <div className="dismantle-detail-toolbar"><label>绑定目标小说<select className="select" value={activeDismantleBook.boundProjectId?.toString() || ''} onChange={event => bindDismantleToProject(activeDismantleBook.id, event.target.value ? Number(event.target.value) : undefined)}><option value="">暂不绑定</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label><button className="btn-secondary" onClick={() => startDismantleImitation(activeDismantleBook)}>一键仿写此书</button><button className="btn-secondary" disabled={styleDistilling} onClick={() => void distillDismantleStyle()}>{styleDistilling ? '蒸馏中...' : '蒸馏文风 Skill'}</button><button className="btn-primary" disabled={Boolean(dismantleRunningIds.length)} onClick={() => void runDismantleAnalysis()}>{dismantleRunningIds.length ? `分析中 ${dismantleRunningIds.length} 章` : `生成选中章纲（${selectedDismantleChapterIds.length}）`}</button></div>
+                <div className="dismantle-detail-toolbar"><label>绑定目标小说<select className="select" value={activeDismantleBook.boundProjectId?.toString() || ''} onChange={event => bindDismantleToProject(activeDismantleBook.id, event.target.value ? Number(event.target.value) : undefined)}><option value="">暂不绑定</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label><button className="btn-secondary" onClick={() => startDismantleImitation(activeDismantleBook)}>一键仿写此书</button><button className="btn-secondary" disabled={styleDistilling} onClick={() => void distillDismantleStyle()}>{styleDistilling ? '蒸馏中...' : '蒸馏文风 Skill'}</button><button className="btn-secondary" disabled={dismantleAggregating} onClick={() => void aggregateDismantleBook()}>{dismantleAggregating ? '聚合中...' : activeDismantleBook.aggregate ? '重新全书聚合' : '全书聚合'}</button><button className="btn-primary" disabled={Boolean(dismantleRunningIds.length)} onClick={() => void runDismantleAnalysis()}>{dismantleRunningIds.length ? `分析中 ${dismantleRunningIds.length} 章` : `生成选中章纲（${selectedDismantleChapterIds.length}）`}</button></div>
                 <div className="dismantle-detail-body" style={{ ['--pane-dismantle-chapters' as string]: `${panes.sizes.dismantleChapters}px` }}>
                   <PaneResizer name="dismantleChapters" axis="x" label="拖动调整章节列表宽度，双击复位" controller={panes} />
                   <div className="dismantle-chapter-list"><div className="dismantle-list-heading"><strong>章节选择</strong><button className="link-button" onClick={() => setSelectedDismantleChapterIds(activeDismantleBook.chapters.map(chapter => chapter.id))}>全选</button><button className="link-button" onClick={() => setSelectedDismantleChapterIds([])}>清空</button></div>{activeDismantleBook.chapters.map(chapter => <label key={chapter.id} className={`dismantle-chapter-row ${chapter.id === activeDismantleChapterId ? 'active' : ''}`}><input type="checkbox" checked={selectedDismantleChapterIds.includes(chapter.id)} onChange={() => setSelectedDismantleChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><button type="button" onClick={() => setActiveDismantleChapterId(chapter.id)}><strong>第 {chapter.number} 章</strong><span>{chapter.title}</span><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.status === 'rewritten' ? '已改写' : chapter.status === 'analyzed' ? '已分析' : chapter.status === 'analyzing' ? '分析中' : '待分析'}</small></button></label>)}</div>
                   {activeDismantleChapter && <article className="dismantle-chapter-editor"><div className="dismantle-chapter-heading"><div><span>第 {activeDismantleChapter.number} 章</span><h4>{activeDismantleChapter.title}</h4></div><button className="btn-secondary" onClick={() => void runDismantleRewrite()} disabled={dismantleRewriteRunning || !activeDismantleChapter.detailedOutline.trim()}>{dismantleRewriteRunning ? '原创生成中...' : '根据章纲生成原创稿'}</button></div><div className="dismantle-analysis-grid"><div><strong>剧情摘要</strong><textarea value={activeDismantleChapter.summary} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, summary: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="分析后显示剧情摘要" /></div><div><strong>节奏判断</strong><textarea value={activeDismantleChapter.pacing} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, pacing: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="开场、发展、转折、收束" /></div></div><label className="dismantle-outline-field"><strong>章节细纲（可人工修改）</strong><textarea value={activeDismantleChapter.detailedOutline} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, detailedOutline: event.target.value, status: event.target.value.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="选择章节后点击生成章纲" /></label><details className="dismantle-source-details"><summary>查看原文（只读）</summary><pre>{activeDismantleChapter.sourceContent}</pre></details><label className="dismantle-outline-field"><strong>原创改写稿（确认前可编辑）</strong><textarea value={activeDismantleChapter.rewriteContent} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, rewriteContent: event.target.value, status: event.target.value.trim() ? 'rewritten' : item.detailedOutline.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="AI 生成后可人工修改，确认后生成到目标小说" /></label><div className="dismantle-rewrite-footer"><input className="input" value={dismantleRewriteInstruction} onChange={event => setDismantleRewriteInstruction(event.target.value)} placeholder="原创改写要求（可选）" />{activeDismantleBook.boundProjectId && <button className="btn-primary" onClick={() => void generateDismantleChapter()}>确认并生成目标章节</button>}</div></article>}
                 </div>
+                {activeDismantleBook.aggregate && <details className="dismantle-aggregate">
+                  <summary>全书聚合 · {activeDismantleBook.aggregate.emotionModules.length} 张情绪模块 · {activeDismantleBook.aggregate.anchors.length} 段原文锚点 · 基于 {activeDismantleBook.aggregate.chapterNumbers.length} 章 · {new Date(activeDismantleBook.aggregate.updatedAt).toLocaleString('zh-CN', { hour12: false })}</summary>
+                  <div className="dismantle-aggregate-body">
+                    {activeDismantleBook.aggregate.emotionModules.length > 0 && <section><strong>情绪模块（借情绪链与功能位，人物场景道具触发条件全换）</strong>{activeDismantleBook.aggregate.emotionModules.map(module => <article key={module.id || module.name}><b>{module.id ? `${module.id} ` : ''}{module.name}{module.tone ? ` · ${module.tone}` : ''}</b><p>读者要：{module.readerNeed}</p><p>触发：{module.trigger}</p><p>戏剧单元：{module.arc}</p><p>可换：{module.replaceable}</p><p>复现时必须换掉：{module.antiCopy}</p></article>)}</section>}
+                    {activeDismantleBook.aggregate.anchors.length > 0 && <section><strong>原文锚点（写作时按目标情绪只带一段）</strong>{activeDismantleBook.aggregate.anchors.map((anchor, index) => <details key={`${anchor.tone}-${index}`}><summary>{anchor.tone}{anchor.source ? ` · ${anchor.source}` : ''}{anchor.point ? ` · ${anchor.point}` : ''}</summary><pre>{anchor.excerpt}</pre></details>)}</section>}
+                    {activeDismantleBook.aggregate.rhythm && <section><strong>节奏表</strong><pre>{activeDismantleBook.aggregate.rhythm}</pre></section>}
+                    {activeDismantleBook.aggregate.styleProfile && <section><strong>文风档案（已存进文风管理，可绑定到小说）</strong><pre>{activeDismantleBook.aggregate.styleProfile}</pre></section>}
+                  </div>
+                </details>}
               </section>}
             </div>}
           </div>
@@ -8187,6 +8466,22 @@ function App() {
                     : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runContinuousWriting()}>新建并连续创作</button>}
                 </div>
                 <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '每章自动：新建章节、生成章纲（总纲没有逐章条目时先规划一段节拍表，存在大纲页可改）、构思、写正文、采用、提炼记忆，再接着写下一章；模型拿不准的事记进大纲页的「给作者｜待答」，不打断写作。写满章数、写到总纲按卷写明的末章、正文明显残缺、出错或点停止为止。'}</p>
+              </div>
+          </section>
+          <section className="agent-task-section">
+              <div className="agent-card-picker">
+                <div className="agent-card-picker-title"><span>重写旧章</span><small>{chapterRewrite ? `已重写 ${chapterRewrite.done}/${chapterRewrite.total} 章` : '把已有的章按新流程重写一遍：构思、正文、验证门、审查、记忆全走'}</small></div>
+                <div className="ai-writing-tool-actions writing-console-range">
+                  {(() => { const range = rewriteRange ?? { from: editingProject.chapters.length, to: editingProject.chapters.length }; return <>
+                    <label className="writing-console-range-field">从第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={range.from} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteRange({ ...range, from: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                    <label className="writing-console-range-field">到第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={range.to} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteRange({ ...range, to: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                  </>; })()}
+                  <label className="writing-console-range-field">方式 <select className="select" value={rewriteMode} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteMode(event.target.value as 'keep' | 'redo')}><option value="keep">保事件换写法</option><option value="redo">从构思重来</option></select></label>
+                  {chapterRewrite
+                    ? <button className="btn-secondary" onClick={() => { rewriteAbortRef.current = true; }}>{rewriteAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
+                    : <button className="btn-primary" disabled={agentRunning(agentStage) || Boolean(continuousWriting) || !editingProject.chapters.length} onClick={() => void runChapterRewrite()}>开始重写</button>}
+                </div>
+                <p className="empty-hint compact">{chapterRewrite ? chapterRewrite.message : '保事件：原稿记忆里的事件、时间线、人物变化、章末落点当作本章必须发生的事，只换写法，不生成新章纲；从构思重来：原稿作废，按总纲、故事账本和上一章重新构思，和写新章一样。每章旧稿进章节历史，重写完立刻提炼记忆，下一章按新记忆承接。逐章串行，中途可停。'}</p>
               </div>
           </section>
           <section className="agent-task-section">

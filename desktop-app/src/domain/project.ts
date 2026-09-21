@@ -71,6 +71,14 @@ export interface ChapterMemory {
   conflicts: string[];
   /** 人物关系与情绪：谁对谁是什么态度、这一章两人之间变了什么；感情线靠它承接，只记事务的记忆写不出感情 */
   relationshipState?: string[];
+  /** 本章读者新知道的事：一致性审查用它查有没有泄底 */
+  readerKnown?: string[];
+  /** 本章埋下但读者还不知道的真相：进账本的"作者真相"，不进正文提示词的读者视图 */
+  authorTruth?: string[];
+  /** 本章结尾对下一章的承诺：下一章构思要回应它，一致性审查查兑现 */
+  nextChapterPromise?: string;
+  /** 本章新出现的具名人物、地点、物件、规则：收编进卡片候选 */
+  newlyIntroduced?: string[];
   endingHook: string;
   sourceChapterNumber?: number;
   createdAt: string;
@@ -173,6 +181,12 @@ export interface Project {
   styleProfileId?: string;
   sourceDismantleBookId?: string;
   authorPreferences?: string[];
+  /** 审查档位：full 四视角、lean 两视角、solo 一次合并审查；缺省 lean */
+  reviewMode?: 'full' | 'lean' | 'solo';
+  /** 全书引号风格；验证门把每章统一到它。缺省按已有正文侦测 */
+  quoteStyle?: 'curly' | 'corner' | 'ascii';
+  /** 作者允许的字面句式（一行一个）：验证门命中它们时不报风格类问题 */
+  allowedPhrases?: string[];
   githubRepositoryUrl?: string;
   /** 每日码字量，键为本地日期 YYYY-MM-DD */
   dailyWords?: Record<string, number>;

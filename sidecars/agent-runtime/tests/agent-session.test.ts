@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendAgentSession, renderAgentSession, type AgentSessionState } from "../src/application/runtime-state.js";
+import { appendAgentSession, normalizeMemoryResult, renderAgentSession, type AgentSessionState } from "../src/application/runtime-state.js";
 
 const emptySession = (): AgentSessionState => ({ version: 1, summary: "", recentTurns: [] });
 
@@ -29,5 +29,25 @@ describe("agent session", () => {
   it("会话结论标明作者未必采用，避免模型把它当成已确认事实", () => {
     const session = appendAgentSession(emptySession(), "继续写第 12 章", "写成了门前对峙。", 128, 0, "chapter:12").state;
     expect(renderAgentSession(session)).toContain("作者未必采用");
+  });
+});
+
+describe("memory result normalization", () => {
+  // 2026-09-20 起记忆提炼多了四个字段：读者已知、作者真相、下一章承诺、本章新增；中英文键名都要认
+  it("normalizeMemoryResult 收下读者已知、作者真相、下一章承诺与本章新增，缺省为空", () => {
+    const result = normalizeMemoryResult(JSON.stringify({
+      summary: "守夜人出现。",
+      readerKnown: ["守夜人认识母亲"],
+      作者真相: ["守夜人就是父亲"],
+      next_chapter_promise: " 天亮前灯塔见 ",
+      newlyIntroduced: ["灯塔地下室", ""],
+    }));
+    expect(result.readerKnown).toEqual(["守夜人认识母亲"]);
+    expect(result.authorTruth).toEqual(["守夜人就是父亲"]);
+    expect(result.nextChapterPromise).toBe("天亮前灯塔见");
+    expect(result.newlyIntroduced).toEqual(["灯塔地下室"]);
+    const empty = normalizeMemoryResult(JSON.stringify({ summary: "只有摘要。" }));
+    expect(empty.readerKnown).toEqual([]);
+    expect(empty.nextChapterPromise).toBe("");
   });
 });

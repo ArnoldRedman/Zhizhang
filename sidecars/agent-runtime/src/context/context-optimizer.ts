@@ -855,7 +855,13 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
   }
   const olderBlock = titles.length ? `更早的章节（只列标题，事件以记忆文档与总纲为准）：${titles.reverse().join("、")}` : "";
   const eventsBlock = events.length ? `已发生事件（近期章节一章一行，这些已经写过了）：\n${events.join("\n")}` : "";
-  return [header, gapNote, olderBlock, eventsBlock, foreshadowingBlock].filter(Boolean).join("\n\n");
+  // 上一章留下的承诺与作者真相：承诺是本章开头必须接住的事；作者真相是读者还不知道的底，写作时只能当背景压着，不能让角色说出来
+  const latest = ordered[ordered.length - 1];
+  const promise = latest ? leadText(String(latest.nextChapterPromise || ""), 240) : "";
+  const promiseBlock = promise ? `上一章留给本章的事（下一章承诺）：${promise}` : "";
+  const truths = ordered.slice(-6).flatMap(memory => compactList(memory.authorTruth, 3, 160).map(text => `- ${chapterLabel(memory)}：${text}`));
+  const truthBlock = truths.length ? `作者真相（读者还不知道的底，角色不能提前说破）：\n${truths.slice(-6).join("\n")}` : "";
+  return [header, gapNote, olderBlock, eventsBlock, promiseBlock, foreshadowingBlock, truthBlock].filter(Boolean).join("\n\n");
 }
 
 /**

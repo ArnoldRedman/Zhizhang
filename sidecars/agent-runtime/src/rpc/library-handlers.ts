@@ -170,6 +170,67 @@ ${source}
       return { summary: "", detailedOutline: response.content.trim(), plotBeats: [], characterDynamics: [], setupPayoff: [], pacing: "" };
     }
   })
+  /**
+   * 拆书全书聚合：逐章拆解之上再做一次整书级提炼
+   * 参考 oh-story 拆文的 Stage 3～6：文风档案（含原文锚点）、情绪模块、节奏表。
+   * 句长分布本地算，不让模型数；原文锚点由模型挑段，落盘前按原文精确回查，挑不到原文里的一律丢掉
+   */
+  .register("book.aggregate", async params => {
+    const { bookTitle, chapters, contextWindow } = params;
+    const list = Array.isArray(chapters) ? chapters.filter(item => item && typeof item === "object") as Array<Record<string, unknown>> : [];
+    if (!list.length) throw new Error("没有可聚合的章节：先给这本书生成几章章纲");
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
+    const analyzed = list.filter(item => String(item.summary || "").trim() || String(item.detailedOutline || "").trim());
+    const summaries = compactText(analyzed.map(item => `### 第 ${Number(item.number) || 0} 章 ${compactText(item.title || "", 60)}\n摘要：${compactText(item.summary || "", 400)}\n节拍：${stringList(item.plotBeats, 8).join("；")}\n人物：${stringList(item.characterDynamics, 6).join("；")}\n节奏：${compactText(item.pacing || "", 200)}`).join("\n\n"), Math.min(contextBudgetBytes(Number(contextWindow) || undefined, 60, 24), 48_000));
+    // 文风采样：首中尾各一章正文，本地算句长分布；原文全量给模型挑锚点太贵，只给这三章
+    const withText = list.filter(item => String(item.sourceContent || "").trim());
+    const picks = [withText[0], withText[Math.floor(withText.length / 2)], withText[withText.length - 1]].filter((item, index, array) => item && array.indexOf(item) === index);
+    const sampleText = picks.map(item => `### 第 ${Number(item.number) || 0} 章 ${compactText(item.title || "", 60)}\n${compactText(item.sourceContent || "", 9000)}`).join("\n\n");
+    const stats = sentenceStats(picks.map(item => String(item.sourceContent || "")).join("\n"));
+    const prompt = `你是网文结构分析师。下面是《${String(bookTitle || "参考作品")}》的逐章拆解摘要和三章原文样本。请做一次整书级提炼，供另一本书写作时"对标"用。对标只借情绪链、功能位与写法，不借人物、场景、道具、专名和句子。
+
+## 逐章摘要
+${summaries || "（无）"}
+
+## 三章原文样本
+${sampleText || "（无）"}
+
+## 本地统计（已算好，直接引用）
+${stats}
+
+只返回 JSON：
+{
+  "styleProfile": "Markdown 文风档案：## 整体语感（句长分布引用上面的统计、标点习惯、段落节奏）/ ## 对话技法（潜台词模式、对话标签习惯、角色语气区分）/ ## 情绪交替模式（章内基调切换、跨章周期）/ ## 可借鉴技巧（五条，各配一个本书例子）/ ## 分层模仿建议（能直接学的、要换壳的、不要学的）",
+  "anchors": [{"tone":"紧张|轻松|悲伤|热血|爽|甜|温馨|压抑","source":"第几章","point":"这一段示范了什么手法","excerpt":"原文里连续的 300～500 字，逐字照抄，不改一个字"}],
+  "emotionModules": [{"id":"EM-001","name":"模块名","readerNeed":"读者在这里想要什么","trigger":"什么事触发","arc":"前状态 → 触发 → 后状态","replaceable":"哪些要素可以换（人物、场景、道具、触发条件）","antiCopy":"复现时必须换掉什么，否则就是套壳","tone":"基调"}],
+  "rhythm": "Markdown 表格：| 关键信息 | 首次出现 | 扩写技法 | 情绪触动点 | 爆发或冷却 |，八到十五行"
+}
+anchors 三到五段，基调各不相同；emotionModules 三到六张。`;
+    const response = await client.chat([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, temperature: 0.3, max_tokens: 9000, retryAttempts: 2 });
+    const parsed = JSON.parse(response.content.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "")) as Record<string, unknown>;
+    // 模型只看过这三章样本，锚点也只能出自这三章：拿全书去比会把模型凭记忆复述的段落当成原文放过
+    const corpus = picks.map(item => String(item.sourceContent || "").replace(/\s+/gu, "")).join("\n");
+    const anchors = (Array.isArray(parsed.anchors) ? parsed.anchors : []).flatMap(item => {
+      const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const excerpt = String(entry.excerpt || "").trim();
+      // 锚点必须真在原文里：模型偶尔"复述"一段当原文，那种锚点会把别人的句子当成范本教给写手
+      if (excerpt.length < 120 || !corpus.includes(excerpt.replace(/\s+/gu, ""))) return [];
+      return [{ tone: String(entry.tone || "其他").trim(), source: String(entry.source || "").trim(), point: String(entry.point || "").trim(), excerpt }];
+    });
+    const emotionModules = (Array.isArray(parsed.emotionModules) ? parsed.emotionModules : []).flatMap((item, index) => {
+      const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      if (!String(entry.name || "").trim()) return [];
+      return [{ id: String(entry.id || `EM-${String(index + 1).padStart(3, "0")}`), name: String(entry.name).trim(), readerNeed: String(entry.readerNeed || "").trim(), trigger: String(entry.trigger || "").trim(), arc: String(entry.arc || "").trim(), replaceable: String(entry.replaceable || "").trim(), antiCopy: String(entry.antiCopy || "").trim(), tone: String(entry.tone || "").trim() }];
+    });
+    return {
+      styleProfile: String(parsed.styleProfile || "").trim(),
+      anchors,
+      emotionModules,
+      rhythm: String(parsed.rhythm || "").trim(),
+      chapterNumbers: analyzed.map(item => Number(item.number) || 0).filter(Boolean),
+      droppedAnchors: (Array.isArray(parsed.anchors) ? parsed.anchors.length : 0) - anchors.length,
+    };
+  })
   .register("book.style.distill", async params => {
     const { bookTitle, styleName, samples, contextWindow } = params;
     if (!Array.isArray(samples) || samples.length === 0) {
@@ -249,3 +310,23 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
     const response = await client.chat([{ role: "user", content: prompt }], { temperature: 0.72, max_tokens: 7000, retryAttempts: 3 });
     return { title: String(chapterTitle || "新章节"), content: response.content.trim().replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim() };
   });
+
+/** 句长分布与标点密度：本地算好给模型引用，不让模型自己数（数出来的永远是编的） */
+function sentenceStats(text: string): string {
+  const narrative = text.replace(/[“「][^”」\n]*[”」]/gu, "");
+  const sentences = narrative.split(/[。！？!?]/u).map(item => item.replace(/\s+/gu, "")).filter(item => item.length >= 2);
+  if (!sentences.length) return "（样本太短，无法统计）";
+  const lengths = sentences.map(item => Array.from(item).length);
+  const share = (predicate: (length: number) => boolean) => `${Math.round(lengths.filter(predicate).length / lengths.length * 100)}%`;
+  const average = Math.round(lengths.reduce((sum, length) => sum + length, 0) / lengths.length);
+  const paragraphs = text.split(/\n+/u).map(item => item.trim()).filter(Boolean);
+  const dialogueLines = paragraphs.filter(item => /^[“「"]/u.test(item)).length;
+  const punctuation = (text.match(/[，。！？；：、]/gu) || []).length;
+  const visible = text.replace(/\s+/gu, "").length || 1;
+  return [
+    `叙述句长：短句(<15字) ${share(length => length < 15)}、中句(15～30) ${share(length => length >= 15 && length <= 30)}、长句(>30) ${share(length => length > 30)}，平均 ${average} 字`,
+    `段落：${paragraphs.length} 段，对话行占 ${Math.round(dialogueLines / Math.max(1, paragraphs.length) * 100)}%`,
+    `标点密度：每百字 ${(punctuation / visible * 100).toFixed(1)} 个`,
+    `感叹号 ${(text.match(/[！!]/gu) || []).length} 个、问号 ${(text.match(/[？?]/gu) || []).length} 个、省略号 ${(text.match(/…/gu) || []).length} 个、破折号 ${(text.match(/—/gu) || []).length} 个`,
+  ].join("\n");
+}

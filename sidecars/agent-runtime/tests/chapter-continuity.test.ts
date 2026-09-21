@@ -152,14 +152,18 @@ describe("chapter continuity context", () => {
     expect(chapterDraftMaxTokens(200)).toBe(2000);
   });
 
-  // 审查只出报告：每多一轮低温改写，人物的情绪和口语就被磨平一层，一致性问题交给作者看
-  it("审查提出一致性问题时只出报告，正文原样交给作者，不再定点修订", async () => {
+  // 审查只出报告：S2 及以下的一致性问题交给作者看，不自动改。每多一轮低温改写，人物的情绪和口语就被磨平一层
+  it("审查给出 S2 一致性问题时只出报告，正文原样交给作者", async () => {
     const requests: Array<Record<string, unknown>> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
       const messages = messagesOf(init);
       if (messages.includes("先想一想")) return ok("回院交样。");
-      if (messages.includes("待审查章节")) return ok(JSON.stringify({ consistent: false, issues: ["第 178 章的试印结论写成了已定，本章又当未定处理", "姜冷月称呼与第 176 章不一致"], suggestions: ["把“试印结论已定”改成“试印结论待刻坊回话”"], advances: true, progress: "推进到交样" }));
+      if (messages.includes("你是这本书的一致性检查员")) return ok(JSON.stringify({ verdict: "CONCERNS", findings: [
+        { severity: "S2", category: "factual", location: "第 2 段", evidence: "试印结论仍未定", issue: "第 178 章的试印结论写成了已定，本章又当未定处理", fix: "统一为待刻坊回话" },
+        { severity: "S2", category: "consistency", location: "第 4 段", evidence: "姜姑娘", issue: "姜冷月称呼与第 176 章不一致", fix: "统一为冷月" },
+      ] }));
+      if (messages.includes("待审查章节")) return ok(passReview);
       return ok("交样\n\n初稿：试印结论仍未定。");
     });
 
@@ -170,11 +174,115 @@ describe("chapter continuity context", () => {
 
     expect(result.draftContent).toBe("初稿：试印结论仍未定。");
     expect(result.reviewResult?.issues).toHaveLength(2);
+    expect(result.reviewResult?.verdict).toBe("CONCERNS");
     expect(result.reviewResult?.revised).toBeUndefined();
-    expect(requests.some(body => JSON.stringify(body.messages || "").includes("按以下一致性审查意见修订本章"))).toBe(false);
-    // 审查只跑一次，之后没有任何改写请求（测试桩不回流式，正文会多一次非流式兜底请求，所以不数总数）
-    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(1);
+    expect(requests.some(body => JSON.stringify(body.messages || "").includes("按以下事实矛盾修订本章"))).toBe(false);
+    // lean 档两个视角各审一次，之后没有任何改写请求（测试桩不回流式，正文会多一次非流式兜底请求，所以不数总数）
+    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(2);
     expect(requests.some(body => JSON.stringify(body.messages || "").includes("本次仅调整正文长度"))).toBe(false);
+    store.close();
+  });
+
+  // 一致性视角给出带原文证据的 S1 事实矛盾才自动改，且只改一次：修订稿再过验证门，但不再进审查，避免审改循环
+  it("一致性视角给出带证据的 S1 事实矛盾时定点修订一次，修订稿剥掉标题行，不再二次审查", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = messagesOf(init);
+      if (messages.includes("先想一想")) return ok("回院交样。");
+      if (messages.includes("你是这本书的一致性检查员")) return ok(JSON.stringify({ verdict: "REJECT", findings: [
+        { severity: "S1", category: "factual", location: "第 1 段", evidence: "试印结论仍未定", issue: "第 178 章刻坊已回话定了试印结论，本章又当未定处理", fix: "统一为已定" },
+      ] }));
+      if (messages.includes("待审查章节")) return ok(passReview);
+      if (messages.includes("按以下事实矛盾修订本章")) return ok("交样\n\n修订稿：试印结论已定，只等落印。");
+      return ok("交样\n\n初稿：试印结论仍未定。");
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "fix-facts-project", title: "试讲与婚帖" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({ projectId: "fix-facts-project", chapterId: "179", instruction: "继续写本章" });
+
+    expect(result.draftContent).toBe("修订稿：试印结论已定，只等落印。");
+    expect(result.reviewResult?.revised).toBe(true);
+    expect(result.reviewResult?.suggestions.join("")).toContain("定点修订一次");
+    // 修订走流式调用；测试桩不回流式，会多一次非流式兜底请求，只数兜底那一次
+    const fixRequests = requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("按以下事实矛盾修订本章"));
+    expect(fixRequests).toHaveLength(1);
+    expect(JSON.stringify(fixRequests[0].messages)).toContain("原文：试印结论仍未定");
+    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(2);
+    store.close();
+  });
+
+  // 验证门是本地规则：blocking 句式只交给模型改一次，改不干净就带着问题交给作者，不陷入改写循环
+  it("验证门命中 blocking 句式时定向修订一次；修订稿剥标题行再过门，改不净不再改", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    let lintFix = "交样\n\n他绝望了。门开了。";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = messagesOf(init);
+      if (messages.includes("先想一想")) return ok("回院交样。");
+      if (messages.includes("待审查章节")) return ok(passReview);
+      if (messages.includes("只改下面点名的句子")) return ok(lintFix);
+      return ok("交样\n\n他不是冷漠，而是绝望——门开了。");
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "lint-project", title: "验证门测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({ projectId: "lint-project", chapterId: "3", instruction: "继续写本章" });
+
+    expect(result.draftContent).toBe("他绝望了。门开了。");
+    expect(result.lintFindings).toEqual([]);
+    const fixRequests = requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("只改下面点名的句子"));
+    expect(fixRequests).toHaveLength(1);
+    expect(JSON.stringify(fixRequests[0].messages)).toContain("不是冷漠，而是绝望");
+    // 修订稿在验证门之后才进审查：审到的是改过的正文
+    const reviewRequest = requests.find(body => JSON.stringify(body.messages || "").includes("待审查章节"));
+    expect(JSON.stringify(reviewRequest?.messages)).toContain("他绝望了。门开了。");
+
+    // 改不净：仍有 blocking，但只改这一次，问题留在报告里
+    requests.length = 0;
+    lintFix = "交样\n\n他不是冷漠，而是绝望。门开了。";
+    store.createProject({ id: "lint-project-2", title: "验证门测试" });
+    const stubborn = await graph.invoke({ projectId: "lint-project-2", chapterId: "4", instruction: "继续写本章" });
+    expect(stubborn.draftContent).toBe("他不是冷漠，而是绝望。门开了。");
+    expect(stubborn.lintFindings.map(item => item.type)).toEqual(["not-is-comparison"]);
+    expect(requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("只改下面点名的句子"))).toHaveLength(1);
+    expect(stubborn.reviewResult?.suggestions.join("")).toContain("not-is-comparison");
+    store.close();
+  });
+
+  it("审查档位决定跑几个视角：full 四个、solo 一个；对标资料构思阶段带情绪模块，正文只带同基调锚点", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = messagesOf(init);
+      if (messages.includes("先想一想")) return ok("这一章情绪从压抑走到热血。");
+      if (messages.includes("待审查章节")) return ok(passReview);
+      return ok("出城\n\n他推门出去。");
+    });
+    const benchmark = {
+      anchors: [{ tone: "热血", source: "第 3 章", point: "爆发前先压三拍", excerpt: "原文热血段落。" }, { tone: "悲伤", source: "第 9 章", point: "", excerpt: "原文悲伤段落。" }],
+      emotionModules: [{ id: "EM-001", name: "被低估者翻盘", readerNeed: "看他打脸", trigger: "当众被贬", arc: "忍 → 爆 → 众人失语", replaceable: "场合、对手", antiCopy: "换掉打脸的道具与台词", tone: "热血" }],
+      rhythm: "| 信息 | 首次出现 |",
+    };
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "mode-project", title: "档位测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    await graph.invoke({ projectId: "mode-project", chapterId: "5", chapterNumber: 5, instruction: "继续写本章", reviewMode: "full", benchmark });
+    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(4);
+    const planRequest = requests.find(body => JSON.stringify(body.messages || "").includes("先想一想"));
+    expect(JSON.stringify(planRequest?.messages)).toContain("对标作品的情绪模块");
+    expect(JSON.stringify(planRequest?.messages)).toContain("被低估者翻盘");
+    const draftRequest = requests.find(body => JSON.stringify(body.messages || "").includes("写第 5 章正文"));
+    expect(JSON.stringify(draftRequest?.messages)).toContain("原文热血段落");
+    expect(JSON.stringify(draftRequest?.messages)).not.toContain("原文悲伤段落");
+
+    requests.length = 0;
+    store.createProject({ id: "solo-project", title: "档位测试" });
+    await graph.invoke({ projectId: "solo-project", chapterId: "6", instruction: "继续写本章", reviewMode: "solo" });
+    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(1);
     store.close();
   });
 

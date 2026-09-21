@@ -4675,3 +4675,15 @@ select.input {
 .agent-review-batch textarea { width: 100%; resize: vertical; font-size: 13px; }
 .agent-review-check { display: inline-flex; align-items: center; }
 .agent-review-row-title { align-items: center; }
+
+/* 拆书全书聚合：情绪模块、原文锚点、节奏表、文风档案折叠在章节编辑器下方 */
+.dismantle-aggregate { margin: 0 20px 16px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-sunken); }
+.dismantle-aggregate > summary { padding: 8px 10px; color: var(--text-3); font-size: 11px; cursor: pointer; }
+.dismantle-aggregate-body { display: grid; gap: 12px; padding: 10px; border-top: 1px solid var(--line); }
+.dismantle-aggregate-body section { display: grid; gap: 6px; }
+.dismantle-aggregate-body strong { color: var(--text-2); font-size: 11px; }
+.dismantle-aggregate-body article { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+.dismantle-aggregate-body article b { color: var(--text); font-size: 12px; }
+.dismantle-aggregate-body article p { margin: 0; color: var(--text-3); font-size: 11px; line-height: 1.55; }
+.dismantle-aggregate-body details summary { color: var(--text-3); font-size: 11px; cursor: pointer; }
+.dismantle-aggregate-body pre { max-height: 260px; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); overflow: auto; color: var(--text-4); font: 11px/1.55 ZhizhangFanqie, ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }

@@ -643,15 +643,26 @@ pub fn chapter_memory_to_markdown(memory: &Value) -> String {
         .unwrap_or("章节记忆");
     let summary = memory.get("summary").and_then(Value::as_str).unwrap_or("暂无摘要");
     let ending_hook = memory.get("endingHook").and_then(Value::as_str).unwrap_or("暂无");
+    // 下一章承诺是单句字段，空串按“暂无”写；读者已知 / 作者真相 / 本章新增是 2026-09-20 起提炼的新字段，旧记忆没有就渲染“暂无”
+    let next_promise = memory
+        .get("nextChapterPromise")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("暂无");
     format!(
-        "# {title} 记忆快照\n\n## 章节摘要\n{summary}\n\n## 关键词\n{}\n\n## 人物状态变化\n{}\n\n## 角色认知变化\n{}\n\n## 伏笔变化\n{}\n\n## 时间线事件\n{}\n\n## 设定事实\n{}\n\n## 冲突\n{}\n\n## 章末钩子\n{ending_hook}\n",
+        "# {title} 记忆快照\n\n## 章节摘要\n{summary}\n\n## 关键词\n{}\n\n## 人物状态变化\n{}\n\n## 人物关系与情绪\n{}\n\n## 角色认知变化\n{}\n\n## 伏笔变化\n{}\n\n## 时间线事件\n{}\n\n## 设定事实\n{}\n\n## 冲突\n{}\n\n## 读者已知\n{}\n\n## 作者真相\n{}\n\n## 本章新增\n{}\n\n## 下一章承诺\n{next_promise}\n\n## 章末钩子\n{ending_hook}\n",
         markdown_list(memory, "keywords"),
         markdown_list(memory, "characterStateChanges"),
+        markdown_list(memory, "relationshipState"),
         markdown_list(memory, "knowledgeChanges"),
         markdown_list(memory, "foreshadowingChanges"),
         markdown_list(memory, "timelineEvents"),
         markdown_list(memory, "canonFacts"),
         markdown_list(memory, "conflicts"),
+        markdown_list(memory, "readerKnown"),
+        markdown_list(memory, "authorTruth"),
+        markdown_list(memory, "newlyIntroduced"),
     )
 }
 

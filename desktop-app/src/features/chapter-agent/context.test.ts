@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { boundChapterOutlineFor, buildChapterWriteContext, effectiveCards, stageBeatsFor, stageRangeFor } from './context.ts';
+import { boundChapterOutlineFor, buildChapterWriteContext, effectiveCards, recentChapterEcho, stageBeatsFor, stageRangeFor } from './context.ts';
 import type { Chapter, ChapterMemory, MemoryDocument, OutlineDocument, Project } from '../../domain/project.ts';
 import type { Skill } from '../../domain/skill.ts';
 
@@ -113,4 +113,42 @@ test('绑定文风时追加成一条技能并写进指令；优先技能只保�
   assert.ok(String(context.params.instruction).includes('冷峻'));
   assert.deepEqual(context.params.preferredSkillNames, ['story-long-write']);
   assert.equal(context.params.targetWords, 3000);
+});
+
+test('验证门与审查的输入：档位、引号风格、允许句式来自项目设置，上一章承诺来自记忆，最近几章开头结尾来自正文', () => {
+  const withSettings = project({ reviewMode: 'full', quoteStyle: 'corner', allowedPhrases: ['声音不大，却'] });
+  withSettings.memories[1] = { ...withSettings.memories[1], nextChapterPromise: '天亮前灯塔见' };
+  const context = buildChapterWriteContext({ project: withSettings, chapter: chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal(context.params.reviewMode, 'full');
+  assert.equal(context.params.quoteStyle, 'corner');
+  assert.deepEqual(context.params.allowedPhrases, ['声音不大，却']);
+  assert.equal(context.params.previousPromise, '天亮前灯塔见');
+  assert.deepEqual(context.params.recentOpenings, ['第 1 章正文', '第 2 章正文']);
+  assert.deepEqual(context.params.recentEndings, ['第 1 章正文', '第 2 章正文']);
+  assert.equal(context.params.benchmark, undefined);
+  // 没设置时缺省 lean，承诺缺省不传
+  const plain = buildChapterWriteContext({ project: project(), chapter: chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal(plain.params.reviewMode, 'lean');
+  assert.equal(plain.params.previousPromise, undefined);
+  // 最近五章只取有正文的章，紧邻上一章排最后
+  assert.deepEqual(recentChapterEcho(project({ chapters: [chapter(1), chapter(2, ''), chapter(3), chapter(4)] }), 4).recentOpenings, ['第 1 章正文', '第 3 章正文']);
+  assert.deepEqual(recentChapterEcho(project(), 1), { recentOpenings: [], recentEndings: [] });
+});
+
+test('对标资料只传锚点、模块、节奏表三样；文风档案走 WritingStyle 不重复带', () => {
+  const benchmark = { styleProfile: '# 文风', anchors: [{ tone: '热血', source: '第 3 章', point: '', excerpt: '原文段落' }], emotionModules: [], rhythm: '| 信息 |', chapterNumbers: [1, 2, 3], updatedAt: now };
+  const context = buildChapterWriteContext({ project: project(), chapter: chapters[3], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [], benchmark });
+  assert.deepEqual(context.params.benchmark, { anchors: benchmark.anchors, emotionModules: [], rhythm: '| 信息 |' });
+});
+
+// 症状：重写第 140 章时聚合文档尾部是第 200 多章的内容，模型把"未来"当前文写；聚合文档按全书累计，历史章只能看到本章之前的
+test('重写历史章时聚合文档只到本章之前，最后一章照旧用项目里的文档', () => {
+  const documents = (context: ReturnType<typeof buildChapterWriteContext>) => context.params.memoryDocuments as Array<{ kind: string; content: string }>;
+  const historical = buildChapterWriteContext({ project: project(), chapter: chapters[2], instruction: '重写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  const snapshot = documents(historical).find(document => document.kind === '章节快照')!;
+  assert.ok(snapshot.content.includes('## 第 2 章'));
+  assert.ok(!snapshot.content.includes('## 第 3 章'));
+  assert.ok(!snapshot.content.includes('## 第 4 章'));
+  const latest = buildChapterWriteContext({ project: project(), chapter: chapters[3], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal(documents(latest).find(document => document.kind === '章节快照')!.content, '# 章节快照');
 });

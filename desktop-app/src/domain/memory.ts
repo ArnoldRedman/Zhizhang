@@ -24,6 +24,10 @@ export type MemoryExtractionResult = {
   canonFacts?: string[];
   conflicts?: string[];
   relationshipState?: string[];
+  readerKnown?: string[];
+  authorTruth?: string[];
+  nextChapterPromise?: string;
+  newlyIntroduced?: string[];
   endingHook?: string;
 };
 
@@ -68,6 +72,10 @@ export const buildChapterMemoryPatch = (options: {
     conflicts: preferAIList(result.conflicts, local.conflicts, existing?.conflicts),
     // 人物关系只有模型能提炼，本地启发式给不出；没返回时保留原值
     relationshipState: asTextList(result.relationshipState, 8).length ? asTextList(result.relationshipState, 8) : (existing?.relationshipState || []),
+    readerKnown: asTextList(result.readerKnown, 10).length ? asTextList(result.readerKnown, 10) : (existing?.readerKnown || []),
+    authorTruth: asTextList(result.authorTruth, 6).length ? asTextList(result.authorTruth, 6) : (existing?.authorTruth || []),
+    nextChapterPromise: typeof result.nextChapterPromise === 'string' && result.nextChapterPromise.trim() ? result.nextChapterPromise.trim() : (existing?.nextChapterPromise || ''),
+    newlyIntroduced: asTextList(result.newlyIntroduced, 12).length ? asTextList(result.newlyIntroduced, 12) : (existing?.newlyIntroduced || []),
     endingHook: typeof result.endingHook === 'string' && result.endingHook.trim() ? result.endingHook.trim() : (local.endingHook || existing?.endingHook || ''),
   };
 };
@@ -136,6 +144,10 @@ export const normalizeChapterMemory = (memory: Partial<ChapterMemory>, fallbackC
     canonFacts: asTextList(memory.canonFacts),
     conflicts: asTextList(memory.conflicts),
     relationshipState: asTextList(memory.relationshipState, 8),
+    readerKnown: asTextList(memory.readerKnown, 10),
+    authorTruth: asTextList(memory.authorTruth, 6),
+    nextChapterPromise: typeof memory.nextChapterPromise === 'string' ? memory.nextChapterPromise : '',
+    newlyIntroduced: asTextList(memory.newlyIntroduced, 12),
     endingHook: typeof memory.endingHook === 'string' ? memory.endingHook : '',
     sourceChapterNumber: typeof memory.sourceChapterNumber === 'number' ? memory.sourceChapterNumber : undefined,
     createdAt: typeof memory.createdAt === 'string' ? memory.createdAt : now,

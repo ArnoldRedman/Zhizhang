@@ -236,6 +236,10 @@ export const normalizeMemoryResult = (content: string): Record<string, unknown> 
       keywords: memoryStringList(memoryField(result, "keywords", "关键词", "key_words"), 8),
       // 人物关系与情绪：感情线唯一的承接依据，没有它记忆里只剩事务
       relationshipState: memoryStringList(memoryField(result, "relationshipState", "relationship_state", "人物关系与情绪", "人物关系", "关系与情绪"), 8),
+      readerKnown: memoryStringList(memoryField(result, "readerKnown", "reader_known", "读者已知"), 10),
+      authorTruth: memoryStringList(memoryField(result, "authorTruth", "author_truth", "作者真相"), 6),
+      nextChapterPromise: typeof (result.nextChapterPromise || result.next_chapter_promise || result.下一章承诺) === "string" ? String(result.nextChapterPromise || result.next_chapter_promise || result.下一章承诺).trim() : "",
+      newlyIntroduced: memoryStringList(memoryField(result, "newlyIntroduced", "newly_introduced", "新增物", "本章新增"), 12),
       characterStateChanges: memoryStringList(memoryField(result, "characterStateChanges", "character_state_changes", "characterChanges", "character_changes", "人物状态变化", "人物状态", "角色状态变化")),
       knowledgeChanges: memoryStringList(memoryField(result, "knowledgeChanges", "knowledge_changes", "characterKnowledgeChanges", "roleKnowledgeChanges", "角色认知变化", "角色认知", "认知变化", "知识变化")),
       foreshadowingChanges: memoryStringList(memoryField(result, "foreshadowingChanges", "foreshadowing_changes", "伏笔变化", "伏笔进展")),

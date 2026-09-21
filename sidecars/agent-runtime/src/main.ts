@@ -8,7 +8,10 @@ import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPrepar
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { outlineWriteTargetContext, stageBeatContentFor } from "./application/outline-target.js";
-import { chapterReviewRequest, normalizeChapterReviewResult } from "./application/chapter-review.js";
+import { normalizeReviewMode } from "./application/chapter-review.js";
+import { runChapterReview } from "./application/review-runner.js";
+import { normalizeBenchmark } from "./application/benchmark.js";
+import { detectQuoteStyle, lintProse, type QuoteStyle } from "@zhizhang/contracts";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
 import { applyDraftChapterTitle, detectChapterNumberStyle, generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
 import { planChapterSplits } from "./application/chapter-split.js";
@@ -24,6 +27,11 @@ import type { RpcResponse } from "@zhizhang/contracts";
 const contextPipelineVersion = 6;
 
 /** 阶段节拍表里本章那一行压成一段：本章行是硬目标，前后行只划边界 */
+/** 项目设置里的引号风格；没设或值不认识就返回 undefined，让运行时按已有正文侦测 */
+function normalizeQuoteStyle(value: unknown): QuoteStyle | undefined {
+  return value === "curly" || value === "corner" || value === "ascii" ? value : undefined;
+}
+
 function chapterBeatText(stageBeats: unknown, chapterNumber: number | undefined): string | undefined {
   const beat = stageBeatLines(stageBeats, chapterNumber);
   if (!beat.current) return undefined;
@@ -89,6 +97,10 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
   "summary": "180 字以内的事件、人物状态和未解决线索",
   "keywords": ["最多 8 个关键词"],
   "relationshipState": ["人物关系与情绪：谁对谁现在是什么态度、这一章两人之间发生了什么变化、各自的情绪落在哪里；一条一人或一对"],
+  "readerKnown": ["本章读者新知道的事，一条一句"],
+  "authorTruth": ["本章埋下但读者还不知道的真相，没有就空数组"],
+  "nextChapterPromise": "本章结尾对下一章的承诺，一到两句：下一章必须接住什么",
+  "newlyIntroduced": ["本章第一次出现的具名人物、地点、物件、规则，一条一个"],
   "characterStateChanges": ["角色名：持续状态变化"],
   "knowledgeChanges": ["角色名：得知或隐瞒的信息"],
   "foreshadowingChanges": ["伏笔进展"],
@@ -674,7 +686,17 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           total: Number(totalChapters) >= 0 ? Number(totalChapters) : undefined,
         },
       });
-      const { messages } = chapterReviewRequest({
+      const reviewMode = normalizeReviewMode(req.params?.reviewMode);
+      // 旧章也先过本地验证门：报告里带上句式与标点问题，但不改正文（正文归作者）
+      // 章纲当"构思"对照：架构视角凭它判"该发生的事发生了没有"；没章纲就只看总纲和账本
+      const lintFindings = lintProse(content, {
+        outline: typeof outline === "string" && outline.trim() ? outline : undefined,
+        recentOpenings: stringList(req.params?.recentOpenings, 6),
+        recentEndings: stringList(req.params?.recentEndings, 6),
+        allowedPhrases: stringList(req.params?.allowedPhrases, 60),
+      });
+      const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
+      const { result, usages } = await runChapterReview(client, reviewMode, {
         agentSystemPrompt: chapterAgentSystemPrompt,
         worldSetting: prepared.worldSetting,
         writingStyle: writingStyle && typeof writingStyle === "object"
@@ -688,29 +710,14 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         draftContent: content,
         chapterNumber: Number(chapterNumber) > 0 ? Number(chapterNumber) : undefined,
         totalChapters: Number(totalChapters) >= 0 ? Number(totalChapters) : undefined,
-      });
-      const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
-      let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
-      try {
-        // 保留作者的推理配置，审查正文预算与章节写作图保持一致
-        response = await client.chat(messages, { response_format: { type: "json_object" }, max_tokens: 4000 });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          id: req.id,
-          result: {
-            reviewResult: {
-              consistent: true,
-              issues: [],
-              suggestions: [`审查未完成：${message}`],
-              advances: true,
-              progress: "",
-              repeatedEvents: [],
-            },
-          },
-        };
-      }
-      return { id: req.id, result: { reviewResult: normalizeChapterReviewResult(response.content), usage: response.usage } };
+        previousPromise: typeof req.params?.previousPromise === "string" ? req.params.previousPromise : undefined,
+        chapterPlan: prepared.outline,
+      }, lintFindings);
+      const usage = usages.reduce<Record<string, number>>((sum, item) => {
+        for (const [key, value] of Object.entries(item)) sum[key] = (sum[key] || 0) + (Number(value) || 0);
+        return sum;
+      }, {});
+      return { id: req.id, result: { reviewResult: result, lintFindings, usage } };
     }
 
     if (req.method === "chapter.write") {
@@ -882,6 +889,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           projectTitle: String(projectTitle || ""),
           chapterId: String(chapterId),
           chapterNumber: chapterPosition.number,
+          totalChapters: chapterPosition.total,
           instruction: String(instruction),
           worldSetting: prepared.worldSetting,
           masterOutline: prepared.masterOutline,
@@ -898,6 +906,14 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           contextReport,
           sessionContext,
           authorPreferences: stringList(authorPreferences, 20),
+          // 验证门与三档审查的输入：档位、引号风格、最近几章的开头结尾、上一章承诺、作者允许的句式
+          reviewMode: normalizeReviewMode(req.params?.reviewMode),
+          quoteStyle: normalizeQuoteStyle(req.params?.quoteStyle) ?? detectQuoteStyle(prepared.previousChapters.map(chapter => chapter.content).join("\n")),
+          recentOpenings: stringList(req.params?.recentOpenings, 6),
+          recentEndings: stringList(req.params?.recentEndings, 6),
+          previousPromise: typeof req.params?.previousPromise === "string" ? req.params.previousPromise : undefined,
+          allowedPhrases: stringList(req.params?.allowedPhrases, 60),
+          benchmark: normalizeBenchmark(req.params?.benchmark),
         });
         const resultRecord = result as Record<string, unknown>;
         // 标题兵底：信封里没给 title、正文开头也没写标题行时，这一章会停在“第 N 章”占位。

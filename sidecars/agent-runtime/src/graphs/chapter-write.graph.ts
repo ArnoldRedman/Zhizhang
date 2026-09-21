@@ -4,7 +4,11 @@ import { StoryStore } from "../storage/story-store.js";
 import { ModelApiClient, type ApiUsage, type ApiWireMode, type ChatMessage } from "../models/model-api.js";
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, masterOutlineBytes, storyLedgerBytes, tailText, type ContextReport } from "../context/context-optimizer.js";
-import { chapterReviewRequest, normalizeChapterReviewResult } from "../application/chapter-review.js";
+import { hasBlocking, lintProse, normalizePauses, normalizeQuotes, type LintFinding, type QuoteStyle } from "@zhizhang/contracts";
+import { reviewUnavailable, type ChapterReviewResult, type ReviewMode } from "../application/chapter-review.js";
+import { perspectiveLabel, runChapterReview } from "../application/review-runner.js";
+import { chapterRevisePrompt, wholeChapterTokenBudget } from "../application/text-prompts.js";
+import { benchmarkDraftSection, benchmarkPlanSection, type ChapterBenchmark } from "../application/benchmark.js";
 // 标题拆分与补全是纯文本处理，批量补标题也要用同一套判定，统一放在 application 层
 import { cleanChapterTitleName, splitChapterTitleHeading } from "../application/chapter-titles.js";
 
@@ -189,6 +193,8 @@ export const ChapterState = Annotation.Root({
   targetWords: Annotation<number | undefined>,
   /** 正在写第几章：提示词里要说"写第 N 章"，模型才不用自己数 */
   chapterNumber: Annotation<number | undefined>,
+  /** 全书总章数：本章不是最后一章时（重写旧章）审查按历史章节口径，不拿最新进度要求它 */
+  totalChapters: Annotation<number | undefined>,
   outline: Annotation<string | undefined>,
   projectTitle: Annotation<string | undefined>,
   previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string; ending?: string }> | undefined>,
@@ -211,21 +217,32 @@ export const ChapterState = Annotation.Root({
   summary: Annotation<string | undefined>,
   /** 模型写在末尾的【给作者】：拿不准的设定、想商量的走向；界面单独展示，连续创作时汇总成待答文档 */
   authorNotes: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
+  /** 审查档位：full 四视角、lean 两视角、solo 一次合并审查 */
+  reviewMode: Annotation<ReviewMode>({ reducer: (_prev, next) => next, default: () => "lean" }),
+  /** 全书引号风格：验证门把本章引号统一到它；没传就按上一章正文侦测 */
+  quoteStyle: Annotation<QuoteStyle | undefined>,
+  /** 最近几章的开头句与结尾句：写作时让模型看见前面几章怎么开怎么收，验证门查同型 */
+  recentOpenings: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
+  recentEndings: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
+  /** 上一章记忆里的"下一章承诺"：构思要回应它，一致性审查查它兑现了没 */
+  previousPromise: Annotation<string | undefined>,
+  /** 作者允许的字面片段：验证门对命中它们的风格类问题不报 */
+  allowedPhrases: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
+  /** 项目绑定的对标拆书的全书聚合：构思看情绪模块与节奏表，正文只带一段同基调锚点 */
+  benchmark: Annotation<ChapterBenchmark | undefined>,
+  /** 本地验证门的结果：进审查报告，不进模型 */
+  lintFindings: Annotation<LintFinding[]>({ reducer: (_prev, next) => next, default: () => [] }),
+  /** 验证门已经为本稿做过几次定向修订；只改一次，改不干净就交给作者 */
+  lintRounds: Annotation<number>({ reducer: (_prev, next) => next, default: () => 0 }),
+  /** 走到验证门时正文处于哪个阶段：修订后的稿不再进审查，避免审改循环 */
+  phase: Annotation<"draft" | "repaired" | "fixed">({ reducer: (_prev, next) => next, default: () => "draft" }),
+  repairRounds: Annotation<number>({ reducer: (_prev, next) => next, default: () => 0 }),
+  fixRounds: Annotation<number>({ reducer: (_prev, next) => next, default: () => 0 }),
   contextReport: Annotation<ContextReport | undefined>,
   sessionContext: Annotation<string | undefined>,
   authorPreferences: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   upstreamUsage: Annotation<UsageTotals | undefined>({ reducer: (_prev, next) => next, default: () => undefined }),
-  reviewResult: Annotation<{
-    consistent: boolean;
-    issues: string[];
-    suggestions: string[];
-    /** 本章相对前文是否有新推进；false 就是又把上一章写了一遍 */
-    advances?: boolean;
-    progress?: string;
-    repeatedEvents?: string[];
-    /** 保留字段：旧版本审查后会定点修订，现在审查只出报告不改正文 */
-    revised?: boolean;
-  } | undefined>,
+  reviewResult: Annotation<(ChapterReviewResult & { revised?: boolean }) | undefined>,
   errors: Annotation<string[]>({
     reducer: (prev, next) => [...prev, ...next],
     default: () => [],
@@ -281,8 +298,19 @@ function chapterMaterialPacket(state: ChapterStateType): string {
     ? `\n## 作者指定的写作技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 4).map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, 2400)}`).join("\n\n")}\n`
     : "";
   const continuitySection = state.continuityContext ? `\n## 上一章结尾\n${state.continuityContext}\n` : "";
+  // 让模型自己看见前面几章怎么开头怎么收尾：比写一条"不得以灯收尾"的禁令管用，也不用往提示词里加规矩
+  const echoSection = state.recentOpenings.length || state.recentEndings.length
+    ? `\n## 前面几章的开头与结尾（本章换个开法和收法）\n${state.recentOpenings.map((line, index) => `开头${index + 1}：${line}`).join("\n")}\n${state.recentEndings.map((line, index) => `结尾${index + 1}：${line}`).join("\n")}\n`
+    : "";
+  const promiseSection = state.previousPromise ? `\n## 上一章留给本章的事\n${state.previousPromise}\n` : "";
   const directionSection = storyDirectionPacket(state);
-  return [skillsSection, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, graphSection, continuitySection, contextSection].filter(Boolean).join("");
+  return [skillsSection, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, graphSection, continuitySection, promiseSection, echoSection, contextSection].filter(Boolean).join("");
+}
+
+/** 修订类调用（验证门定向修订、事实矛盾定点修订）返回的整章正文：剥围栏、标题行与【给作者】，和首稿走同一套拆法 */
+function parseRevisedDraft(raw: string): { content: string; title: string; authorNotes: string[] } {
+  const parsed = parseDraftResponse(raw);
+  return { content: parsed.content, title: parsed.title, authorNotes: parsed.authorNotes };
 }
 
 function chapterLabel(state: ChapterStateType): string {
@@ -301,7 +329,8 @@ function chapterDraftPrompts(state: ChapterStateType, contextWindowKTokens?: num
 } {
   const stablePacket = stableProjectPacket(state);
   const session = splitSessionContext(state.sessionContext);
-  const dynamicPacket = chapterMaterialPacket(state);
+  // 正文阶段只带一段与构思基调相同的对标锚点和一张模块：整份聚合塞进来模型会照着抄结构
+  const dynamicPacket = chapterMaterialPacket(state) + benchmarkDraftSection(state.benchmark, state.chapterPlan).section;
   // 字数读项目设置，写死两三千字会让作者设的目标形同虚设
   const targetWords = state.targetWords && state.targetWords > 0 ? Math.round(state.targetWords) : 3000;
   const planSection = state.chapterPlan ? `\n\n## 这一章的想法\n${state.chapterPlan}` : "";
@@ -438,8 +467,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.context("plan", "装载本章资料", { source: "ChapterPlanner", status: "loaded", bytes: byteLength(state.outline || "") });
       const stablePacket = stableProjectPacket(state);
       const session = splitSessionContext(state.sessionContext);
-      const material = chapterMaterialPacket(state);
-      const planInstruction = `## 作者的要求\n${state.instruction}\n\n先想一想${chapterLabel(state)}怎么写，二三百字，自由格式：这一章发生什么（一件前文没发生过的事，总纲或章纲有安排就按它）；相对上一章过了多久、换没换地方；每个出场人物这一章想要什么、会怎么做、和别人怎么相处；情绪落在哪里；结尾停在什么地方。不要写正文。`;
+      // 构思阶段多看一份对标资料：情绪模块与节奏表，让模型挑这一章的情绪链
+      const material = chapterMaterialPacket(state) + benchmarkPlanSection(state.benchmark);
+      const planInstruction = `## 作者的要求\n${state.instruction}\n\n先想一想${chapterLabel(state)}怎么写，三四百字，自由格式，但要写清这几样：这一章发生什么（一件前文没发生过的事，总纲或章纲有安排就按它）；读完这章什么变了（目标、风险、信息、关系、资源、身份、情绪立场里至少一项）；相对上一章过了多久、换没换地方；每个出场人物这一章想要什么、会怎么做、和别人怎么相处；情绪从什么走到什么；按顺序列四到八个情节点，每个一句话；结尾停在哪个具体动作或画面上。不要写正文，不要把情节点写成成品句子。`;
       const fallbackPlan = "按总纲和章纲写这一章该发生的事，承接上一章结尾后推进；人物按各自性格行动，结尾停在能继续发展的地方。";
       let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
       try {
@@ -484,16 +514,51 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         upstreamUsage: addUsage(state.upstreamUsage, response.usage),
       };
     })
-    // 审查只出报告：一致性问题写给作者看，不再自动定点修订。每多一轮低温改写，人物的情绪和口语就被磨平一层
-    .addNode("review", async (state: ChapterStateType) => {
-      emitter?.progress("review", 75, "正在审查人物、设定、时间线和推进...");
-
-      if (!state.draftContent) {
-        return { reviewResult: { consistent: false, issues: ["没有生成章节内容"], suggestions: [] } };
+    // 本地验证门：不调模型，毫秒级。引号与停顿标点直接归一；blocking 句式交给一次定向修订；其余进报告
+    .addNode("gate", async (state: ChapterStateType) => {
+      if (!state.draftContent) return {};
+      const quoted = normalizeQuotes(state.draftContent, state.quoteStyle || "curly");
+      const paused = normalizePauses(quoted.text);
+      const content = paused.text;
+      const lintFindings = lintProse(content, {
+        outline: state.chapterPlan,
+        recentOpenings: state.recentOpenings,
+        recentEndings: state.recentEndings,
+        allowedPhrases: state.allowedPhrases,
+      });
+      const blocking = lintFindings.filter(item => item.severity === "blocking");
+      const normalized = quoted.changes + paused.changes;
+      emitter?.progress("review", 72, `验证门：标点归一 ${normalized} 处；句式问题 ${blocking.length} 条须改，${lintFindings.length - blocking.length} 条提示`);
+      emitter?.context("review", "本地验证门", { source: "prose-lint", status: blocking.length ? "selected" : "loaded", items: lintFindings.length });
+      return { draftContent: content, lintFindings };
+    })
+    // 定向修订：只把验证门点名的句子交给模型改，其余原样保留。每稿最多一次，改不干净就交给作者
+    .addNode("fixLint", async (state: ChapterStateType) => {
+      const blocking = state.lintFindings.filter(item => item.severity === "blocking");
+      if (!state.draftContent || !blocking.length) return {};
+      emitter?.progress("review", 74, `正在按验证门意见定向修订 ${blocking.length} 处`);
+      const instruction = [
+        "只改下面点名的句子，其余一字不动；改法：删掉否定铺垫直接写后项、破折号按功能换成动作或逗号、章尾预告改成具体动作画面、复读的句子只留一处、截断处补完结尾：",
+        ...blocking.map((item, index) => `${index + 1}. 第 ${item.line} 行「${item.excerpt}」：${item.message}`),
+      ].join("\n");
+      const prompt = chapterRevisePrompt({ projectTitle: state.projectTitle, chapterTitle: state.chapterTitle, instruction, content: state.draftContent });
+      try {
+        const response = await client.chatStream([{ role: "user", content: prompt }], { temperature: 0.5, max_tokens: wholeChapterTokenBudget(state.draftContent), retryAttempts: 2 }, chunk => emitter?.chunk(chunk));
+        const revised = parseRevisedDraft(response.content);
+        // 修订没产出正文就保留原稿：宁可报告里留着问题，也不能把整章弄丢
+        if (!revised.content) return { lintRounds: state.lintRounds + 1, errors: ["验证门定向修订没有返回正文，已保留原稿"] };
+        return { draftContent: revised.content, authorNotes: [...state.authorNotes, ...revised.authorNotes], lintRounds: state.lintRounds + 1, upstreamUsage: addUsage(state.upstreamUsage, response.usage) };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { lintRounds: state.lintRounds + 1, errors: [`验证门定向修订失败：${message}`] };
       }
-
-      // 审查提示词与批量审查旧章共用一份（application/chapter-review.ts），改一处两边都生效
-      const { messages: reviewMessages, inputBytes: reviewInputBytes } = chapterReviewRequest({
+    })
+    // 审查只出报告；两种情况自动改一次：判定重复前文（换事重写）、一致性给出 S1 事实矛盾（定向修订）
+    .addNode("review", async (state: ChapterStateType) => {
+      if (!state.draftContent) {
+        return { reviewResult: { ...reviewUnavailable(state.reviewMode, "没有生成章节内容"), consistent: false, issues: ["没有生成章节内容"] } };
+      }
+      const { result, inputBytes, usages, failures } = await runChapterReview(client, state.reviewMode, {
         agentSystemPrompt: chapterAgentSystemPrompt,
         worldSetting: state.worldSetting,
         writingStyle: state.writingStyle,
@@ -505,31 +570,27 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         retrievedContext: state.retrievedContext,
         draftContent: state.draftContent,
         sessionContext: state.sessionContext,
-      });
-      const contextReport = state.contextReport ? { ...state.contextReport, reviewInputBytes } : undefined;
-
-      let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
-      try {
-        response = await client.chat(reviewMessages, { response_format: { type: "json_object" }, max_tokens: 4000 });
-      } catch (error) {
-        // 审查失败不能拖垮已经写好的整章正文：如实标注审查未完成，正文照常交给作者
-        const message = error instanceof Error ? error.message : String(error);
-        emitter?.progress("review", 95, `审查未完成：${message}`);
-        return {
-          reviewResult: { consistent: true, issues: [], suggestions: [`审查未完成：${message}`], advances: true, progress: "", repeatedEvents: [] },
-          contextReport,
-          errors: [`审查阶段失败：${message}`],
-        };
-      }
-      emitter?.progress("review", 95, "审查完成");
+        chapterNumber: state.chapterNumber,
+        totalChapters: state.totalChapters,
+        chapterPlan: state.chapterPlan,
+        previousPromise: state.previousPromise,
+        instruction: state.instruction,
+      }, state.lintFindings, (perspective, index, total) => emitter?.progress("review", 75 + Math.round(index / total * 18), `${perspectiveLabel(perspective)}（${index + 1}/${total}）`));
+      emitter?.progress("review", 94, `审查完成：${result.verdict}，${result.findings.length} 条`);
+      const contextReport = state.contextReport ? { ...state.contextReport, reviewInputBytes: inputBytes } : undefined;
+      let upstreamUsage = state.upstreamUsage;
+      for (const usage of usages) upstreamUsage = addUsage(upstreamUsage, usage);
+      // 视角全失败等于审查没跑：报告里如实写审查未完成，错误按"审查阶段失败"记，正文照常交给作者
+      const allFailed = failures.length > 0 && result.perspectives.length === failures.length;
+      if (allFailed) emitter?.progress("review", 95, `审查未完成：${failures.join("；")}`);
       return {
-        reviewResult: normalizeChapterReviewResult(response.content),
+        reviewResult: allFailed ? reviewUnavailable(state.reviewMode, failures.join("；")) : result,
         contextReport,
-        upstreamUsage: addUsage(state.upstreamUsage, response.usage),
+        upstreamUsage,
+        errors: failures.map(item => `${allFailed ? "审查阶段失败" : "审查视角失败"}：${item}`),
       };
     })
-    // 审查说"没推进"时重写一次：这是唯一保留的自动改写，因为把上一章再写一遍的稿子交给作者毫无价值
-    // 只重写一次就不再审，避免既烧 token 又陷入反复改的循环
+    // 审查说"没推进"时换一件事重写一次：把上一章再写一遍的稿子交给作者毫无价值
     .addNode("repair", async (state: ChapterStateType) => {
       const review = state.reviewResult;
       if (!review) return {};
@@ -545,12 +606,44 @@ export function createChapterGraph(config: ChapterGraphConfig) {
           chapterTitle: parsed.title || state.chapterTitle,
           authorNotes: [...state.authorNotes, ...parsed.authorNotes],
           reviewResult: { ...review, advances: true, repeatedEvents: [], suggestions: [...review.suggestions, "本章首版未推进主线，已自动换一件事重写一次"] },
+          repairRounds: state.repairRounds + 1,
+          lintRounds: 0,
+          phase: "repaired" as const,
           upstreamUsage: addUsage(state.upstreamUsage, response.usage),
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         emitter?.progress("review", 96, `重写失败，保留首版正文：${message}`);
-        return { errors: [`重写阶段失败：${message}`] };
+        return { repairRounds: state.repairRounds + 1, errors: [`重写阶段失败：${message}`] };
+      }
+    })
+    // 一致性审查给出带证据的 S1 事实矛盾时定点修订一次：只含这几条，其余保持原样
+    .addNode("fixFacts", async (state: ChapterStateType) => {
+      const review = state.reviewResult;
+      const critical = (review?.findings || []).filter(item => item.severity === "S1" && item.evidence && (item.category === "consistency" || item.category === "factual" || item.category === "causal"));
+      if (!state.draftContent || !critical.length) return {};
+      emitter?.progress("review", 96, `正在按 ${critical.length} 条事实矛盾定点修订一次`);
+      const instruction = [
+        "按以下事实矛盾修订本章，逐条落到正文里；意见没点到的地方保持原样：",
+        ...critical.map((item, index) => `${index + 1}. ${item.location ? `${item.location}：` : ""}${item.issue}${item.evidence ? `（原文：${item.evidence}）` : ""}${item.fix ? `。改法：${item.fix}` : ""}`),
+      ].join("\n");
+      const prompt = chapterRevisePrompt({ projectTitle: state.projectTitle, chapterTitle: state.chapterTitle, instruction, content: state.draftContent });
+      try {
+        const response = await client.chatStream([{ role: "user", content: prompt }], { temperature: 0.5, max_tokens: wholeChapterTokenBudget(state.draftContent), retryAttempts: 2 }, chunk => emitter?.chunk(chunk));
+        const revised = parseRevisedDraft(response.content);
+        if (!revised.content) return { fixRounds: state.fixRounds + 1, errors: ["事实矛盾定点修订没有返回正文，已保留原稿"] };
+        return {
+          draftContent: revised.content,
+          authorNotes: [...state.authorNotes, ...revised.authorNotes],
+          reviewResult: review ? { ...review, revised: true, suggestions: [...review.suggestions, `已按 ${critical.length} 条事实矛盾定点修订一次`] } : review,
+          fixRounds: state.fixRounds + 1,
+          lintRounds: 0,
+          phase: "fixed" as const,
+          upstreamUsage: addUsage(state.upstreamUsage, response.usage),
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { fixRounds: state.fixRounds + 1, errors: [`事实矛盾定点修订失败：${message}`] };
       }
     })
     .addEdge("__start__", "prewrite")
@@ -559,14 +652,24 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     .addEdge("retrieve", "continuity")
     .addEdge("continuity", "plan")
     .addEdge("plan", "draft")
-    .addEdge("draft", "review")
+    .addEdge("draft", "gate")
+    // 验证门之后：有 blocking 且还没改过 → 定向修订再过一遍门；改过或干净 → 首稿进审查，修订稿直接结束
+    .addConditionalEdges("gate", (state: ChapterStateType) => {
+      if (hasBlocking(state.lintFindings) && state.lintRounds === 0 && state.draftContent) return "fixLint";
+      return state.phase === "draft" ? "review" : "done";
+    }, { fixLint: "fixLint", review: "review", done: "__end__" })
+    .addEdge("fixLint", "gate")
     .addConditionalEdges("review", (state: ChapterStateType) => {
       const review = state.reviewResult;
       if (!review) return "done";
-      if (review.advances === false || (review.repeatedEvents?.length || 0) > 0) return "repair";
+      if ((review.advances === false || (review.repeatedEvents?.length || 0) > 0) && state.repairRounds === 0) return "repair";
+      const hasCritical = review.findings.some(item => item.severity === "S1" && item.evidence && (item.category === "consistency" || item.category === "factual" || item.category === "causal"));
+      if (hasCritical && state.fixRounds === 0) return "fixFacts";
       return "done";
-    }, { repair: "repair", done: "__end__" })
-    .addEdge("repair", "__end__");
+    }, { repair: "repair", fixFacts: "fixFacts", done: "__end__" })
+    // 重写稿与修订稿都再过一遍验证门（标点、句式），但不再进审查，避免审改循环
+    .addEdge("repair", "gate")
+    .addEdge("fixFacts", "gate");
 
   return graph.compile();
 }

@@ -370,3 +370,20 @@ describe("stage beats", () => {
     expect(stageBeatLines(sheet, 190).current).toBe("");
   });
 });
+
+describe("story ledger promise and author truth", () => {
+  // 上一章的"下一章承诺"是本章开头必须接住的事；"作者真相"是读者还不知道的底，账本里标明角色不能说破
+  it("buildStoryLedger 带上最后一章的下一章承诺与最近几章的作者真相", () => {
+    const ledger = buildStoryLedger([
+      { chapterNumber: 2, title: "第二章", summary: "阁楼电台亮起。", authorTruth: ["电台是父亲留下的，母亲一直瞒着"] },
+      { chapterNumber: 3, title: "第三章", summary: "守夜人出现。", nextChapterPromise: "守夜人约定天亮前在灯塔见面", authorTruth: [] },
+    ], { number: 4, total: 3 }, 3000);
+    expect(ledger).toContain("上一章留给本章的事（下一章承诺）：守夜人约定天亮前在灯塔见面");
+    expect(ledger).toContain("作者真相（读者还不知道的底，角色不能提前说破）");
+    expect(ledger).toContain("- 第 2 章：电台是父亲留下的，母亲一直瞒着");
+    // 没有承诺与真相时两段都不出现，不留空标题
+    const plain = buildStoryLedger([{ chapterNumber: 3, title: "第三章", summary: "守夜人出现。" }], { number: 4, total: 3 }, 3000);
+    expect(plain).not.toContain("下一章承诺");
+    expect(plain).not.toContain("作者真相");
+  });
+});

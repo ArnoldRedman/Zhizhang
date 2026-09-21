@@ -69,6 +69,14 @@ export const normalizeDismantleBook = (book: Partial<DismantleBook>): DismantleB
     chapters: Array.isArray(book.chapters) ? book.chapters.map((chapter, index) => normalizeDismantleChapter(chapter, index)) : [],
     boundProjectId: typeof book.boundProjectId === 'number' ? book.boundProjectId : undefined,
     sourceLibraryBookId: typeof book.sourceLibraryBookId === 'string' ? book.sourceLibraryBookId : undefined,
+    aggregate: book.aggregate && typeof book.aggregate === 'object' && typeof book.aggregate.styleProfile === 'string' ? {
+      styleProfile: book.aggregate.styleProfile,
+      anchors: Array.isArray(book.aggregate.anchors) ? book.aggregate.anchors.filter(item => item && typeof item.excerpt === 'string') : [],
+      emotionModules: Array.isArray(book.aggregate.emotionModules) ? book.aggregate.emotionModules.filter(item => item && typeof item.name === 'string') : [],
+      rhythm: typeof book.aggregate.rhythm === 'string' ? book.aggregate.rhythm : '',
+      chapterNumbers: Array.isArray(book.aggregate.chapterNumbers) ? book.aggregate.chapterNumbers.filter((item): item is number => typeof item === 'number') : [],
+      updatedAt: typeof book.aggregate.updatedAt === 'string' ? book.aggregate.updatedAt : now,
+    } : undefined,
     createdAt: typeof book.createdAt === 'string' ? book.createdAt : now,
     updatedAt: typeof book.updatedAt === 'string' ? book.updatedAt : now,
   };

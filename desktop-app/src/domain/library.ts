@@ -27,7 +27,44 @@ export interface DismantleBook {
   chapters: DismantleChapter[];
   boundProjectId?: number;
   sourceLibraryBookId?: string;
+  /** 全书聚合：逐章拆解之上再做一次整书级提炼，写作时按目标情绪召回 */
+  aggregate?: DismantleAggregate;
   createdAt: string;
+  updatedAt: string;
+}
+
+/** 情绪模块卡：只留情绪链与功能位，人物场景道具触发条件全换，防止对标写成套壳 */
+export interface EmotionModule {
+  id: string;
+  name: string;
+  /** 读者在这里想要什么 */
+  readerNeed: string;
+  trigger: string;
+  /** 戏剧单元：前状态 → 触发 → 后状态 */
+  arc: string;
+  replaceable: string;
+  antiCopy: string;
+  /** 与本模块最贴近的基调 */
+  tone: string;
+}
+
+/** 原文锚点：一段三五百字的原文，标了基调；写作时同基调只给一段，模仿手法不抄字句 */
+export interface StyleAnchor {
+  tone: string;
+  source: string;
+  point: string;
+  excerpt: string;
+}
+
+export interface DismantleAggregate {
+  /** 文风档案 Markdown：句长分布、标点习惯、段落节奏、对话标签、角色语气区分、可借鉴技巧 */
+  styleProfile: string;
+  anchors: StyleAnchor[];
+  emotionModules: EmotionModule[];
+  /** 节奏表 Markdown：关键信息 → 扩写技法 → 情绪触动点 → 爆发或冷却 */
+  rhythm: string;
+  /** 参与聚合的章号 */
+  chapterNumbers: number[];
   updatedAt: string;
 }
 
