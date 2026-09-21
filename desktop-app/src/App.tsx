@@ -8,6 +8,7 @@ import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile, buildGraphRelationIndex, computeGraphLayout, noGraphNodes, noGraphEdges, type GraphRelationSummary } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
+import { addChapterAnnotation, applyParagraphRevision, paragraphNeighbors, removeChapterAnnotations, resolveAnnotationTargets } from './domain/annotation';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories } from './domain/memory';
 import { cardSearchTerms, refreshCardStatesForProject, stripHeuristicCardStates } from './domain/cards';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
@@ -1666,6 +1667,10 @@ function App() {
   const [chapterSaving, setChapterSaving] = useState(false);
   const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [showSearchPanel, setShowSearchPanel] = useState(false);
+  /** 正文批注面板：选中一段、写一句要求；"按批注修订"只改批注所在段落 */
+  const [showAnnotationPanel, setShowAnnotationPanel] = useState(false);
+  const [annotationDraft, setAnnotationDraft] = useState('');
+  const [annotationRunning, setAnnotationRunning] = useState(false);
   const [searchScope, setSearchScope] = useState<'chapter' | 'book'>('chapter');
   const [searchQuery, setSearchQuery] = useState('');
   const [replaceQuery, setReplaceQuery] = useState('');
@@ -3638,6 +3643,110 @@ function App() {
     setSearchScope('book');
     setShowSearchPanel(false);
     window.setTimeout(() => searchInputRef.current?.focus(), 0);
+  };
+
+  /** 把当前选区加成一条批注：选区来自编辑器实时选区，没有就用上一次记下的选区快照 */
+  const addAnnotationFromSelection = () => {
+    if (!activeChapter || !editingProject) return;
+    const element = chapterEditorRef.current;
+    const liveStart = element?.selectionStart ?? 0;
+    const liveEnd = element?.selectionEnd ?? 0;
+    const snapshotValid = selectionSnapshot && selectionSnapshot.end > selectionSnapshot.start && activeChapter.content.slice(selectionSnapshot.start, selectionSnapshot.end) === selectionSnapshot.source;
+    const quote = liveEnd > liveStart ? activeChapter.content.slice(liveStart, liveEnd) : snapshotValid ? selectionSnapshot.source : '';
+    if (!quote.trim()) {
+      setNotice({ title: '先选中一段正文', content: '在正文里选中要改的句子或段落，再写批注。' });
+      return;
+    }
+    if (!annotationDraft.trim()) {
+      setNotice({ title: '批注不能为空', content: '写一句要怎么改，例如「沈妄这里不会这么说，他会先把账本合上」。' });
+      return;
+    }
+    const updatedChapter = addChapterAnnotation(activeChapter, quote, annotationDraft);
+    const updated = replaceChapterInProject(editingProject, updatedChapter);
+    setEditingProject(updated);
+    setActiveChapter(updatedChapter);
+    setProjects(current => current.map(project => project.id === updated.id ? updated : project));
+    setAnnotationDraft('');
+  };
+
+  const removeAnnotation = (ids: string[]) => {
+    if (!activeChapter || !editingProject || !ids.length) return;
+    const updatedChapter = removeChapterAnnotations(activeChapter, ids);
+    const updated = replaceChapterInProject(editingProject, updatedChapter);
+    setEditingProject(updated);
+    setActiveChapter(updatedChapter);
+    setProjects(current => current.map(project => project.id === updated.id ? updated : project));
+  };
+
+  /**
+   * 按批注修订：每条批注只改它所在的段落，其余正文不经过模型
+   * 同一段的批注合并成一次调用；逐段串行，改完一段立刻写回；失效的批注（原文片段已经不在正文里）跳过并提示
+   */
+  const reviseByAnnotations = async () => {
+    if (!activeChapter || !editingProject || annotationRunning) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中配置可用模型。' });
+      return;
+    }
+    const { targets, stale } = resolveAnnotationTargets(activeChapter.content, activeChapter.annotations || []);
+    if (!targets.length) {
+      setNotice({ title: '没有可修订的批注', content: stale.length ? `${stale.length} 条批注的原文片段已经不在正文里，删掉后重新选段。` : '先选中一段正文并写下批注。' });
+      return;
+    }
+    setAnnotationRunning(true);
+    let chapter = pushChapterSnapshot(activeChapter, '按批注修订');
+    let done = 0;
+    const failures: string[] = [];
+    try {
+      for (const target of targets) {
+        // 段落里出场的人物卡跟着送过去，模型才知道这个人该怎么说话
+        const cards = editingProject.cards.filter(card => cardSearchTerms(card).some(term => target.paragraph.includes(term))).slice(0, 6).map(card => ({ title: card.title, content: card.content }));
+        const neighbors = paragraphNeighbors(chapter.content, target);
+        try {
+          const result = await agentRpc<{ content?: string }>('text.transform', {
+            mode: 'annotate',
+            content: target.paragraph,
+            notes: target.annotations.map(item => item.note),
+            before: neighbors.before,
+            after: neighbors.after,
+            cards,
+            projectTitle: editingProject.title,
+            chapterTitle: chapter.title,
+            apiKey: agentConfig.apiKey.trim(),
+            baseURL: agentConfig.baseURL.trim(),
+            model: agentConfig.model.trim() || fallbackModels[0],
+            apiMode: agentConfig.apiMode,
+            reasoningMode: agentConfig.reasoningMode,
+            contextWindow: agentConfig.contextWindow,
+            ...agentNetworkParams(agentConfig),
+          });
+          const content = applyParagraphRevision(chapter.content, target, result.content || '');
+          if (!content) throw new Error('模型没有返回改后的段落');
+          chapter = { ...removeChapterAnnotations(chapter, target.annotations.map(item => item.id)), content, wordCount: countNovelCharacters(content) };
+          done += 1;
+        } catch (error) {
+          failures.push(`「${target.annotations[0].quote.slice(0, 20)}」：${String(error)}`);
+        }
+      }
+      const updated = replaceChapterInProject(editingProject, chapter);
+      await applyProjectChange(updated);
+      setActiveChapter(chapter);
+      setNotice({
+        title: `按批注改了 ${done}/${targets.length} 段`,
+        content: [failures.length ? `失败：${failures.join('；')}` : '', stale.length ? `${stale.length} 条批注的原文已不在正文里，未处理` : '', '旧版本在章节历史里，可回退。'].filter(Boolean).join(' '),
+      });
+    } finally {
+      setAnnotationRunning(false);
+    }
+  };
+
+  /** 常驻开关：常驻卡每章必带，写正文与生成章纲都带 */
+  const toggleCardPinned = (cardId: number) => {
+    updateEditorProject(project => ({
+      ...project,
+      cards: project.cards.map(card => card.id === cardId ? { ...card, pinned: !card.pinned, updatedAt: new Date().toISOString() } : card),
+      updatedAt: new Date().toISOString(),
+    }));
   };
 
   const moveDocumentSearchMatch = (content: string, label: string, direction: 1 | -1) => {
@@ -6859,6 +6968,7 @@ function App() {
                     {visibleCards.map(card => (
                       <div key={card.id} className={`knowledge-card-item ${activeCardId === card.id ? 'active' : ''}`} onClick={() => editCard(card)}>
                         <div><strong>{card.title}</strong><small>{card.type} · {card.currentState ? card.currentState.slice(0, 80) : '状态未更新'}</small></div>
+                        <button className={`link-button ${card.pinned ? 'card-pinned' : ''}`} title={card.pinned ? '常驻中：每章必带，点一下取消' : '设为常驻：写正文与生成章纲时每章必带'} onClick={(event) => { event.stopPropagation(); toggleCardPinned(card.id); }}>{card.pinned ? '常驻' : '设常驻'}</button>
                         <button className="chapter-location-button" title="打开卡片文件所在位置" aria-label={`打开${card.title}文件所在位置`} onClick={(event) => { event.stopPropagation(); handleOpenCardLocation(card); }}>打开位置</button>
                         <button className="link-button" title="全文检索并更新卡片状态" onClick={(event) => { event.stopPropagation(); editCard(card); void updateCardStatesFromBook(card.id); }}>更新状态</button>
                         <button className="icon-delete" title="删除卡片" onClick={(event) => { event.stopPropagation(); deleteCard(card.id); }}><Icon name="trash" size={14} /></button>
@@ -7126,6 +7236,7 @@ function App() {
                       <button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button>
                       <span className="search-shortcut">⌘/Ctrl F</span>
                     </div>
+                    <button className={`editor-tool-button ${showAnnotationPanel ? 'active' : ''}`} title="选中一段正文写批注，只改那一段" onClick={() => setShowAnnotationPanel(current => !current)}>批注{activeChapter.annotations?.length ? ` ${activeChapter.annotations.length}` : ''}</button>
                     <button className="editor-tool-button" title="统一换行、清理多余空格和空行" onClick={formatActiveChapter} disabled={!activeChapter.content.trim()}>格式化正文</button>
                     <span className="chapter-goal-status">目标 {Number(editingProject.chapterTargetWords) || 3000} 字 · 上限 {Math.floor((Number(editingProject.chapterTargetWords) || 3000) * 1.2)} 字</span>
                   </div>
@@ -7137,6 +7248,26 @@ function App() {
                         <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}><Icon name="x" size={14} /></button>
                       </div>
                       <div className="search-panel-row replace-row"><input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} /><button className="editor-tool-button" onClick={replaceCurrentMatch} disabled={!searchQuery}>替换</button><button className="editor-tool-button" onClick={replaceAllMatches} disabled={!searchQuery}>全部替换</button><small>{currentSearchMatches ? `${Math.min(searchMatchIndex + 1, currentSearchMatches)} / ${currentSearchMatches}` : '无匹配'}</small></div>
+                    </section>
+                  )}
+                  {showAnnotationPanel && (
+                    <section className="search-panel annotation-panel" aria-label="正文批注">
+                      <div className="search-panel-row">
+                        <input className="input" value={annotationDraft} placeholder="先在正文里选中一段，再写要怎么改，例如：沈妄这里不会这么说，他会先把账本合上" onChange={event => setAnnotationDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') addAnnotationFromSelection(); }} />
+                        <button className="editor-tool-button" onClick={addAnnotationFromSelection} disabled={!annotationDraft.trim()}>加批注</button>
+                        <button className="editor-tool-button" disabled={annotationRunning || !activeChapter.annotations?.length} onClick={() => void reviseByAnnotations()}>{annotationRunning ? '修订中…' : `按批注修订（${activeChapter.annotations?.length || 0}）`}</button>
+                        <button className="icon-delete" title="关闭批注" onClick={() => setShowAnnotationPanel(false)}><Icon name="x" size={14} /></button>
+                      </div>
+                      {activeChapter.annotations?.length ? (() => {
+                        const staleIds = new Set(resolveAnnotationTargets(activeChapter.content, activeChapter.annotations).stale.map(item => item.id));
+                        return <div className="annotation-list">{activeChapter.annotations.map(item => (
+                          <div key={item.id} className={`annotation-item ${staleIds.has(item.id) ? 'stale' : ''}`}>
+                            <blockquote title={item.quote}>{item.quote.length > 60 ? `${item.quote.slice(0, 60)}…` : item.quote}</blockquote>
+                            <p>{item.note}{staleIds.has(item.id) ? <small>原文已不在正文里</small> : null}</p>
+                            <button className="icon-delete" title="删除批注" onClick={() => removeAnnotation([item.id])}><Icon name="x" size={12} /></button>
+                          </div>
+                        ))}</div>;
+                      })() : <small className="search-panel-hint">每条批注只改它所在的那一段，其余正文不经过模型；段落里出场的人物卡会一起给模型。</small>}
                     </section>
                   )}
                   <div className="chapter-title-wrap">

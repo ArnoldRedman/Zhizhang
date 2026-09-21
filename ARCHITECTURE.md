@@ -89,7 +89,7 @@ React 通过 `src/services/agent-client.ts` 调用 Agent RPC，通过 `native-cl
 
 - `rpc/model-handlers.ts`：模型列表、诊断、测试和用量。
 - `rpc/content-handlers.ts`：作品信息和技能生成。
-- `rpc/text-handlers.ts`：文本变换。
+- `rpc/text-handlers.ts`：文本变换（润色、去 AI 味、续写、整章修订、按批注只改一段）。
 - `rpc/library-handlers.ts`：书籍、榜单、拆书和文风相关 RPC。
 - `sources/library-service.ts`：Fanqie、千阅、其他书源和榜单抓取。
 

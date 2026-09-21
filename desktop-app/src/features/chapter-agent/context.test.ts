@@ -152,3 +152,15 @@ test('重写历史章时聚合文档只到本章之前，最后一章照旧用�
   const latest = buildChapterWriteContext({ project: project(), chapter: chapters[3], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
   assert.equal(documents(latest).find(document => document.kind === '章节快照')!.content, '# 章节快照');
 });
+
+test('常驻卡片每章必带：自动挑时排最前且不占名额，作者勾了别的卡时也照带', () => {
+  const current = project({
+    chapters: [chapter(1, '什么都没提到。'), chapter(2)],
+    cards: [...project().cards, { id: 3, type: '势力卡', title: '书肆', content: '', pinned: true, createdAt: now, updatedAt: now }],
+  });
+  assert.deepEqual(effectiveCards(current, [], '无关的正文').map(card => card.title), ['书肆']);
+  assert.deepEqual(effectiveCards(current, [], '沈砚推门').map(card => card.title), ['书肆', '沈砚']);
+  assert.deepEqual(effectiveCards(current, [2], '沈砚推门').map(card => card.title), ['书肆', '灯塔']);
+  // 勾选里包含常驻卡时不重复
+  assert.deepEqual(effectiveCards(current, [2, 3], '沈砚推门').map(card => card.title), ['书肆', '灯塔']);
+});

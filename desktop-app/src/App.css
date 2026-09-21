@@ -4687,3 +4687,14 @@ select.input {
 .dismantle-aggregate-body article p { margin: 0; color: var(--text-3); font-size: 11px; line-height: 1.55; }
 .dismantle-aggregate-body details summary { color: var(--text-3); font-size: 11px; cursor: pointer; }
 .dismantle-aggregate-body pre { max-height: 260px; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); overflow: auto; color: var(--text-4); font: 11px/1.55 ZhizhangFanqie, ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+
+/* 正文批注：选中一段写一句要求，只改那一段 */
+.annotation-panel .search-panel-hint { color: var(--text-5); font-size: 11px; }
+.annotation-list { display: grid; gap: 6px; max-height: 200px; overflow-y: auto; }
+.annotation-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+.annotation-item.stale { opacity: .6; }
+.annotation-item blockquote { grid-column: 1; margin: 0; padding-left: 8px; border-left: 2px solid var(--line-strong); color: var(--text-4); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-item p { grid-column: 1; margin: 0; color: var(--text-2); font-size: 12px; }
+.annotation-item p small { margin-left: 6px; color: var(--warn-fg); font-size: 10px; }
+.annotation-item .icon-delete { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+.knowledge-card-item .link-button.card-pinned { color: var(--accent-2-fg); font-weight: 600; }

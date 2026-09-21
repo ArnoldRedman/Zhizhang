@@ -20,6 +20,8 @@ export interface Chapter {
   snapshots?: ChapterSnapshot[];
   /** 作家的话 / 作家寄语 (PS)，不计入正文字数 */
   authorNote?: string;
+  /** 作者的正文批注：按原文片段定位，"按批注修订"时只改批注所在段落 */
+  annotations?: Array<{ id: string; quote: string; note: string; createdAt: string }>;
 }
 
 export interface OutlineNode {
@@ -52,6 +54,8 @@ export interface KnowledgeCard {
   content: string;
   currentState?: string;
   stateHistory?: Array<{ chapterId: number; chapterTitle: string; status: string; changes: string; updatedAt: string }>;
+  /** 常驻：写正文与生成章纲时每章必带，不看正文里有没有提到 */
+  pinned?: boolean;
   createdAt: string;
   updatedAt: string;
 }

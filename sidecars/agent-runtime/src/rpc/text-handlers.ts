@@ -1,8 +1,8 @@
-import { createModelApiClient } from "../application/model-client.js";
-import { chapterRevisePrompt, wholeChapterTokenBudget } from "../application/text-prompts.js";
+import { createModelApiClient, stringList } from "../application/model-client.js";
+import { chapterRevisePrompt, paragraphAnnotationPrompt, wholeChapterTokenBudget } from "../application/text-prompts.js";
 import type { RpcRegistry } from "./registry.js";
 
-const textModes = new Set(["polish", "de-ai", "continue", "revise"]);
+const textModes = new Set(["polish", "de-ai", "continue", "revise", "annotate"]);
 
 export const registerTextHandlers = (registry: RpcRegistry): RpcRegistry => registry
   .register("text.transform", async params => {
@@ -10,6 +10,22 @@ export const registerTextHandlers = (registry: RpcRegistry): RpcRegistry => regi
     if (!content && !previousChapter) throw new Error("缺少文本处理所需参数");
     if (typeof mode !== "string" || !textModes.has(mode)) throw new Error("不支持的文本处理类型");
     const client = createModelApiClient(params, { model: "gpt-4o-mini" });
+    // 按批注只改一段：输入是那一段加前后文，输出只有那一段，几百字，走非流式就够
+    if (mode === "annotate") {
+      const notes = stringList(params.notes, 12);
+      if (!notes.length) throw new Error("缺少批注内容");
+      const cards = Array.isArray(params.cards)
+        ? params.cards.filter(item => item && typeof item === "object").map(item => ({ title: String((item as Record<string, unknown>).title || ""), content: String((item as Record<string, unknown>).content || "").slice(0, 4000) })).slice(0, 6)
+        : [];
+      const prompt = paragraphAnnotationPrompt({
+        projectTitle, chapterTitle, notes, paragraph: String(content),
+        before: typeof params.before === "string" ? params.before : undefined,
+        after: typeof params.after === "string" ? params.after : undefined,
+        cards,
+      });
+      const response = await client.chat([{ role: "user", content: prompt }], { temperature: 0.7, max_tokens: Math.min(4000, Math.max(800, Math.ceil(String(content).length * 2))), retryAttempts: 2 });
+      return { content: response.content.trim().replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim() };
+    }
     const extraRequirement = String(instruction || "").trim();
     const numericLimit = Math.max(1, Math.floor(Number(maxWords) || 0));
     const prompt = mode === "polish"

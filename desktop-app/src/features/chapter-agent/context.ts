@@ -66,6 +66,7 @@ export const stageBeatsFor = (project: Project, chapterNumber: number): OutlineD
  * 只用主词（卡名/别名/能力名），次词会把“中心”“法庭”这类到处都有的词当成命中
  */
 const autoSelectCards = (project: Project, haystack: string, limit = 8): KnowledgeCard[] => project.cards
+  .filter(card => !card.pinned)
   .map(card => ({
     card,
     score: (card.type === '金手指卡' ? 100 : 0) + cardSearchTermGroups(card).primary.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0),
@@ -76,12 +77,16 @@ const autoSelectCards = (project: Project, haystack: string, limit = 8): Knowled
   .map(entry => entry.card);
 
 /**
- * 本次入场卡片：勾了就用勾的，没勾自己挑——懒人化就是这一条，不选也不会缺人物素材
+ * 本次入场卡片：常驻卡每章必带；其余勾了就用勾的，没勾自己挑——懒人化就是这一条，不选也不会缺人物素材
  * 章纲生成与正文写作共用同一套规矩，免得一边自动一边空手
  */
-export const effectiveCards = (project: Project, selectedCardIds: number[], haystack: string): KnowledgeCard[] => (selectedCardIds.length
-  ? project.cards.filter(card => selectedCardIds.includes(card.id))
-  : autoSelectCards(project, haystack));
+export const effectiveCards = (project: Project, selectedCardIds: number[], haystack: string): KnowledgeCard[] => {
+  const pinned = project.cards.filter(card => card.pinned);
+  const rest = selectedCardIds.length
+    ? project.cards.filter(card => selectedCardIds.includes(card.id) && !card.pinned)
+    : autoSelectCards(project, haystack);
+  return [...pinned, ...rest];
+};
 
 export interface ChapterWriteContextInput {
   project: Project;
