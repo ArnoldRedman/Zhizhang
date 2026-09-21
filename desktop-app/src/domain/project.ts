@@ -191,6 +191,10 @@ export interface Project {
   quoteStyle?: 'curly' | 'corner' | 'ascii';
   /** 作者允许的字面句式（一行一个）：验证门命中它们时不报风格类问题 */
   allowedPhrases?: string[];
+  /** 作品默认技能：写正文时每章必带，按章纲匹配的技能在它之上追加；文风走 styleProfileId 单独绑定 */
+  defaultSkillNames?: string[];
+  /** 单章 AI 率上限（本地启发式，百分比）：写完超过就对疑似段落去一次 AI 味；缺省 30 */
+  maxAIRate?: number;
   githubRepositoryUrl?: string;
   /** 每日码字量，键为本地日期 YYYY-MM-DD */
   dailyWords?: Record<string, number>;

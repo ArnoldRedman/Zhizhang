@@ -422,3 +422,47 @@ describe("正文文本拆分", () => {
     expect(splitDraftTitleLine("“走吧。”她说。\n他没动。")).toEqual({ title: "", content: "“走吧。”她说。\n他没动。" });
   });
 });
+
+describe("skills and cast in the writing graph", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("默认技能进正文提示词、按章纲匹配的技能追加；正文阶段只带构思点到名的卡，构思阶段带全部卡", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = messagesOf(init);
+      if (messages.includes("先想一想")) return ok("这一章只写周伯在书肆守夜，等一封信。");
+      if (messages.includes("待审查章节")) return ok(passReview);
+      return ok("守夜\n\n周伯把灯芯挑了挑。");
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "cast-project", title: "出场测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "cast-project", chapterId: "7", chapterNumber: 7, instruction: "继续写本章",
+      outline: "本章：码头夜战之后的余波，周伯守店",
+      skillCatalog: [
+        { name: "story-long-write", category: "write", description: "长篇", tags: ["长篇"], content: "长篇写法。" },
+        { name: "fight-scene", displayName: "战斗场面", category: "write", description: "打斗", tags: ["夜战"], content: "打斗写法。" },
+        { name: "story-review", category: "review", description: "审查", tags: ["余波"], content: "审查规矩。" },
+      ],
+      defaultSkillNames: ["story-long-write"],
+      cards: [{ type: "角色卡", title: "沈妄", content: "沈妄卡" }, { type: "角色卡", title: "周伯", content: "周伯卡" }],
+    });
+    expect(result.selectedSkills).toEqual(["story-long-write", "fight-scene"]);
+    const planRequest = requests.find(body => JSON.stringify(body.messages || "").includes("先想一想"));
+    const draftRequest = requests.find(body => JSON.stringify(body.messages || "").includes("写第 7 章正文"));
+    const planText = JSON.stringify(planRequest?.messages);
+    const draftText = JSON.stringify(draftRequest?.messages);
+    expect(planText).toContain("沈妄卡");
+    expect(planText).toContain("周伯卡");
+    expect(planText).toContain("谁出场由本章构思定");
+    expect(draftText).toContain("周伯卡");
+    expect(draftText).not.toContain("沈妄卡");
+    expect(draftText).toContain("本章出场人物与设定卡");
+    expect(draftText).toContain("长篇写法");
+    expect(draftText).toContain("打斗写法");
+    expect(draftText).not.toContain("审查规矩");
+    store.close();
+  });
+});

@@ -151,6 +151,32 @@ function splitSessionContext(value?: string): { summary: string; recent: string 
   return { summary: context.slice(0, index).trim(), recent: context.slice(index).trim() };
 }
 
+/** 只有写作与润色类技能会进正文提示词；审查、拆书、工具类的规矩混进来只会让模型束手束脚 */
+const chapterSkillCategories = new Set(["write", "polish"]);
+/** 流程词不算场景标签："继续写第三章"里的"续写"、章纲里的"正文"到处都是，按它们匹配等于每章都带满 */
+const genericSkillTerms = new Set(["正文", "章节", "续写", "写作", "长篇", "短篇", "大纲", "结构", "润色", "小说", "创作", "剧情"]);
+
+/**
+ * 本章技能：作品默认技能每章必带，作者本次勾选的其次，再按章纲、节拍与指令里出现的标签自动匹配
+ * 匹配只认整词命中（标签或显示名原样出现），不做分词打分：分词打分会把"章节""正文"这种到处都有的词当成命中，
+ * 结果就是每章都带满四条。日常过渡章命不中任何标签，就只带默认技能
+ */
+export function routeChapterSkills(input: { catalog: SkillDefinition[]; defaultNames: string[]; preferredNames: string[]; haystack: string; limit?: number }): { skills: SkillDefinition[]; routed: SkillDefinition[] } {
+  const limit = input.limit ?? 4;
+  const byName = (name: string) => input.catalog.find(skill => skill.name === name);
+  const defaults = input.defaultNames.map(byName).filter((skill): skill is SkillDefinition => Boolean(skill));
+  const preferred = input.preferredNames.map(byName).filter((skill): skill is SkillDefinition => Boolean(skill));
+  const haystack = input.haystack.toLowerCase();
+  const routed = input.catalog.filter(skill => {
+    if (!chapterSkillCategories.has(skill.category || "write")) return false;
+    if (defaults.includes(skill) || preferred.includes(skill)) return false;
+    const terms = [skill.displayName || "", ...(skill.tags || [])].map(term => term.trim().toLowerCase()).filter(term => term.length >= 2 && !genericSkillTerms.has(term));
+    return terms.some(term => haystack.includes(term));
+  });
+  const skills = [...defaults, ...preferred, ...routed].filter((skill, index, list) => list.findIndex(item => item.name === skill.name) === index).slice(0, limit);
+  return { skills, routed: routed.filter(skill => skills.includes(skill)) };
+}
+
 export function selectSkillsByIntent(instruction: string, catalog: SkillDefinition[]): { intent: string; skills: SkillDefinition[] } {
   const query = instruction.toLowerCase();
   const scored = catalog.map(skill => {
@@ -202,6 +228,8 @@ export const ChapterState = Annotation.Root({
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
   preferredSkillNames: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
+  /** 作品默认技能：项目设置里绑定，每章必带；按章纲与指令自动匹配的技能在它之上追加 */
+  defaultSkillNames: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   selectedSkills: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   recognizedIntent: Annotation<string | undefined>,
   retrievedContext: Annotation<string[]>({
@@ -283,6 +311,15 @@ export function chapterDraftMaxTokens(targetWords: number, contextWindowKTokens?
   return Math.max(2000, Math.min(wanted, cap));
 }
 
+/**
+ * 正文阶段的出场卡：构思里点到名的才带，构思没安排的人（哪怕是常驻的主角）本章就不出现
+ * 支线章、第二视角的伏笔章靠这条才能只写配角；金手指卡是世界规则不是人物，一律带
+ */
+export function castCards(cards: Array<{ type?: string; title: string; content: string }> | undefined, chapterPlan: string | undefined): Array<{ type?: string; title: string; content: string }> {
+  if (!cards?.length || !chapterPlan?.trim()) return cards || [];
+  return cards.filter(card => card.type === "金手指卡" || chapterPlan.includes(card.title.trim()));
+}
+
 /** 正文、计划、重写三处看到的资料是同一份；各写一份迟早会漂移 */
 function chapterMaterialPacket(state: ChapterStateType): string {
   const contextSection = state.retrievedContext.length > 0
@@ -291,7 +328,7 @@ function chapterMaterialPacket(state: ChapterStateType): string {
   const outlineSection = state.outline ? `\n## 本章章纲\n${state.outline}\n` : "";
   const graphSection = state.knowledgeGraph ? `\n## 知识图谱\n${state.knowledgeGraph}\n` : "";
   const cardsSection = state.cards?.length
-    ? `\n## 本章人物与设定卡\n${state.cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}\n`
+    ? `\n## ${state.chapterPlan ? "本章出场人物与设定卡" : "人物与设定卡（资料；谁出场由本章构思定，常驻的人也可以整章不出现）"}\n${state.cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}\n`
     : "";
   // 只带作者亲手勾的技能：自动按关键词塞三条截断到七百字节的技能，等于往提示词里加一堆残缺的规矩
   const skillsSection = state.selectedSkills.length
@@ -329,8 +366,8 @@ function chapterDraftPrompts(state: ChapterStateType, contextWindowKTokens?: num
 } {
   const stablePacket = stableProjectPacket(state);
   const session = splitSessionContext(state.sessionContext);
-  // 正文阶段只带一段与构思基调相同的对标锚点和一张模块：整份聚合塞进来模型会照着抄结构
-  const dynamicPacket = chapterMaterialPacket(state) + benchmarkDraftSection(state.benchmark, state.chapterPlan).section;
+  // 正文阶段只带一段与构思基调相同的对标锚点和一张模块：整份聚合塞进来模型会照着抄结构；卡片只带构思里出场的
+  const dynamicPacket = chapterMaterialPacket({ ...state, cards: castCards(state.cards, state.chapterPlan) }) + benchmarkDraftSection(state.benchmark, state.chapterPlan).section;
   // 字数读项目设置，写死两三千字会让作者设的目标形同虚设
   const targetWords = state.targetWords && state.targetWords > 0 ? Math.round(state.targetWords) : 3000;
   const planSection = state.chapterPlan ? `\n\n## 这一章的想法\n${state.chapterPlan}` : "";
@@ -382,14 +419,23 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       return { prewriteCheck };
     })
     .addNode("intent", async (state: ChapterStateType) => {
-      // 只认作者亲手勾选的技能；按指令关键词自动挑技能会把审查、润色类的规矩混进写作提示词
-      const preferred = state.preferredSkillNames.map(name => state.skillCatalog.find(skill => skill.name === name)).filter((skill): skill is SkillDefinition => Boolean(skill));
-      const selectedSkills = preferred.filter((skill, index, list) => list.findIndex(item => item.name === skill.name) === index).slice(0, 4);
-      emitter?.progress("intent", 8, selectedSkills.length ? `作者指定技能：${selectedSkills.map(skill => skill.displayName || skill.name).join("、")}` : "没有指定技能，按资料直接写");
-      emitter?.context("intent", "作者指定的写作技能", { source: "SkillRouter", status: "selected", items: selectedSkills.length });
+      const { skills, routed } = routeChapterSkills({
+        catalog: state.skillCatalog,
+        defaultNames: state.defaultSkillNames,
+        preferredNames: state.preferredSkillNames,
+        haystack: [state.outline, state.chapterBeat, state.instruction].filter(Boolean).join("\n"),
+      });
+      const label = (list: SkillDefinition[]) => list.map(skill => skill.displayName || skill.name).join("、");
+      const parts = [
+        state.defaultSkillNames.length ? `作品默认：${label(skills.filter(skill => state.defaultSkillNames.includes(skill.name)))}` : "",
+        state.preferredSkillNames.length ? `本次指定：${label(skills.filter(skill => state.preferredSkillNames.includes(skill.name)))}` : "",
+        routed.length ? `按章纲匹配：${label(routed)}` : "",
+      ].filter(Boolean);
+      emitter?.progress("intent", 8, parts.length ? parts.join("；") : "没有默认技能，本章也没匹配到技能，按资料直接写");
+      emitter?.context("intent", "本章写作技能", { source: "SkillRouter", status: "selected", items: skills.length });
       return {
         recognizedIntent: "章节创作与续写",
-        selectedSkills: selectedSkills.map(skill => skill.name),
+        selectedSkills: skills.map(skill => skill.name),
       };
     })
     .addNode("retrieve", async (state: ChapterStateType) => {

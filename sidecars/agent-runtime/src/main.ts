@@ -18,7 +18,7 @@ import { planChapterSplits } from "./application/chapter-split.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
 import { registerLibraryHandlers } from "./rpc/library-handlers.js";
-import { registerContentHandlers } from "./rpc/content-handlers.js";
+import { registerCardRefreshHandler, registerContentHandlers } from "./rpc/content-handlers.js";
 import { registerTextHandlers } from "./rpc/text-handlers.js";
 import type { RpcResponse } from "@zhizhang/contracts";
 
@@ -903,6 +903,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           cards: prepared.cards,
           skillCatalog: prepared.skills,
           preferredSkillNames: stringList(preferredSkillNames, 8),
+          defaultSkillNames: stringList(req.params?.defaultSkillNames, 6),
           contextReport,
           sessionContext,
           authorPreferences: stringList(authorPreferences, 20),
@@ -972,7 +973,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
   }
 }
 
-const rpcRegistry = registerTextHandlers(registerContentHandlers(registerLibraryHandlers(registerModelHandlers(new RpcRegistry(handleLegacyRequest)))));
+const rpcRegistry = registerTextHandlers(registerCardRefreshHandler(registerContentHandlers(registerLibraryHandlers(registerModelHandlers(new RpcRegistry(handleLegacyRequest))))));
 
 async function main() {
   process.stdin.setEncoding("utf8");

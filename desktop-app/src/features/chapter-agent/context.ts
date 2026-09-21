@@ -151,6 +151,7 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
       stageBeats: stageBeatsFor(project, chapterNumber)?.content,
       skills,
       preferredSkillNames: input.preferredSkillNames.filter(name => input.skills.some(skill => skill.name === name)),
+      defaultSkillNames: (project.defaultSkillNames || []).filter(name => input.skills.some(skill => skill.name === name)),
       previousChapters: previousChapter ? [{ id: previousChapter.id, title: previousChapter.title, content: previousChapter.content }] : [],
       memories: priorMemories.map(memory => ({
         id: memory.id,

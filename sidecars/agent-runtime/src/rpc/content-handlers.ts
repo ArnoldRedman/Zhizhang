@@ -1,4 +1,5 @@
 import { createModelApiClient, stringList } from "../application/model-client.js";
+import { compactText, contextBudgetBytes } from "../context/context-optimizer.js";
 import type { RpcRegistry } from "./registry.js";
 
 /** 从模型返回里剥掉 ```json 围栏，失败时返回原始文本 */
@@ -83,4 +84,42 @@ export const registerContentHandlers = (registry: RpcRegistry): RpcRegistry => r
       content: trimmed(parsed.content, response.content),
       tags: stringList(parsed.tags, 12),
     };
+  });
+
+/**
+ * 卡片批量刷新：按最近几章正文把每张卡的"当前状态"重写一遍
+ * 逐章记忆提炼只更新本章提到的卡，十几章下来没被点名的卡状态就停在旧处；这里一次调用把全部卡对着近期正文重新校准。
+ * 只改 currentState，不动卡片正文（那是作者写的设定）；没依据的卡返回空串，调用方跳过
+ */
+export const registerCardRefreshHandler = (registry: RpcRegistry): RpcRegistry => registry
+  .register("card.refresh", async params => {
+    const { projectTitle, cards, chapters, contextWindow } = params;
+    const list = Array.isArray(cards) ? cards.filter(item => item && typeof item === "object").map(item => item as Record<string, unknown>) : [];
+    const recent = Array.isArray(chapters) ? chapters.filter(item => item && typeof item === "object").map(item => item as Record<string, unknown>) : [];
+    if (!list.length) throw new Error("没有可刷新的卡片");
+    if (!recent.length) throw new Error("没有可对照的章节正文");
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
+    const budget = contextBudgetBytes(Number(contextWindow) || undefined, 60, 24);
+    const perChapter = Math.max(2000, Math.floor(budget / recent.length));
+    const chapterText = recent.map(item => `### ${compactText(item.title || "", 60)}\n${compactText(item.content || "", perChapter)}`).join("\n\n");
+    const cardText = list.map(item => `- [${compactText(item.type || "知识卡", 20)}] ${compactText(item.title || "", 60)}（id ${String(item.id)}）\n  现状：${compactText(item.currentState || "（空）", 400)}\n  设定摘录：${compactText(item.content || "", 600)}`).join("\n");
+    const prompt = `你是《${String(projectTitle || "未命名小说")}》的档案员。下面是最近几章正文和全部知识卡的现状。请对照正文，把每张卡的"当前状态"改成截至最新一章的实际情况：这个人现在在哪、在做什么、和谁的关系变成了什么、手里有什么、知道了什么；地点和势力卡写现在的状态与归属。只写正文有依据的事，正文没提到、现状也没变的卡返回空字符串。每张卡的状态两三句，不超过 200 字。
+
+## 最近几章正文
+${chapterText}
+
+## 知识卡
+${cardText}
+
+只返回 JSON：{"cards":[{"id":"卡片 id","currentState":"新的当前状态，没变化就空串"}]}`;
+    const response = await client.chat([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 6000, retryAttempts: 2 });
+    const parsed = JSON.parse(response.content.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "")) as Record<string, unknown>;
+    const updates = (Array.isArray(parsed.cards) ? parsed.cards : []).flatMap(item => {
+      const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const currentState = String(entry.currentState || "").trim();
+      const id = String(entry.id || "").trim();
+      if (!id || !currentState) return [];
+      return [{ id, currentState: currentState.slice(0, 600) }];
+    });
+    return { updates, usage: response.usage };
   });

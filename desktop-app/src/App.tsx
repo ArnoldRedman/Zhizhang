@@ -15,7 +15,7 @@ import { mergeKnowledgeGraph } from './domain/graph-merge';
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
 import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
-import { buildAIDetectionReport } from './domain/ai-detection';
+import { analyzeAIChapter, buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
 import type { DismantleChapter, DismantleBook, DismantleAggregate, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
@@ -243,6 +243,10 @@ interface AgentDraftResult {
   authorNotes?: string[];
   /** 本地验证门的结果：句式、标点、开头结尾同型、对话密度 */
   lintFindings?: Array<{ type: string; severity: 'blocking' | 'advisory'; line: number; excerpt: string; message: string }>;
+  /** 本地启发式 AI 率（百分比）：去 AI 味前后各一个，和项目上限一起展示 */
+  aiRate?: number;
+  aiRateBefore?: number;
+  aiRateLimit?: number;
   prewriteCheck?: { blockers: string[]; warnings: string[]; summary: string };
   reviewResult?: AgentReviewResult;
   retrievedContext?: string[];
@@ -1290,6 +1294,7 @@ function App() {
   const [showChapterCardPicker, setShowChapterCardPicker] = useState(false);
   const [cardTypeFilter, setCardTypeFilter] = useState<CardType | '全部'>('全部');
   const [cardDraft, setCardDraft] = useState<{ type: CardType; title: string; content: string }>({ type: '角色卡', title: '', content: '' });
+  const [cardRefreshing, setCardRefreshing] = useState(false);
   const [cardGenerating, setCardGenerating] = useState(false);
   // One state object so a first-run install cannot generate two different
   // profile IDs for the list and for the active pointer.
@@ -4135,6 +4140,59 @@ function App() {
     setNotice({ title: '全书标点已统一', content: `改了 ${changed} 章，旧版本都进了章节历史${unbalanced ? `；${unbalanced} 行引号未闭合，保持原样` : ''}。` });
   };
 
+  /**
+   * 全部卡片按最近几章正文重写"当前状态"：一次模型调用，只改状态不动卡片正文
+   * 连续创作每十章自动跑一次；卡片面板也能手动点。没变化的卡返回空串就不动
+   */
+  const refreshAllCardStates = async (project: Project, throughChapterNumber: number): Promise<Project> => {
+    const chapters = project.chapters.slice(Math.max(0, throughChapterNumber - 10), throughChapterNumber).filter(chapter => chapter.content.trim());
+    if (!project.cards.length || !chapters.length) return project;
+    const result = await agentRpc<{ updates?: Array<{ id?: string; currentState?: string }> }>('card.refresh', {
+      projectTitle: project.title,
+      cards: project.cards.map(card => ({ id: card.id, type: card.type, title: card.title, content: card.content, currentState: card.currentState || '' })),
+      chapters: chapters.map(chapter => ({ title: chapter.title, content: chapter.content })),
+      apiKey: agentConfig.apiKey.trim(),
+      baseURL: agentConfig.baseURL.trim(),
+      model: agentConfig.model.trim() || fallbackModels[0],
+      apiMode: agentConfig.apiMode,
+      reasoningMode: agentConfig.reasoningMode,
+      contextWindow: agentConfig.contextWindow,
+      ...agentNetworkParams(agentConfig),
+    });
+    const updates = new Map((result.updates || []).filter(item => item.id && item.currentState?.trim()).map(item => [String(item.id), String(item.currentState).trim()]));
+    if (!updates.size) return project;
+    const now = new Date().toISOString();
+    const anchor = chapters[chapters.length - 1];
+    return {
+      ...project,
+      cards: project.cards.map(card => {
+        const currentState = updates.get(String(card.id));
+        if (!currentState || currentState === card.currentState) return card;
+        return { ...card, currentState, stateHistory: [...(card.stateHistory || []), { chapterId: anchor.id, chapterTitle: anchor.title, status: 'refreshed', changes: currentState, updatedAt: now }].slice(-30), updatedAt: now };
+      }),
+      updatedAt: now,
+    };
+  };
+
+  const refreshCardStatesNow = async () => {
+    if (!editingProject || cardRefreshing) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥。' });
+      return;
+    }
+    setCardRefreshing(true);
+    try {
+      const updated = await refreshAllCardStates(editingProject, editingProject.chapters.length);
+      const changed = updated.cards.filter((card, index) => card.currentState !== editingProject.cards[index]?.currentState).length;
+      await applyProjectChange(updated);
+      setNotice({ title: '卡片状态已刷新', content: changed ? `按最近十章正文更新了 ${changed} 张卡的当前状态。` : '最近十章正文里卡片状态没有变化。' });
+    } catch (error) {
+      setNotice({ title: '卡片状态刷新失败', content: String(error) });
+    } finally {
+      setCardRefreshing(false);
+    }
+  };
+
   const updateCardStatesFromBook = async (cardId?: number) => {
     if (!editingProject) return;
     let searchProject = editingProject;
@@ -4667,6 +4725,24 @@ function App() {
    * 依据和手动生成完全一样：总纲骨架、故事账本、上一章正文、上一章章纲的格式，再加上作者这次给章节智能体的创作指令；
    * 结果存进大纲页，作者随时可以改，不用为了写一章先去大纲页点一遍
    */
+  /**
+   * 丢掉本章旧章纲：从构思重来时用
+   * 只删绑定到本章的那份，阶段节拍表不动（它是按总纲规划的一段，不是原稿的产物）；图谱里对应的节点与边一起清
+   */
+  const discardChapterOutline = (project: Project, chapter: Chapter): Project => {
+    const stale = boundChapterOutlineFor(project, chapter);
+    if (!stale) return project;
+    const updated: Project = {
+      ...project,
+      outlines: project.outlines.filter(outline => outline.id !== stale.id),
+      graphNodes: project.graphNodes.filter(node => node.id !== `outline:${stale.id}`),
+      graphEdges: project.graphEdges.filter(edge => edge.source !== `outline:${stale.id}` && edge.target !== `outline:${stale.id}`),
+      updatedAt: new Date().toISOString(),
+    };
+    setEditingProject(current => current && current.id === project.id ? { ...current, outlines: updated.outlines, graphNodes: updated.graphNodes, graphEdges: updated.graphEdges, updatedAt: updated.updatedAt } : current);
+    return updated;
+  };
+
   const autoGenerateChapterOutline = async (project: Project, chapter: Chapter, instruction: string, runId: string): Promise<Project> => {
     const index = project.chapters.findIndex(item => item.id === chapter.id);
     const previous = index > 0 ? project.chapters[index - 1] : undefined;
@@ -4869,7 +4945,7 @@ function App() {
    * 请求章节智能体写一章：本章没有章纲就先自动生成并绑定，再组装资料调 chapter.write
    * 单次运行与连续创作共用；返回带上新章纲的项目与已剥好标题的草稿，界面状态怎么落由调用方决定
    */
-  const requestChapterDraft = async (sourceProject: Project, chapter: Chapter, runId: string, options: { instruction?: string; skipOutline?: boolean } = {}): Promise<{ project: Project; result: AgentDraftResult }> => {
+  const requestChapterDraft = async (sourceProject: Project, chapter: Chapter, runId: string, options: { instruction?: string; skipOutline?: boolean; discardOutline?: boolean } = {}): Promise<{ project: Project; result: AgentDraftResult }> => {
     activeAgentRunRef.current = runId;
     setAgentError('');
     setAgentDraft(null);
@@ -4887,7 +4963,9 @@ function App() {
     await invoke<string>('start_agent_runtime');
     // 懒人流程：先保证本章所在阶段有逐章节拍表，再保证本章有章纲；作者只管点一次运行
     // 保事件重写旧章时跳过：事件已经由原稿的记忆给定，再生成一份节拍表或章纲只会和它打架
-    let project = options.skipOutline ? sourceProject : await ensureStageBeats(sourceProject, chapter, runId);
+    // 从构思重来时先删掉旧章纲：留着它，新构思会被拉回原稿安排的那件事
+    let project = options.discardOutline ? discardChapterOutline(sourceProject, chapter) : sourceProject;
+    project = options.skipOutline ? project : await ensureStageBeats(project, chapter, runId);
     if (!options.skipOutline && !boundChapterOutlineFor(project, chapter)) {
       const message = '本章还没有章纲，正在按总纲、故事账本和上一章自动生成';
       setAgentProgress(items => items.map(item => item.id === 'starting' ? { ...item, status: 'active', progress: Math.max(item.progress, 2), message } : item));
@@ -4930,7 +5008,57 @@ function App() {
     // 运行时已经在图里拆过一次，这里再兜一次——非流式回退或模型二次补标题时也能拿到章节名
     const draft = splitChapterTitleHeading(chapterDraftFromStream(result.draftContent || ''));
     // 运行时的信封 title 优先（它已做过清洗和命名兵底），非流式回退时才用正文开头剥下来的那行
-    return { project, result: { ...result, draftContent: draft.content, chapterTitle: result.chapterTitle || draft.title } };
+    const gated = await gateAIRate(project, chapter, draft.content, runId);
+    return { project, result: { ...result, draftContent: gated.content, chapterTitle: result.chapterTitle || draft.title, aiRate: gated.aiRate, aiRateBefore: gated.before, aiRateLimit: gated.limit } };
+  };
+
+  /**
+   * AI 率门：本地启发式算一遍，超过项目上限就只对"疑似 AI"段落去一次 AI 味（走批注那条只改一段的路），再算一遍
+   * 不整章重写：整章低温改写会把人物磨平；也只改一轮，改不下去就把数字带给作者
+   */
+  const gateAIRate = async (project: Project, chapter: Chapter, content: string, runId: string): Promise<{ content: string; aiRate: number; before: number; limit: number }> => {
+    const limit = Math.max(1, Math.min(100, Number(project.maxAIRate) || 30));
+    const measure = (text: string) => analyzeAIChapter({ ...chapter, content: text });
+    const first = measure(content);
+    if (!content.trim() || first.aiRate <= limit) return { content, aiRate: first.aiRate, before: first.aiRate, limit };
+    const suspects = first.segments.filter(segment => segment.label !== '人工' && segment.text.trim().length >= 40);
+    if (!suspects.length) return { content, aiRate: first.aiRate, before: first.aiRate, limit };
+    const message = `AI 率 ${first.aiRate}% 超过上限 ${limit}%，正在对 ${suspects.length} 段疑似段落去 AI 味`;
+    setAgentProgress(items => items.map(item => item.id === 'review' ? { ...item, status: 'active', progress: Math.max(item.progress, 96), message } : item));
+    setAgentProgressMessage(message);
+    let next = content;
+    for (const segment of suspects) {
+      const paragraph = segment.text.trim();
+      const start = next.indexOf(paragraph);
+      if (start < 0) continue;
+      const cards = project.cards.filter(card => cardSearchTerms(card).some(term => paragraph.includes(term))).slice(0, 4).map(card => ({ title: card.title, content: card.content }));
+      try {
+        const result = await agentRpc<{ content?: string }>('text.transform', {
+          mode: 'annotate',
+          content: paragraph,
+          notes: ['这段读起来像机器写的：句子长短太齐、连接词太多、没有口语。保持事件、人物和信息不变，换成这个人物自己会说会做的写法，句子长短错开，删掉解释腔'],
+          before: next.slice(Math.max(0, start - 400), start).trim(),
+          after: next.slice(start + paragraph.length, start + paragraph.length + 400).trim(),
+          cards,
+          projectTitle: project.title,
+          chapterTitle: chapter.title,
+          runId: `${runId}:deai`,
+          apiKey: agentConfig.apiKey.trim(),
+          baseURL: agentConfig.baseURL.trim(),
+          model: agentConfig.model.trim() || fallbackModels[0],
+          apiMode: agentConfig.apiMode,
+          reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow,
+          ...agentNetworkParams(agentConfig),
+        });
+        const revised = result.content?.trim();
+        if (revised) next = `${next.slice(0, start)}${revised}${next.slice(start + paragraph.length)}`;
+      } catch {
+        // 一段改失败就跳过：AI 率门是加分项，不能因为它让整章白跑
+      }
+    }
+    const after = measure(next);
+    return { content: next, aiRate: after.aiRate, before: first.aiRate, limit };
   };
 
   // 一次运行收尾：停掉打字机、同步用量、把进度条推到 100%
@@ -5334,6 +5462,17 @@ function App() {
           if (isQuotaExceededError(error)) throw error;
           setNotice({ title: `第 ${number} 章记忆未提炼`, content: `${String(error)}。正文已保存，下一章只能靠本章摘要承接。` });
         }
+        // 每十章把全部卡片对着近期正文校准一遍：逐章提炼只更新本章点到名的卡，没出场的卡状态会停在旧处
+        if (number % 10 === 0) {
+          setContinuousWriting({ done: done + 1, total, message: `第 ${number} 章：写满十章，正在刷新全部卡片状态` });
+          try {
+            project = await refreshAllCardStates(project, number);
+            await applyProjectChange(project);
+          } catch (error) {
+            if (isQuotaExceededError(error)) throw error;
+            setNotice({ title: '卡片状态未刷新', content: `${String(error)}。不影响写作，可在卡片面板手动点"按近期正文刷新状态"。` });
+          }
+        }
       }
     } catch (error) {
       failAgentRun(error);
@@ -5400,7 +5539,7 @@ function App() {
         const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const drafted = await requestChapterDraft(project, chapter, runId, rewriteMode === 'keep'
           ? { instruction: keepEventsInstruction(project, chapter, number), skipOutline: true }
-          : { instruction: `重写第 ${number} 章：原稿作废，从构思重来，按总纲、故事账本和上一章重新安排这一章发生的事。\n${agentInstruction.trim()}` });
+          : { instruction: `重写第 ${number} 章：原稿作废，从构思重来，按总纲、故事账本和上一章重新安排这一章发生的事。\n${agentInstruction.trim()}`, discardOutline: true });
         if (!drafted.result.draftContent?.trim()) throw new Error(`第 ${number} 章没有生成出正文`);
         const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
         const actual = countNovelCharacters(drafted.result.draftContent);
@@ -6879,6 +7018,11 @@ function App() {
                     </select>
                     <button className="btn-secondary" onClick={normalizeBookPunctuation}>全书统一</button>
                   </div>
+                  <div className="chapter-target-row">
+                    <label htmlFor="max-ai-rate">AI 率上限</label>
+                    <input id="max-ai-rate" className="input" type="number" min="1" max="100" step="1" value={editingProject.maxAIRate ?? 30} onChange={event => updateEditorProject(project => ({ ...project, maxAIRate: Math.max(1, Math.min(100, Number(event.target.value) || 30)), updatedAt: new Date().toISOString() }))} />
+                    <span>%（本地启发式；写完超过就只对疑似段落去一次 AI 味）</span>
+                  </div>
                   <details className="chapter-target-row">
                     <summary>允许的句式（验证门不报）</summary>
                     <textarea className="input" rows={3} placeholder="一行一句原文片段，例如：声音不大，却" value={(editingProject.allowedPhrases || []).join('\n')} onChange={event => updateEditorProject(project => ({ ...project, allowedPhrases: event.target.value.split(/\r?\n/u).map(line => line.trim()).filter(Boolean).slice(0, 60), updatedAt: new Date().toISOString() }))} />
@@ -6963,6 +7107,7 @@ function App() {
                     </select>
                     <button className="btn-add-chapter" onClick={startNewCard}>+ 新建</button>
                     <button className="btn-secondary" onClick={() => updateCardStatesFromBook()}>一键更新状态</button>
+                    <button className="btn-secondary" disabled={cardRefreshing} title="一次模型调用，按最近十章正文重写全部卡片的当前状态；连续创作每十章自动做一次" onClick={() => void refreshCardStatesNow()}>{cardRefreshing ? '刷新中...' : '按近期正文刷新状态'}</button>
                   </div>
                   <div className="card-list">
                     {visibleCards.map(card => (
@@ -6991,6 +7136,9 @@ function App() {
                   </label>
                   {activeWritingStyle ? <div className="project-style-summary"><strong>{activeWritingStyle.name}</strong><small>{activeWritingStyle.sourceBookId ? '拆书蒸馏' : '自定义'} · {activeWritingStyle.tags.slice(0, 4).join('、') || '未分类'}</small><p>{activeWritingStyle.description || '暂无说明'}</p></div> : <p className="empty-hint compact">选择一份全局文风后，后续生成章节和大纲都会遵循它。</p>}
                   <button className="btn-secondary project-style-manage-button" onClick={() => { setActiveTab('styles'); setStyleDraft(activeWritingStyle || writingStyles[0] || null); setEditingProject(null); }}>管理全局文风</button>
+                  <div className="panel-section-title">作品默认技能 <span>{editingProject.defaultSkillNames?.length ? `${editingProject.defaultSkillNames.length} 项` : '未设置'}</span></div>
+                  <p className="project-style-hint">写正文时每章必带，奠定全书写法；章纲、节拍或指令里出现技能标签时再自动追加对应技能，日常过渡章就只带这几项。只列写作与润色类技能。</p>
+                  <div className="agent-skill-options">{skills.filter(skill => skill.category === 'write' || skill.category === 'polish').map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={(editingProject.defaultSkillNames || []).includes(skill.name)} onChange={() => updateEditorProject(project => { const current = project.defaultSkillNames || []; return { ...project, defaultSkillNames: current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 4), updatedAt: new Date().toISOString() }; })} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div>
                 </div>
               )}
 
@@ -7635,6 +7783,12 @@ function App() {
                         {agentDraft.reviewResult.issues.map(issue => <p key={issue}>{issue}</p>)}
                         {agentDraft.reviewResult.suggestions.map(suggestion => <p key={suggestion}>建议：{suggestion}</p>)}
                         {agentDraft.reviewResult.nextChapterRisks?.length ? <p>下一章要接住：{agentDraft.reviewResult.nextChapterRisks.join('；')}</p> : null}
+                      </div>
+                    )}
+                    {typeof agentDraft.aiRate === 'number' && (
+                      <div className={`agent-review ${agentDraft.aiRate <= (agentDraft.aiRateLimit || 30) ? 'passed' : 'warning'}`}>
+                        <strong>AI 率 {agentDraft.aiRate}%（上限 {agentDraft.aiRateLimit || 30}%）{typeof agentDraft.aiRateBefore === 'number' && agentDraft.aiRateBefore !== agentDraft.aiRate ? ` · 去 AI 味前 ${agentDraft.aiRateBefore}%` : ''}</strong>
+                        {agentDraft.aiRate > (agentDraft.aiRateLimit || 30) && <p>疑似段落已改过一轮仍超上限，本地启发式只看句长、连接词和口语，可在 AI 检测面板逐段看。</p>}
                       </div>
                     )}
                     {agentDraft.lintFindings?.length ? (

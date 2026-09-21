@@ -164,3 +164,9 @@ test('常驻卡片每章必带：自动挑时排最前且不占名额，作者�
   // 勾选里包含常驻卡时不重复
   assert.deepEqual(effectiveCards(current, [2, 3], '沈砚推门').map(card => card.title), ['书肆', '灯塔']);
 });
+
+test('作品默认技能只传技能目录里真有的名字', () => {
+  const context = buildChapterWriteContext({ project: project({ defaultSkillNames: ['story-long-write', 'missing'] }), chapter: chapters[3], instruction: '继续写', skills: [skill('story-long-write')], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.deepEqual(context.params.defaultSkillNames, ['story-long-write']);
+  assert.deepEqual(buildChapterWriteContext({ project: project(), chapter: chapters[3], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] }).params.defaultSkillNames, []);
+});
