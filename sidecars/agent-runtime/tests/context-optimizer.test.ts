@@ -387,3 +387,25 @@ describe("story ledger promise and author truth", () => {
     expect(plain).not.toContain("作者真相");
   });
 });
+
+describe("buildStoryLedger · 感情线", () => {
+  it("单列最近一次人物关系状态，并写明之后停了几章", () => {
+    const memories = [
+      { chapterNumber: 200, title: "第 200 章", summary: "选址。", relationshipState: ["沈妄与姜冷月：她替他挡掉话筒线，他没躲。"] },
+      { chapterNumber: 201, title: "第 201 章", summary: "看纸坊。" },
+      { chapterNumber: 202, title: "第 202 章", summary: "水样复检。" },
+      { chapterNumber: 203, title: "第 203 章", summary: "编号争执。" },
+    ];
+    const ledger = buildStoryLedger(memories, { number: 204, total: 203 }, 4000);
+    expect(ledger).toContain("感情线（第 200 章时的人物关系与情绪");
+    expect(ledger).toContain("她替他挡掉话筒线");
+    expect(ledger).toContain("之后 3 章没有关系变化，感情线停在这里");
+    // 上一章刚有变化：只提"接着往前走"，不报停
+    const fresh = buildStoryLedger([...memories, { chapterNumber: 204, title: "第 204 章", summary: "拆信。", relationshipState: ["他当着她拆了信。"] }], { number: 205, total: 204 }, 4000);
+    expect(fresh).toContain("第 204 章时的人物关系");
+    expect(fresh).not.toContain("感情线停在这里");
+    // 最近几章一条关系记录都没有：直接说停了
+    const none = buildStoryLedger(memories.map(memory => ({ ...memory, relationshipState: [] })), { number: 204, total: 203 }, 4000);
+    expect(none).toContain("都没有人物关系变化，感情线已经停了");
+  });
+});

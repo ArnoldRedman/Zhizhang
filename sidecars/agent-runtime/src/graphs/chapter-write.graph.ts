@@ -51,6 +51,8 @@ const intentLabels: Record<string, string> = {
  */
 export const chapterAgentSystemPrompt = `你是这本书的作者。资料里有世界观、人物卡、总纲、前文记忆和上一章结尾，写作以它们为准；资料里没有的可以自己定，但不能和已有设定冲突。
 人物按各自的性格说话和做选择：每个人有想要的东西，也有拿不到的时候；情绪要写出来，不用沉默、"没问"、"淡淡地说"来代替。
+每个人物的说话方式、在意的东西、处理情绪的办法都不一样，一句台词遮住名字也能认出是谁说的；两个人在同一场戏里对同一件事的反应必须不同。
+事务和感情一起推进：主角之间的关系每章都要往前走一点，用具体的一句话、一个动作、一次让步或一次靠近写出来，不用"默契""信任加深"这类总结代替。
 拿不准或想和作者商量的事，写在输出末尾，每条单独一行，以「【给作者】」开头；作者会看到并回复你。`;
 
 /** 【给作者】行的识别：模型按系统提示词把疑问写在末尾，逐行剥出来单独交给界面 */
@@ -127,9 +129,38 @@ function buildPrewriteCheck(state: ChapterStateType): { blockers: string[]; warn
 /** A deterministic, stable prefix lets compatible upstreams reuse prompt cache. */
 function stableProjectPacket(state: ChapterStateType): string {
   return [
+    projectProfileSection(state.projectProfile),
     state.worldSetting ? `## 世界观与作品设定（作者定的固定规则）\n${state.worldSetting}` : "",
     state.writingStyle ? `## 绑定文风\n名称：${state.writingStyle.name}\n${state.writingStyle.content}` : "",
   ].filter(Boolean).join("\n\n");
+}
+
+/**
+ * 作品定位：类型、标签、简介、主角
+ * 以前只有卡片和大纲生成看得到简介，写正文的模型不知道这本书是"慢热高甜"还是"权谋清算"，
+ * 只能照着事务性的章纲写，一本言情写成工作日志就是从这里开始的
+ */
+export function projectProfileSection(profile: ProjectProfile | undefined): string {
+  if (!profile) return "";
+  const genre = [profile.genre, profile.subgenre].filter(Boolean).join(" / ");
+  const tags = (profile.tags || []).filter(Boolean).slice(0, 12).join("、");
+  const leads = (profile.protagonists || []).filter(Boolean);
+  const lines = [
+    genre ? `类型：${genre}` : "",
+    tags ? `标签：${tags}` : "",
+    leads.length ? `主角：${leads.join(" × ")}` : "",
+    profile.synopsis ? `简介：${compactText(profile.synopsis, 1400)}` : "",
+  ].filter(Boolean);
+  if (!lines.length) return "";
+  return `## 作品定位（这本书卖什么，每章都要兑现）\n${lines.join("\n")}`;
+}
+
+export interface ProjectProfile {
+  genre?: string;
+  subgenre?: string;
+  tags?: string[];
+  synopsis?: string;
+  protagonists?: string[];
 }
 
 /** 总纲与故事账本：全书级的推进依据，计划、正文、审查三个阶段都要看到同一份
@@ -207,6 +238,8 @@ export const ChapterState = Annotation.Root({
   projectId: Annotation<string>,
   chapterId: Annotation<string>,
   instruction: Annotation<string>,
+  /** 作品定位：类型、标签、简介、主角；进稳定资料，构思、正文、审查三步都看 */
+  projectProfile: Annotation<ProjectProfile | undefined>,
   worldSetting: Annotation<string | undefined>,
   writingStyle: Annotation<{ name: string; content: string } | undefined>,
   /** 总纲骨架与当前相关段落，见 compactMasterOutline */
@@ -515,7 +548,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const session = splitSessionContext(state.sessionContext);
       // 构思阶段多看一份对标资料：情绪模块与节奏表，让模型挑这一章的情绪链
       const material = chapterMaterialPacket(state) + benchmarkPlanSection(state.benchmark);
-      const planInstruction = `## 作者的要求\n${state.instruction}\n\n先想一想${chapterLabel(state)}怎么写，三四百字，自由格式，但要写清这几样：这一章发生什么（一件前文没发生过的事，总纲或章纲有安排就按它）；读完这章什么变了（目标、风险、信息、关系、资源、身份、情绪立场里至少一项）；相对上一章过了多久、换没换地方；每个出场人物这一章想要什么、会怎么做、和别人怎么相处；情绪从什么走到什么；按顺序列四到八个情节点，每个一句话；结尾停在哪个具体动作或画面上。不要写正文，不要把情节点写成成品句子。`;
+      const planInstruction = `## 作者的要求\n${state.instruction}\n\n先想一想${chapterLabel(state)}怎么写，四五百字，自由格式，但要写清这几样：这一章发生什么（一件前文没发生过的事，总纲或章纲有安排就按它）；读完这章什么变了（目标、风险、信息、关系、资源、身份、情绪立场里至少一项）；相对上一章过了多久、换没换地方；每个出场人物这一章想要什么、会怎么做、和别人怎么相处，以及这个人和别人不一样的地方在本章怎么显出来（说话的句式、在意的东西、处理情绪的办法，写一处只有这个人会做的选择）；感情线：主角之间这一章走到哪一步，比上一章多了什么，用哪个具体场面写出来（一次靠近、一句真话、一个只对对方做的动作），主角不出场的配角章或伏笔章可以写"本章不推进感情线"并说明原因；情绪从什么走到什么；按顺序列四到八个情节点，每个一句话；结尾停在哪个具体动作或画面上。不要写正文，不要把情节点写成成品句子。`;
       const fallbackPlan = "按总纲和章纲写这一章该发生的事，承接上一章结尾后推进；人物按各自性格行动，结尾停在能继续发展的地方。";
       let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
       try {
@@ -606,6 +639,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       }
       const { result, inputBytes, usages, failures } = await runChapterReview(client, state.reviewMode, {
         agentSystemPrompt: chapterAgentSystemPrompt,
+        projectProfile: projectProfileSection(state.projectProfile),
         worldSetting: state.worldSetting,
         writingStyle: state.writingStyle,
         chapterBeat: state.chapterBeat,

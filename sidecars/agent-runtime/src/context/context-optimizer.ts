@@ -861,7 +861,29 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
   const promiseBlock = promise ? `上一章留给本章的事（下一章承诺）：${promise}` : "";
   const truths = ordered.slice(-6).flatMap(memory => compactList(memory.authorTruth, 3, 160).map(text => `- ${chapterLabel(memory)}：${text}`));
   const truthBlock = truths.length ? `作者真相（读者还不知道的底，角色不能提前说破）：\n${truths.slice(-6).join("\n")}` : "";
-  return [header, gapNote, olderBlock, eventsBlock, promiseBlock, foreshadowingBlock, truthBlock].filter(Boolean).join("\n\n");
+  return [header, gapNote, olderBlock, eventsBlock, promiseBlock, relationshipBlock(ordered), foreshadowingBlock, truthBlock].filter(Boolean).join("\n\n");
+}
+
+/**
+ * 感情线单列一块：最近一次有记录的人物关系状态，加上已经连续几章没写关系变化
+ * 事件行里的"（人物：…）"夹在摘要中间，模型读账本时看不出感情线已经断了多久；
+ * 实测一本书第 201～204 章 relationshipState 全空，正文越写越像工作日志，这一块就是让构思阶段看见"该发糖了"
+ */
+function relationshipBlock(ordered: Array<Record<string, unknown>>): string {
+  const recent = ordered.slice(-8);
+  let lastIndex = -1;
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    if (compactList(recent[index].relationshipState, 1, 40).length) {
+      lastIndex = index;
+      break;
+    }
+  }
+  if (lastIndex < 0) return recent.length >= 2 ? `感情线：最近 ${recent.length} 章的记忆里都没有人物关系变化，感情线已经停了，本章要有一处实打实的推进。` : "";
+  const latest = recent[lastIndex];
+  const lines = compactList(latest.relationshipState, 4, 160).map(text => `- ${text}`);
+  const stalled = recent.length - 1 - lastIndex;
+  const stallNote = stalled >= 2 ? `\n之后 ${stalled} 章没有关系变化，感情线停在这里，本章要有一处实打实的推进。` : stalled === 1 ? "\n上一章没有关系变化，本章接着往前走。" : "";
+  return `感情线（${chapterLabel(latest)}时的人物关系与情绪，本章从这里往前推）：\n${lines.join("\n")}${stallNote}`;
 }
 
 /**

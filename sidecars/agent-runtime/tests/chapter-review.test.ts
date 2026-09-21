@@ -123,3 +123,34 @@ describe("chapter review", () => {
     expect(latestText).not.toContain("审查的是历史章节");
   });
 });
+
+describe("chapter review · 感情线与人物区分", () => {
+  it("作品定位进架构、人物、综合三个视角，不进文字与一致性视角", () => {
+    const input = { ...baseInput, projectProfile: "## 作品定位\n类型：男频 / 都市日常\n标签：慢热高甜" };
+    for (const perspective of ["architect", "character", "solo"] as const) {
+      expect(chapterReviewRequest(input, perspective).messages.map(message => message.content).join("\n")).toContain("慢热高甜");
+    }
+    for (const perspective of ["prose", "consistency"] as const) {
+      expect(chapterReviewRequest(input, perspective).messages.map(message => message.content).join("\n")).not.toContain("慢热高甜");
+    }
+    const architect = chapterReviewRequest(input, "architect").messages.map(message => message.content).join("\n");
+    expect(architect).toContain("人物分得开");
+    expect(architect).toContain("感情有戏");
+    expect(architect).toContain("relationshipProgress");
+  });
+
+  it("relationshipProgress：模型写'无'归一成空串，合并后进报告；relationship 是合法 category", () => {
+    const stalled = normalizePerspectiveResult(JSON.stringify({ verdict: "CONCERNS", advances: true, progress: "选址", relationshipProgress: "无", findings: [
+      { severity: "S2", category: "relationship", location: "全章", evidence: "她把早饭往他手边推了推", issue: "只推事务，两人关系原地不动", fix: "加一处只对对方做的动作" },
+    ] }), "architect");
+    expect(stalled.relationshipProgress).toBe("");
+    expect(stalled.findings[0].category).toBe("relationship");
+    const moved = normalizePerspectiveResult(JSON.stringify({ verdict: "APPROVE", advances: true, progress: "选址", relationshipProgress: "她第一次在人前叫他名字" }), "architect");
+    const merged = mergeReviewResults("lean", [moved, { perspective: "consistency", verdict: "APPROVE", findings: [] }]);
+    expect(merged.relationshipProgress).toBe("她第一次在人前叫他名字");
+    // relationship 类问题不算事实类，进 suggestions 而不是 issues
+    const mergedStalled = mergeReviewResults("lean", [stalled]);
+    expect(mergedStalled.issues).toHaveLength(0);
+    expect(mergedStalled.suggestions[0]).toContain("原地不动");
+  });
+});

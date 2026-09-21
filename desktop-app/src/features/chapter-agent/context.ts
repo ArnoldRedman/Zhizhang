@@ -138,6 +138,14 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
     params: {
       projectId: String(project.id),
       projectTitle: project.title,
+      // 作品定位进稳定资料：写正文的模型得知道这本书是"慢热高甜"还是"权谋清算"，只看章纲会把言情写成工作日志
+      projectProfile: {
+        genre: project.genre,
+        subgenre: project.subgenre,
+        tags: Object.values(project.tags || {}).flat().filter((tag): tag is string => typeof tag === 'string' && tag.trim().length > 0),
+        synopsis: project.synopsis,
+        protagonists: [project.protagonist1, project.protagonist2].filter((name): name is string => Boolean(name?.trim())),
+      },
       chapterId: String(chapter.id),
       chapterNumber,
       totalChapters: project.chapters.length,

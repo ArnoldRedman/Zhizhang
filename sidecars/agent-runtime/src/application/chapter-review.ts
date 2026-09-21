@@ -14,7 +14,7 @@ import { compactText, masterOutlineBytes, storyLedgerBytes } from "../context/co
 export type ReviewMode = "full" | "lean" | "solo";
 export type ReviewPerspective = "architect" | "character" | "prose" | "consistency" | "solo";
 export type ReviewSeverity = "S1" | "S2" | "S3" | "S4";
-export type ReviewCategory = "structure" | "character" | "prose" | "consistency" | "platform" | "factual" | "format" | "causal";
+export type ReviewCategory = "structure" | "character" | "prose" | "consistency" | "platform" | "factual" | "format" | "causal" | "relationship";
 export type ReviewVerdict = "APPROVE" | "CONCERNS" | "REJECT";
 
 export interface ReviewFinding {
@@ -37,10 +37,12 @@ export interface PerspectiveResult {
   /** 架构视角专用：本章有没有发生前文没发生过的事 */
   advances?: boolean;
   progress?: string;
+  /** 架构与综合视角：主角关系这一章走到哪；"无"或空就是没推进 */
+  relationshipProgress?: string;
   repeatedEvents?: string[];
   /** 一致性视角专用：上一章承诺有没有兑现、本章留下哪些下章要接的风险 */
   nextChapterRisks?: string[];
-  /** 番茄六项 PASS/FAIL，架构视角填 */
+  /** 逐项 PASS/FAIL（番茄六项加人物分得开、感情有戏），架构视角填 */
   rubric?: Record<string, "PASS" | "FAIL">;
 }
 
@@ -52,6 +54,8 @@ export interface ChapterReviewResult {
   suggestions: string[];
   advances: boolean;
   progress: string;
+  /** 主角关系这一章走到哪；空串就是审查认为没推进 */
+  relationshipProgress: string;
   repeatedEvents: string[];
   mode: ReviewMode;
   verdict: ReviewVerdict;
@@ -65,6 +69,8 @@ export interface ChapterReviewInput {
   /** 写作 Agent 的系统提示词：审查必须站在写这一章的同一个 Agent 口上，不能两边各说一套
    * （它长在写作图里，这里当参数传，避免审查模块反向依赖写作图） */
   agentSystemPrompt: string;
+  /** 作品定位（类型、标签、简介、主角）：架构与人物视角凭它判感情线该不该推、人物像不像模板 */
+  projectProfile?: string;
   worldSetting?: string;
   writingStyle?: { name: string; content: string };
   chapterBeat?: string;
@@ -111,24 +117,28 @@ const fanqieRubric = `| 指标 | PASS | FAIL |
 | 情绪节点 | 每 1000 字有情绪起伏 | 连续 2000 字情绪平直 |
 | 信息密度 | 段落短、事件推进快 | 大段描写、慢节奏、低信息 |
 | 实质推进 | 本章改变了目标、风险、信息、关系、资源、身份、情绪立场中至少一项 | 读完这章世界和之前一样 |
-| 人物在做事 | 人物有想要的东西并为之行动 | 人物只在感受、沉默、旁观 |`;
+| 人物在做事 | 人物有想要的东西并为之行动 | 人物只在感受、沉默、旁观 |
+| 人物分得开 | 遮住名字也能认出每句台词是谁说的，同一场戏里各人反应不同 | 几个人说话一个腔调，对同一件事都沉默、都点头、都"没说话" |
+| 感情有戏 | 主角之间有一处具体的靠近、真话或只对对方做的动作 | 只推事务，关系原地不动（配角章、伏笔章记 PASS） |`;
 
 const findingsSchema = `每条 finding 是 {"severity":"S1|S2|S3|S4","category":"...","location":"第几段或引用原句前十字","evidence":"引用原文","issue":"问题","fix":"怎么改"}。
 严重度：S1 破坏主线、人物动机、世界规则或读者信任；S2 明显影响本章效果、留存、节奏、人物可信度；S3 局部措辞或轻微节奏；S4 建议项。没有原文证据的不写。`;
 
 const perspectivePrompts: Record<ReviewPerspective, string> = {
-  architect: `你是这本书的结构编辑，只出报告，不改正文。对照总纲、故事账本和本章构思读这一章，回答：
+  architect: `你是这本书的结构编辑，只出报告，不改正文。对照作品定位、总纲、故事账本和本章构思读这一章，回答：
 1. 本章改变了什么？目标、风险、信息、关系、资源、身份、情绪立场里至少变了一项吗？把账本里已发生的事重写一遍、或者整章停在上一章那个场景那件事里，advances 记 false，repeatedEvents 里写清重复了什么。作者要求本章留在同一场景时不算。
 2. 读者为什么翻下一页？结尾落在动作、画面、台词还是总结、抒情、静止？
 3. 构思里安排的事发生了吗？漏了哪件？
-4. 按下面番茄六项逐项 PASS / FAIL。
+4. 感情线：主角之间这一章有没有实打实的推进（一次靠近、一句真话、一个只对对方做的动作）？只有事务往前走、关系原地不动的，记一条 S2，category 用 relationship；账本"感情线"一块已经写明停了两章以上而本章仍没推进的，记 S1。主角不出场的配角章、伏笔章不算。作品定位是言情、甜宠、日常向的，还要看有没有让读者想看两人在一起的段落。
+5. 按下面八项逐项 PASS / FAIL。人物分得开一项 FAIL 时另记一条 S2，category 用 character，evidence 里并列引用两个人的台词。
 ${fanqieRubric}
-返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话：本章把故事推进到哪","repeatedEvents":[],"rubric":{"开头吸引力":"PASS","翻页动力":"PASS","情绪节点":"PASS","信息密度":"PASS","实质推进":"PASS","人物在做事":"PASS"},"findings":[]}。category 用 structure 或 platform。${findingsSchema}`,
+返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话：本章把故事推进到哪","relationshipProgress":"一句话：主角关系这一章走到哪，没推进就写'无'","repeatedEvents":[],"rubric":{"开头吸引力":"PASS","翻页动力":"PASS","情绪节点":"PASS","信息密度":"PASS","实质推进":"PASS","人物在做事":"PASS","人物分得开":"PASS","感情有戏":"PASS"},"findings":[]}。category 用 structure、platform、character 或 relationship。${findingsSchema}`,
   character: `你是这本书的人物编辑，只出报告，不改正文。对照人物卡读这一章，回答：
 1. 每个出场人物按自己卡上的性格说话和做选择了吗？哪句话换个人说也成立？
-2. 有谁一整章只在沉默、点头、"没问"、"淡淡地说"？他此刻想要什么、为什么不说？
-3. 对话有没有三种病：问答式（一句问一句答，没有情绪承接）、科普嘴（整段讲设定原理）、不分场合（高压时刻插科打诨）？
-4. 关系尺度和当前阶段匹配吗？有没有突然亲密、突然信任、突然翻脸？
+2. 人物之间分得开吗？把本章每个人的台词单独抽出来，遮住名字能不能认出是谁？两个人对同一件事的反应是不是一样的（都沉默、都点头、都"没说话"）？同一场戏里的人像同一个模板刻出来的，记 S2，evidence 里并列引用两个人的台词或反应。
+3. 有谁一整章只在沉默、点头、"没问"、"淡淡地说"？他此刻想要什么、为什么不说？
+4. 对话有没有三种病：问答式（一句问一句答，没有情绪承接）、科普嘴（整段讲设定原理）、不分场合（高压时刻插科打诨）？
+5. 关系尺度和当前阶段匹配吗？有没有突然亲密、突然信任、突然翻脸？反过来，卡上写的"对他温柔""会脸红"这类感情表现，本章有机会写却一处没写的，也记下来。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","findings":[]}。category 用 character。${findingsSchema}`,
   prose: `你是这本书的文字编辑，只出报告，不改正文。读这一章，回答：
 1. 哪些句子是作者跳出来讲解、剧透、总结、定性（"之所以""原来""这意味着""她不知道的是""他终于明白"）？
@@ -144,15 +154,16 @@ ${fanqieRubric}
 4. 上一章的"下一章承诺"兑现了吗？没兑现算不算断线？
 5. 本章留下哪些下一章必须接住的事（承诺、悬而未决的动作、刚出现的人物物件）？写进 nextChapterRisks。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","nextChapterRisks":["一句一条"],"findings":[]}。category 用 consistency、factual 或 causal；fix 只写事实统一方向（"统一为左臂旧伤"），不写怎么写得更好。${findingsSchema}`,
-  solo: `你是这本书的编辑，只出报告，不改正文。对照世界观、人物卡、总纲、故事账本读这一章，回答四件事：
+  solo: `你是这本书的编辑，只出报告，不改正文。对照作品定位、世界观、人物卡、总纲、故事账本读这一章，回答五件事：
 一、推进：本章有没有发生前文没发生过的事？把账本里已发生的事重写一遍、或整章停在上一章那个场景，advances 记 false，repeatedEvents 里写清重复了什么。作者要求本章留在同一场景时不算。
 二、一致性：人物状态、已知信息、时间线、物品归属、称谓有没有和前文或设定矛盾？只列明确矛盾。
-三、人物：出场的人有没有按自己的性格说话和做选择？有谁一整章只在沉默、点头、"没问"？
-四、结尾：落在动作画面上，还是总结抒情？本章留下哪些下一章必须接住的事，写进 nextChapterRisks。
-返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话","repeatedEvents":[],"nextChapterRisks":[],"findings":[]}。${findingsSchema}`,
+三、人物：出场的人有没有按自己的性格说话和做选择？遮住名字能不能认出台词是谁说的？有谁一整章只在沉默、点头、"没问"？同一场戏里几个人反应一样的，记 S2，category 用 character。
+四、感情线：主角之间这一章有没有实打实的推进（一次靠近、一句真话、一个只对对方做的动作）？只推事务不推关系的记 S2，账本里感情线已停两章以上而本章仍没推进的记 S1，category 用 relationship；主角不出场的配角章、伏笔章不算。
+五、结尾：落在动作画面上，还是总结抒情？本章留下哪些下一章必须接住的事，写进 nextChapterRisks。
+返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话","relationshipProgress":"一句话，没推进就写'无'","repeatedEvents":[],"nextChapterRisks":[],"findings":[]}。${findingsSchema}`,
 };
 
-/** 审查请求本体：稳定资料（世界观/文风）+ 会话摘要 + 约束摘要与待审正文 + 该视角的审查口径 */
+/** 审查请求本体：稳定资料（作品定位/世界观/文风）+ 会话摘要 + 约束摘要与待审正文 + 该视角的审查口径 */
 export function chapterReviewRequest(input: ChapterReviewInput, perspective: ReviewPerspective = "solo"): { messages: ChapterReviewMessage[]; inputBytes: number } {
   // 审历史章节时账本里的"现在"不是它的时点：实测第 131 章的审查把"账本标注第178章/第五卷"
   // 当成本章的时间线矛盾，还建议"把总纲卷次改回当前写作位"，那是要拿旧章去追新进度，改下去只会把正文改坏
@@ -161,7 +172,10 @@ export function chapterReviewRequest(input: ChapterReviewInput, perspective: Rev
   const historyNote = historical
     ? `## 审查的是历史章节\n本章是第 ${input.chapterNumber} 章，全书已经写到第 ${input.totalChapters} 章。账本里的 current_timeline 与最新完成章描述的是现在，不是本章的时点；账本中与本章时点不符的行不算本章的问题，不要去建议改总纲或账本的进度标注，也不要拿后续章节的事实要求本章提前兑现。`
     : "";
+  // 作品定位在架构、人物、综合三个视角都要看：判"感情线该不该推"和"人物像不像模板"都得先知道这本书卖什么
+  const wantsProfile = perspective !== "prose" && perspective !== "consistency";
   const stablePacket = [
+    wantsProfile ? input.projectProfile || "" : "",
     worldSetting ? `## 世界观与作品设定（作者定的固定规则）\n${worldSetting}` : "",
     input.writingStyle ? `## 绑定文风\n名称：${input.writingStyle.name}\n${input.writingStyle.content}` : "",
   ].filter(Boolean).join("\n\n");
@@ -212,6 +226,9 @@ export function normalizePerspectiveResult(value: unknown, perspective: ReviewPe
     if (perspective === "architect" || perspective === "solo") {
       result.advances = parsed.advances !== false;
       result.progress = typeof parsed.progress === "string" ? parsed.progress.trim() : "";
+      // 模型按提示词在没推进时写"无"，归一成空串，界面和账本只认空
+      const relationship = typeof parsed.relationshipProgress === "string" ? parsed.relationshipProgress.trim() : "";
+      result.relationshipProgress = /^(?:无|没有|无推进|未推进|none|n\/a)[。.]?$/iu.test(relationship) ? "" : relationship;
       result.repeatedEvents = stringItems(parsed.repeatedEvents);
     }
     if (perspective === "consistency" || perspective === "solo") result.nextChapterRisks = stringItems(parsed.nextChapterRisks);
@@ -232,7 +249,7 @@ const unparsedFinding = (perspective: ReviewPerspective): ReviewFinding => ({
 });
 
 const severities = new Set<ReviewSeverity>(["S1", "S2", "S3", "S4"]);
-const categories = new Set<ReviewCategory>(["structure", "character", "prose", "consistency", "platform", "factual", "format", "causal"]);
+const categories = new Set<ReviewCategory>(["structure", "character", "prose", "consistency", "platform", "factual", "format", "causal", "relationship"]);
 const defaultCategory: Record<ReviewPerspective, ReviewCategory> = { architect: "structure", character: "character", prose: "prose", consistency: "consistency", solo: "structure" };
 
 function normalizeFinding(item: Record<string, unknown>, perspective: ReviewPerspective): ReviewFinding | undefined {
@@ -294,6 +311,7 @@ export function mergeReviewResults(mode: ReviewMode, results: PerspectiveResult[
     suggestions: rest.map(label),
     advances: architect?.advances !== false,
     progress: architect?.progress || "",
+    relationshipProgress: architect?.relationshipProgress || "",
     repeatedEvents: architect?.repeatedEvents || [],
     mode,
     verdict: verdictFromFindings(findings),

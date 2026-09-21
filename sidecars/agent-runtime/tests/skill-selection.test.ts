@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectSkillsByIntent } from "../src/graphs/chapter-write.graph.js";
+import { projectProfileSection, selectSkillsByIntent } from "../src/graphs/chapter-write.graph.js";
 
 describe("chapter skill intent selection", () => {
   const catalog = [
@@ -58,5 +58,18 @@ describe("castCards", () => {
     expect(castCards(cards, "这一章只写周伯在栖迟书肆守夜，等一封信。").map(card => card.title)).toEqual(["周伯", "修复之眼", "栖迟书肆"]);
     expect(castCards(cards, undefined).map(card => card.title)).toEqual(["沈妄", "周伯", "修复之眼", "栖迟书肆"]);
     expect(castCards(undefined, "什么都没有")).toEqual([]);
+  });
+});
+
+describe("projectProfileSection", () => {
+  it("类型、标签、主角、简介拼成作品定位；全空返回空串", () => {
+    const section = projectProfileSection({ genre: "男频", subgenre: "都市日常", tags: ["慢热高甜", "治愈"], synopsis: "核心题材：慢热高甜。", protagonists: ["沈妄", "姜冷月"] });
+    expect(section).toContain("## 作品定位");
+    expect(section).toContain("类型：男频 / 都市日常");
+    expect(section).toContain("标签：慢热高甜、治愈");
+    expect(section).toContain("主角：沈妄 × 姜冷月");
+    expect(section).toContain("简介：核心题材：慢热高甜。");
+    expect(projectProfileSection(undefined)).toBe("");
+    expect(projectProfileSection({ tags: [], protagonists: [] })).toBe("");
   });
 });

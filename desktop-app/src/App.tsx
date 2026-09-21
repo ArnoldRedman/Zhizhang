@@ -191,8 +191,9 @@ const formatReviewReport = (number: number, chapterTitle: string, result: AgentR
   `- 审查时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
   `- 结论：${result.verdict ? `${result.verdict}（${result.mode || 'lean'} 档）` : result.consistent ? '与设定、前文一致' : '发现一致性问题'}${result.advances === false ? '；本章相对前文没有推进' : ''}`,
   ...(result.progress ? [`- 推进到：${result.progress}`] : []),
+  ...(result.relationshipProgress !== undefined ? [`- 感情线：${result.relationshipProgress || '本章没有推进'}`] : []),
   ...(result.perspectives?.length ? [`- 视角：${result.perspectives.map(item => `${reviewPerspectiveLabel(item.perspective)} ${item.verdict}（${item.count}）`).join('，')}`] : []),
-  ...(result.rubric ? [`- 番茄六项：${Object.entries(result.rubric).map(([key, value]) => `${key} ${value}`).join('，')}`] : []),
+  ...(result.rubric ? [`- 逐项检查：${Object.entries(result.rubric).map(([key, value]) => `${key} ${value}`).join('，')}`] : []),
   '',
   '## 问题',
   ...(result.issues.length ? result.issues.map((item, index) => `${index + 1}. ${item}`) : ['无']),
@@ -221,6 +222,8 @@ interface AgentReviewResult {
   /** 本章相对前文是否有新推进；false 就是又把上一章写了一遍 */
   advances?: boolean;
   progress?: string;
+  /** 主角关系这一章走到哪；空串就是审查认为没推进，旧报告没有这个字段 */
+  relationshipProgress?: string;
   repeatedEvents?: string[];
   /** 审查提出一致性问题后，已按意见定点修订过一次（改的是同一篇正文，不是又写一遍） */
   revised?: boolean;
@@ -1727,6 +1730,8 @@ function App() {
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
   const readingArticleRef = useRef<HTMLElement | null>(null);
   const goalNoticeChapterRef = useRef<number | null>(null);
+  // 已经为哪个文风 id 提示过"绑定的文风不存在"：每次运行都弹一遍太吵，同一个坏绑定只提一次
+  const styleMissingNoticedRef = useRef<string | null>(null);
   const persistCurrentChapterRef = useRef<() => Promise<void>>(async () => {});
   /**
    * 切章时把编辑器、高亮层和阅读视图的滚动位置归零，并把光标放回开头
@@ -4740,6 +4745,13 @@ function App() {
         } : undefined,
         instruction: activeStyle ? `${instruction}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : instruction,
         synopsis: project.synopsis,
+        // 类型、标签、主角：章纲和节拍表得知道这本书卖什么，感情线一栏才有得写
+        projectProfile: {
+          genre: project.genre,
+          subgenre: project.subgenre,
+          tags: Object.values(project.tags || {}).flat().filter((tag): tag is string => typeof tag === 'string' && tag.trim().length > 0),
+          protagonists: [project.protagonist1, project.protagonist2].filter((name): name is string => Boolean(name?.trim())),
+        },
         // 没勾卡片时按本章依据自动挑：章纲生成不看卡就没人出场，新人物与地点永远进不来
         cards: effectiveCards(project, selectedOutlineCardIds, `${targetOutline.title}\n${targetOutline.content}\n${String(sourceChapter?.content || '').slice(-8000)}\n${instruction}`),
         knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
@@ -5266,6 +5278,11 @@ function App() {
       }
     }
     const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
+    // 绑定的文风已经不在库里（删过、换过机器、备份没带）：以前静默跳过，作者以为文风还在生效，实际每章都是空的
+    if (project.styleProfileId && !activeStyle && styleMissingNoticedRef.current !== project.styleProfileId) {
+      styleMissingNoticedRef.current = project.styleProfileId;
+      setNotice({ title: '绑定的文风不存在', content: '这本书绑定的文风已不在文风库里，本次写作不带任何文风。到侧栏文风页重新选一份，或在文风页新建后再绑定。' });
+    }
     // 项目绑定的来源拆书做过全书聚合，写作时才有情绪模块与锚点可召回
     const benchmark = project.sourceDismantleBookId ? dismantleBooks.find(book => book.id === project.sourceDismantleBookId)?.aggregate : undefined;
     return { agentSkills, activeStyle, benchmark };
@@ -7228,7 +7245,9 @@ function App() {
                       {writingStyles.map(style => <option key={style.id} value={style.id}>{style.name}</option>)}
                     </select>
                   </label>
-                  {activeWritingStyle ? <div className="project-style-summary"><strong>{activeWritingStyle.name}</strong><small>{activeWritingStyle.sourceBookId ? '拆书蒸馏' : '自定义'} · {activeWritingStyle.tags.slice(0, 4).join('、') || '未分类'}</small><p>{activeWritingStyle.description || '暂无说明'}</p></div> : <p className="empty-hint compact">选择一份全局文风后，后续生成章节和大纲都会遵循它。</p>}
+                  {activeWritingStyle ? <div className="project-style-summary"><strong>{activeWritingStyle.name}</strong><small>{activeWritingStyle.sourceBookId ? '拆书蒸馏' : '自定义'} · {activeWritingStyle.tags.slice(0, 4).join('、') || '未分类'}</small><p>{activeWritingStyle.description || '暂无说明'}</p></div>
+                    : editingProject.styleProfileId ? <p className="empty-hint compact">绑定的文风已不在文风库里，写作时不带任何文风。重新选一份，或先去文风页新建。</p>
+                    : <p className="empty-hint compact">选择一份全局文风后，后续生成章节和大纲都会遵循它。</p>}
                   <button className="btn-secondary project-style-manage-button" onClick={() => { setActiveTab('styles'); setStyleDraft(activeWritingStyle || writingStyles[0] || null); setEditingProject(null); }}>管理全局文风</button>
                   <div className="panel-section-title">作品默认技能 <span>{editingProject.defaultSkillNames?.length ? `${editingProject.defaultSkillNames.length} 项` : '未设置'}</span></div>
                   <p className="project-style-hint">写正文时每章必带，奠定全书写法；章纲、节拍或指令里出现技能标签时再自动追加对应技能，日常过渡章就只带这几项。只列写作与润色类技能。</p>
@@ -7875,8 +7894,9 @@ function App() {
                       <div className={`agent-review ${agentDraft.reviewResult.verdict === 'APPROVE' || (!agentDraft.reviewResult.verdict && agentDraft.reviewResult.consistent && agentDraft.reviewResult.advances !== false) ? 'passed' : 'warning'}`}>
                         <strong>{agentDraft.reviewResult.verdict ? `审查 ${agentDraft.reviewResult.verdict}（${agentDraft.reviewResult.mode || 'lean'}）` : agentDraft.reviewResult.consistent ? '一致性审查通过' : '发现一致性问题'}{agentDraft.reviewResult.advances === false ? ' · 本章没有推进主线' : ''}{agentDraft.reviewResult.revised ? ' · 已按审查意见修订' : ''}</strong>
                         {agentDraft.reviewResult.perspectives?.length ? <p>{agentDraft.reviewResult.perspectives.map(item => `${reviewPerspectiveLabel(item.perspective)} ${item.verdict}（${item.count}）`).join(' · ')}</p> : null}
-                        {agentDraft.reviewResult.rubric && <p>番茄六项：{Object.entries(agentDraft.reviewResult.rubric).map(([key, value]) => `${key} ${value === 'FAIL' ? '✗' : '✓'}`).join('，')}</p>}
+                        {agentDraft.reviewResult.rubric && <p>逐项检查：{Object.entries(agentDraft.reviewResult.rubric).map(([key, value]) => `${key} ${value === 'FAIL' ? '✗' : '✓'}`).join('，')}</p>}
                         {agentDraft.reviewResult.progress && <p>推进：{agentDraft.reviewResult.progress}</p>}
+                        {agentDraft.reviewResult.relationshipProgress !== undefined && <p>感情线：{agentDraft.reviewResult.relationshipProgress || '本章没有推进'}</p>}
                         {(agentDraft.reviewResult.repeatedEvents || []).map(event => <p key={`repeat-${event}`}>重复前文：{event}</p>)}
                         {agentDraft.reviewResult.issues.map(issue => <p key={issue}>{issue}</p>)}
                         {agentDraft.reviewResult.suggestions.map(suggestion => <p key={suggestion}>建议：{suggestion}</p>)}

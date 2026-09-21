@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createChapterGraph, chapterAgentSystemPrompt, selectSkillsByIntent, type SkillDefinition } from "./graphs/chapter-write.graph.js";
+import { createChapterGraph, chapterAgentSystemPrompt, projectProfileSection, selectSkillsByIntent, type ProjectProfile, type SkillDefinition } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
 import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
@@ -24,12 +24,39 @@ import type { RpcResponse } from "@zhizhang/contracts";
 
 /** 资料组装规则版本：改了预算或裁剪策略就加一
  * 准备结果的缓存 key 只由入参算出，代码变了 key 不变，旧缓存会一直命中、优化完全看不出效果 */
-const contextPipelineVersion = 6;
+const contextPipelineVersion = 7;
 
 /** 阶段节拍表里本章那一行压成一段：本章行是硬目标，前后行只划边界 */
 /** 项目设置里的引号风格；没设或值不认识就返回 undefined，让运行时按已有正文侦测 */
 function normalizeQuoteStyle(value: unknown): QuoteStyle | undefined {
   return value === "curly" || value === "corner" || value === "ascii" ? value : undefined;
+}
+
+/** 桌面端传来的作品定位：类型、标签、简介、主角；字段全空就当没传 */
+function normalizeProjectProfile(value: unknown): ProjectProfile | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const profile: ProjectProfile = {
+    genre: typeof record.genre === "string" ? record.genre.trim() : "",
+    subgenre: typeof record.subgenre === "string" ? record.subgenre.trim() : "",
+    tags: stringList(record.tags, 12),
+    synopsis: typeof record.synopsis === "string" ? record.synopsis.trim() : "",
+    protagonists: stringList(record.protagonists, 3),
+  };
+  return profile.genre || profile.subgenre || profile.tags?.length || profile.synopsis || profile.protagonists?.length ? profile : undefined;
+}
+
+/** 大纲生成用的作品定位单行：类型、标签、主角；简介已经单独带了，这里不重复 */
+function projectProfileLine(value: unknown): string {
+  const profile = normalizeProjectProfile(value);
+  if (!profile) return "";
+  const parts = [
+    [profile.genre, profile.subgenre].filter(Boolean).join(" / "),
+    profile.tags?.length ? `标签：${profile.tags.join("、")}` : "",
+    profile.protagonists?.length ? `主角：${profile.protagonists.join(" × ")}` : "",
+  ].filter(Boolean);
+  return parts.length ? `
+作品定位：${parts.join("；")}` : "";
 }
 
 function chapterBeatText(stageBeats: unknown, chapterNumber: number | undefined): string | undefined {
@@ -96,7 +123,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
 {
   "summary": "180 字以内的事件、人物状态和未解决线索",
   "keywords": ["最多 8 个关键词"],
-  "relationshipState": ["人物关系与情绪：谁对谁现在是什么态度、这一章两人之间发生了什么变化、各自的情绪落在哪里；一条一人或一对"],
+  "relationshipState": ["人物关系与情绪：谁对谁现在是什么态度、这一章两人之间发生了什么变化、各自的情绪落在哪里；一条一人或一对。主角两人同时出场的章必须有一条，哪怕只是一个小动作或一句话带来的变化，也要写出来；只有事务没有关系变化时写'主角关系：本章无变化'"],
   "readerKnown": ["本章读者新知道的事，一条一句"],
   "authorTruth": ["本章埋下但读者还不知道的真相，没有就空数组"],
   "nextChapterPromise": "本章结尾对下一章的承诺，一到两句：下一章必须接住什么",
@@ -589,7 +616,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const skillSection = matchedSkills.length
         ? `\n## 本次匹配技能\n${matchedSkills.map(item => `### ${compactText(item.displayName || item.name || "技能", 80)}\n${compactText(item.content || item.description || "", 2400)}`).join("\n\n")}`
         : "";
-      const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${worldSettingSection}${skillSection}${graphSection}${cardSection}`;
+      const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${projectProfileLine(req.params?.projectProfile)}${worldSettingSection}${skillSection}${graphSection}${cardSection}`;
       const outlineSessionKey = stableHash({ scope: "outline", outlineId: String(outlineId || "active"), sessionId: String(sessionId || "default"), projectTitle, kind, model, apiMode, targetChapterId: targetChapterRecord?.id, sourceChapterId: sourceChapterRecord?.id, formatOutlineId: formatOutlineRecord?.id, stableProjectPacket });
       const storedOutlineSession = await readPersistentContext<unknown>(`outline-session-${outlineSessionKey}`);
       const inheritedOutlineSession = outlineSessionCache.get(outlineSessionKey)
@@ -698,6 +725,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
       const { result, usages } = await runChapterReview(client, reviewMode, {
         agentSystemPrompt: chapterAgentSystemPrompt,
+        projectProfile: projectProfileSection(normalizeProjectProfile(req.params?.projectProfile)),
         worldSetting: prepared.worldSetting,
         writingStyle: writingStyle && typeof writingStyle === "object"
           ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) }
@@ -891,6 +919,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           chapterNumber: chapterPosition.number,
           totalChapters: chapterPosition.total,
           instruction: String(instruction),
+          projectProfile: normalizeProjectProfile(req.params?.projectProfile),
           worldSetting: prepared.worldSetting,
           masterOutline: prepared.masterOutline,
           storyLedger: prepared.storyLedger,
