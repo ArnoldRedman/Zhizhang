@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { asTextList, buildChapterMemoryPatch, buildLocalStructuredMemory, buildMemoryDocuments, hydrateMemoryDocuments, memoryDocumentKinds, memoryTextList, normalizeChapterMemory, recentChapterMemories } from './memory.ts';
+import { asTextList, buildChapterMemoryPatch, buildLocalStructuredMemory, buildMemoryDocuments, chapterMemoryStale, hydrateMemoryDocuments, memoryDocumentKinds, memoryTextList, normalizeChapterMemory, recentChapterMemories, staleMemoryChapters } from './memory.ts';
 import type { Chapter, ChapterMemory, Project } from './project.ts';
 
 const now = '2026-01-01T00:00:00.000Z';
@@ -142,4 +142,37 @@ test('recentChapterMemories 只取目标章之前的记忆，按目录顺序排�
   // 章节已不在目录里时退回记忆自带的章号；没有任何章号的记忆不进账本
   const orphan = recentChapterMemories(project({ chapters: [], memories: [memory(99, { sourceChapterNumber: 2 }), memory(98)] }), 5);
   assert.deepEqual(orphan.map(item => item.chapterNumber), [2]);
+});
+
+test('chapterMemoryStale 按提炼时间对比正文改动时间，旧记忆按结构化字段判定', () => {
+  const written = chapter(1, '沈砚守在阁楼。随后电台亮起。');
+  const later = '2026-01-02T00:00:00.000Z';
+  // 没有记忆、只有本地兜底（结构化全空且没有 refinedAt）都算落后
+  assert.equal(chapterMemoryStale(undefined, written), true);
+  assert.equal(chapterMemoryStale(memory(1), written), true);
+  // 提炼过之后正文没再改：不落后
+  assert.equal(chapterMemoryStale(memory(1, { refinedAt: later }), written), false);
+  // 正文在提炼之后又改过：落后
+  assert.equal(chapterMemoryStale(memory(1, { refinedAt: later }), { ...written, updatedAt: '2026-01-03T00:00:00.000Z' }), true);
+  // 2026-09-21 之前的记忆没有 refinedAt：带结构化字段就按 updatedAt 当作提炼过
+  assert.equal(chapterMemoryStale(memory(1, { timelineEvents: ['当晚电台亮起'] }), written), false);
+  assert.equal(chapterMemoryStale(memory(1, { timelineEvents: ['当晚电台亮起'] }), { ...written, updatedAt: later }), true);
+  // 空章不算落后：正文删空时记忆本来就会被移除
+  assert.equal(chapterMemoryStale(undefined, chapter(2)), false);
+});
+
+test('staleMemoryChapters 按目录顺序列出记忆落后的章并带章号', () => {
+  const later = '2026-01-02T00:00:00.000Z';
+  const book = project({
+    chapters: [chapter(1, '正文一'), chapter(2, '正文二'), chapter(3, '正文三'), chapter(4)],
+    memories: [memory(1, { refinedAt: later }), memory(3)],
+  });
+  assert.deepEqual(staleMemoryChapters(book).map(item => item.number), [2, 3]);
+});
+
+test('buildChapterMemoryPatch 合并模型结果时记下提炼时间', () => {
+  const local = buildLocalStructuredMemory(chapter(1, '沈砚守在阁楼。'), project());
+  const patch = buildChapterMemoryPatch({ result: { summary: '新摘要' }, local, keywords: [] });
+  assert.ok(patch.refinedAt && patch.refinedAt >= now);
+  assert.equal(normalizeChapterMemory({ ...memory(1), refinedAt: patch.refinedAt }).refinedAt, patch.refinedAt);
 });

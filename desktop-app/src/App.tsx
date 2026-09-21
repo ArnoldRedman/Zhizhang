@@ -9,7 +9,7 @@ import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, Ch
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile, buildGraphRelationIndex, computeGraphLayout, noGraphNodes, noGraphEdges, type GraphRelationSummary } from './domain/knowledge-graph';
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
 import { addChapterAnnotation, applyParagraphRevision, paragraphNeighbors, removeChapterAnnotations, resolveAnnotationTargets } from './domain/annotation';
-import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories } from './domain/memory';
+import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories, staleMemoryChapters } from './domain/memory';
 import { cardSearchTerms, refreshCardStatesForProject, stripHeuristicCardStates } from './domain/cards';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
 import { mapWithConcurrency } from './utils/concurrency';
@@ -1363,6 +1363,12 @@ function App() {
   const [memoryBackfillFrom, setMemoryBackfillFrom] = useState(1);
   const [memoryBackfillProgress, setMemoryBackfillProgress] = useState<{ done: number; total: number } | null>(null);
   const memoryBackfillAbortRef = useRef(false);
+  // 后台记忆提炼的并发与失败记录：同一章不并发提炼；失败的章十分钟内不自动重试，免得每次停笔都撞同一个错
+  const memoryRefineInFlightRef = useRef(new Set<number>());
+  const memoryRefineFailedAtRef = useRef(new Map<number, number>());
+  const cardStatesRefreshingRef = useRef(false);
+  // 只对本次会话里改过的章自动提炼；旧书里落后于正文的章走记忆中心的补全，不在打开项目时一口气打几十次模型
+  const sessionStartedAtRef = useRef('');
   // 懒人连续创作：要写几章、当前写到第几章；停止只在本章写完后生效
   /** 旧章审查：正文已经写好的章只能重跑审查，才发现当时没人修的遗留问题 */
   /** 写作操作台：润色续写、连续创作、旧章审查三件费地方的事共用一个二级面板 */
@@ -3727,7 +3733,7 @@ function App() {
           });
           const content = applyParagraphRevision(chapter.content, target, result.content || '');
           if (!content) throw new Error('模型没有返回改后的段落');
-          chapter = { ...removeChapterAnnotations(chapter, target.annotations.map(item => item.id)), content, wordCount: countNovelCharacters(content) };
+          chapter = { ...removeChapterAnnotations(chapter, target.annotations.map(item => item.id)), content, wordCount: countNovelCharacters(content), updatedAt: new Date().toISOString() };
           done += 1;
         } catch (error) {
           failures.push(`「${target.annotations[0].quote.slice(0, 20)}」：${String(error)}`);
@@ -3736,6 +3742,7 @@ function App() {
       const updated = replaceChapterInProject(editingProject, chapter);
       await applyProjectChange(updated);
       setActiveChapter(chapter);
+      if (done > 0) refineChapterMemoryInBackground(updated, chapter);
       setNotice({
         title: `按批注改了 ${done}/${targets.length} 段`,
         content: [failures.length ? `失败：${failures.join('；')}` : '', stale.length ? `${stale.length} 条批注的原文已不在正文里，未处理` : '', '旧版本在章节历史里，可回退。'].filter(Boolean).join(' '),
@@ -4098,6 +4105,8 @@ function App() {
         localStorage.setItem('projects', JSON.stringify(nextProjects));
       }
       setAutoSaveStatus('saved');
+      // 润色、去 AI 味、续写都改了正文，记忆跟着重提，别等作者再点一次保存
+      refineChapterMemoryInBackground(updatedProject, updatedChapter);
       setNotice({ title: aiToolResult.mode === 'continue' ? '续写已插入章节' : aiToolResult.mode === 'de-ai' ? '去 AI 味已替换章节内容' : '润色已替换章节内容', content: '正文已写入并保存到本地。' });
     } catch (error) {
       setAutoSaveStatus('error');
@@ -4130,7 +4139,8 @@ function App() {
       unbalanced += quoted.unbalancedLines.length;
       if (paused.text === chapter.content) return chapter;
       changed += 1;
-      return { ...pushChapterSnapshot(chapter, '统一标点'), content: paused.text, wordCount: countNovelCharacters(paused.text), updatedAt: new Date().toISOString() };
+      // 标点归一不改故事内容，记忆不用重提：不动 updatedAt，免得全书几百章都被当成本次改过而排队提炼
+      return { ...pushChapterSnapshot(chapter, '统一标点'), content: paused.text, wordCount: countNovelCharacters(paused.text) };
     });
     if (!changed) {
       setNotice({ title: '标点已经一致', content: `全书引号已是同一风格${unbalanced ? `；${unbalanced} 行引号未闭合，保持原样` : ''}。` });
@@ -4146,7 +4156,9 @@ function App() {
    */
   const refreshAllCardStates = async (project: Project, throughChapterNumber: number): Promise<Project> => {
     const chapters = project.chapters.slice(Math.max(0, throughChapterNumber - 10), throughChapterNumber).filter(chapter => chapter.content.trim());
-    if (!project.cards.length || !chapters.length) return project;
+    // 没卡、没正文、模型没给变化也记下水位，不然下一章写完又刷一次
+    const marked: Project = { ...project, cardStatesRefreshedThrough: throughChapterNumber };
+    if (!project.cards.length || !chapters.length) return marked;
     const result = await agentRpc<{ updates?: Array<{ id?: string; currentState?: string }> }>('card.refresh', {
       projectTitle: project.title,
       cards: project.cards.map(card => ({ id: card.id, type: card.type, title: card.title, content: card.content, currentState: card.currentState || '' })),
@@ -4160,11 +4172,11 @@ function App() {
       ...agentNetworkParams(agentConfig),
     });
     const updates = new Map((result.updates || []).filter(item => item.id && item.currentState?.trim()).map(item => [String(item.id), String(item.currentState).trim()]));
-    if (!updates.size) return project;
+    if (!updates.size) return marked;
     const now = new Date().toISOString();
     const anchor = chapters[chapters.length - 1];
     return {
-      ...project,
+      ...marked,
       cards: project.cards.map(card => {
         const currentState = updates.get(String(card.id));
         if (!currentState || currentState === card.currentState) return card;
@@ -4173,6 +4185,9 @@ function App() {
       updatedAt: now,
     };
   };
+
+  /** 全部卡片状态要不要按近期正文校准一遍：距上次校准又写满了十章，连续创作和手写都按这一条 */
+  const cardStatesRefreshDue = (project: Project) => project.chapters.length - (project.cardStatesRefreshedThrough ?? 0) >= 10;
 
   const refreshCardStatesNow = async () => {
     if (!editingProject || cardRefreshing) return;
@@ -4278,7 +4293,138 @@ function App() {
     };
   };
 
-  // 将章节记忆 Agent 抽取的实体和关系增量合并到本地知识图谱。
+  /** 全卡片状态在后台按近期正文校准一遍，只把状态与水位合回当前状态：等待期间作者手改的卡片内容不受影响 */
+  const refreshAllCardStatesInBackground = async (projectId: number) => {
+    const base = projectsRef.current.find(item => item.id === projectId);
+    if (!base) return;
+    cardStatesRefreshingRef.current = true;
+    try {
+      const refreshed = await refreshAllCardStates(base, base.chapters.length);
+      const states = new Map(refreshed.cards.map(card => [card.id, card]));
+      setProjects(currentProjects => currentProjects.map(item => item.id !== projectId ? item : {
+        ...item,
+        cards: item.cards.map(card => {
+          const next = states.get(card.id);
+          return next && next.currentState !== card.currentState ? { ...card, currentState: next.currentState, stateHistory: next.stateHistory, updatedAt: next.updatedAt } : card;
+        }),
+        cardStatesRefreshedThrough: refreshed.cardStatesRefreshedThrough,
+        updatedAt: new Date().toISOString(),
+      }));
+    } catch (error) {
+      if (isQuotaExceededError(error)) memoryQuotaRetryAt = Date.now() + memoryQuotaCooldownMs;
+      setNotice({ title: '卡片状态未刷新', content: `${String(error)}。不影响写作，可在卡片面板手动点"按近期正文刷新状态"。` });
+    } finally {
+      cardStatesRefreshingRef.current = false;
+    }
+  };
+
+  /**
+   * 后台提炼一章记忆并合并卡片状态与图谱：手动保存、采用草稿、AI 工具改稿、批注与审查修订、停笔或切章后的自动补提都走这里
+   * 正文已经落盘，提炼只在后台跑；等待期间正文又改了就丢弃这次结果，下一轮按新正文再来
+   * 提炼成功后若距上次全卡片校准又写满十章，顺手把全部卡片按近期正文刷一遍
+   */
+  const refineChapterMemoryInBackground = (project: Project, chapter: Chapter, options: { notifyOnSuccess?: boolean } = {}) => {
+    if (!chapter.content.trim() || !agentConfig.enabled || !agentConfig.apiKey.trim()) return;
+    if (Date.now() < memoryQuotaRetryAt || memoryRefineInFlightRef.current.has(chapter.id)) return;
+    memoryRefineInFlightRef.current.add(chapter.id);
+    const currentMemory = project.memories.find(memory => memory.chapterId === chapter.id);
+    const local = buildLocalStructuredMemory(chapter, project);
+    const selectedKeywords = project.cards.filter(card => selectedCardIds.includes(card.id)).map(card => card.title);
+    const keywords = selectedKeywords.length ? selectedKeywords : (currentMemory?.keywords?.length ? currentMemory.keywords : local.keywords);
+    const mentionedCardIds = (cards: KnowledgeCard[], content: string) => new Set(cards
+      .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => content.includes(term)))
+      .map(card => card.id));
+    void (async () => {
+      try {
+        const result = await agentRpc<AgentMemoryResult>('memory.write', {
+          projectTitle: project.title,
+          chapterTitle: chapter.title,
+          content: chapter.content,
+          cards: project.cards.filter(card => selectedCardIds.includes(card.id) || (card.title.trim() && chapter.content.includes(card.title))).slice(0, 10),
+          apiKey: agentConfig.apiKey.trim(),
+          baseURL: agentConfig.baseURL.trim(),
+          model: agentConfig.model.trim() || fallbackModels[0],
+          apiMode: agentConfig.apiMode,
+          reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow,
+          knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
+          ...agentNetworkParams(agentConfig),
+        });
+        const memoryPatch = buildChapterMemoryPatch({ result, local, keywords, existing: currentMemory });
+        // 合并时以当前状态为准：等待期间作者可能还在打字，不能拿发请求时的快照回写；本章正文变了就整份丢弃，落盘交给自动保存
+        setProjects(currentProjects => {
+          const latestProject = currentProjects.find(item => item.id === project.id);
+          const latestChapter = latestProject?.chapters.find(item => item.id === chapter.id);
+          if (!latestProject || !latestChapter || latestChapter.updatedAt !== chapter.updatedAt) return currentProjects;
+          const withMemory = buildProjectWithChapterMemory(latestProject, latestChapter, memoryPatch);
+          const withGraph = mergeKnowledgeGraph(refreshCardStatesForProject(withMemory, mentionedCardIds(withMemory.cards, latestChapter.content)), latestChapter, result);
+          const resultCardIds = (result.cardUpdates || [])
+            .map(update => withGraph.cards.find(card => (update.cardId !== undefined && String(card.id) === String(update.cardId)) || (update.cardTitle && card.title === update.cardTitle))?.id)
+            .filter((id): id is number => id !== undefined);
+          const merged: Project = {
+            ...refreshCardStatesForProject(withGraph, new Set([...resultCardIds, ...selectedCardIds])),
+            authorPreferences: Array.from(new Set([...(latestProject.authorPreferences || []), ...asTextList(result.authorPreferences, 8)])).slice(-20),
+          };
+          return currentProjects.map(item => item.id === merged.id ? merged : item);
+        });
+        memoryRefineFailedAtRef.current.delete(chapter.id);
+        if (options.notifyOnSuccess) setNotice({ title: '章节记忆更新完成', content: '本章结构化摘要已写入本地；若期间再次编辑，旧摘要会被自动丢弃。' });
+        // 水位按当前状态看，不看发请求时的快照：几章并行提炼时，前一章刷完卡片后面几章不该再刷
+        const latest = projectsRef.current.find(item => item.id === project.id);
+        if (latest && cardStatesRefreshDue(latest) && !cardStatesRefreshingRef.current) await refreshAllCardStatesInBackground(project.id);
+      } catch (error) {
+        memoryRefineFailedAtRef.current.set(chapter.id, Date.now());
+        if (isQuotaExceededError(error)) {
+          memoryQuotaRetryAt = Date.now() + memoryQuotaCooldownMs;
+          setNotice({ title: '本章记忆未更新', content: 'API 中转额度已用尽，正文不受影响；额度恢复后重新保存或在记忆中心补全。' });
+          return;
+        }
+        // 标成"记忆未更新"而不是"章节已保存"：记忆提炼失败会让这本书的伏笔/时间线永远停住，
+        // 混在一句"已保存"里作者根本注意不到（实测某本书就是这样丢了 170 章的记忆）
+        setNotice({ title: `${chapter.title || '本章'}记忆未更新`, content: `${String(error)}。正文和本地快照不受影响；可以稍后在记忆中心补全。` });
+      } finally {
+        memoryRefineInFlightRef.current.delete(chapter.id);
+      }
+    })();
+  };
+  // 效应里通过 ref 调最新的一份：函数每次渲染都会重建，不适合直接放进依赖数组
+  const refineChapterMemoryInBackgroundRef = useRef(refineChapterMemoryInBackground);
+  refineChapterMemoryInBackgroundRef.current = refineChapterMemoryInBackground;
+
+  /**
+   * 记忆自动跟上正文：本次会话里改过、记忆落后于正文的章在后台重新提炼
+   * 正在写的章等停笔两分钟再提，别的章（切走的、批量修订过的）三秒后就提；连续创作、重写、补全期间它们自己管记忆，这里不插手
+   * 同时最多提两章：全书替换这类一次改几十章的操作靠每次合并后重跑效应慢慢排队，不能一口气把几十个请求全打出去
+   */
+  useEffect(() => {
+    if (!editingProject || !deviceStorageReady || continuousWriting || chapterRewrite || memoryBackfillProgress) return;
+    // 会话起点取本地数据读完之后：读档时补的 updatedAt 不能算成本次改过
+    if (!sessionStartedAtRef.current) sessionStartedAtRef.current = new Date().toISOString();
+    const project = editingProject;
+    const activeChapterId = activeChapter?.id;
+    const activeIdleMs = 2 * 60_000;
+    let timer = 0;
+    const run = () => {
+      let waitForActive = 0;
+      for (const { chapter } of staleMemoryChapters(project)) {
+        if (memoryRefineInFlightRef.current.size >= 2) break;
+        if (chapter.updatedAt <= sessionStartedAtRef.current) continue;
+        if (Date.now() - (memoryRefineFailedAtRef.current.get(chapter.id) || 0) < 10 * 60_000) continue;
+        if (chapter.id === activeChapterId) {
+          const idle = Date.now() - Date.parse(chapter.updatedAt);
+          if (idle < activeIdleMs) {
+            waitForActive = activeIdleMs - idle;
+            continue;
+          }
+        }
+        refineChapterMemoryInBackgroundRef.current(project, chapter);
+      }
+      if (waitForActive > 0) timer = window.setTimeout(run, waitForActive);
+    };
+    timer = window.setTimeout(run, 3000);
+    return () => window.clearTimeout(timer);
+  }, [editingProject, activeChapter?.id, deviceStorageReady, continuousWriting, chapterRewrite, memoryBackfillProgress]);
+
   const persistCurrentChapter = async () => {
     if (!editingProject || !activeChapter || chapterSaving) return;
     setChapterSaving(true);
@@ -4338,67 +4484,7 @@ function App() {
     // 这样网络中转变慢或返回 502 时不会阻塞编辑器的保存按钮。
     setChapterSaving(false);
     setNotice({ title: '章节已保存', content: '章节已写入本地，正在后台更新本章记忆。' });
-    void (async () => {
-      try {
-        const result = await agentRpc<AgentMemoryResult>('memory.write', {
-            projectTitle: localProject.title,
-            chapterTitle: chapter.title,
-            content: chapter.content,
-            cards: localProject.cards.filter(card => selectedCardIds.includes(card.id) || (card.title.trim() && chapter.content.includes(card.title))).slice(0, 10),
-            apiKey: agentConfig.apiKey.trim(),
-              baseURL: agentConfig.baseURL.trim(),
-            model: agentConfig.model.trim() || fallbackModels[0],
-            apiMode: agentConfig.apiMode,
-            reasoningMode: agentConfig.reasoningMode,
-            contextWindow: agentConfig.contextWindow,
-            knowledgeGraph: { nodes: localProject.graphNodes, edges: localProject.graphEdges },
-            ...agentNetworkParams(agentConfig),
-          });
-        const memoryPatch = buildChapterMemoryPatch({
-          result,
-          local: localStructuredMemory,
-          keywords,
-          existing: currentMemory,
-        });
-        // 如果用户在等待期间又编辑了本章，丢弃过期摘要，避免覆盖新正文。
-        setProjects(currentProjects => {
-          const latestProject = currentProjects.find(project => project.id === localProject.id);
-          const latestChapter = latestProject?.chapters.find(item => item.id === chapter.id);
-          if (!latestProject || !latestChapter || latestChapter.updatedAt !== chapter.updatedAt) return currentProjects;
-          const memoryProject = buildProjectWithChapterMemory(latestProject, latestChapter, memoryPatch);
-          const refreshedMemoryProject = refreshCardStatesForProject(memoryProject, new Set(memoryProject.cards
-            .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => latestChapter.content.includes(term)))
-            .map(card => card.id)));
-          const mergedBase = mergeKnowledgeGraph(refreshedMemoryProject, latestChapter, result);
-          const resultCardIds = (result.cardUpdates || [])
-            .map(update => mergedBase.cards.find(card => (update.cardId !== undefined && String(card.id) === String(update.cardId)) || (update.cardTitle && card.title === update.cardTitle))?.id)
-            .filter((id): id is number => id !== undefined);
-          const merged = {
-            ...refreshCardStatesForProject(mergedBase, new Set([...resultCardIds, ...selectedCardIds])),
-            authorPreferences: Array.from(new Set([...(latestProject.authorPreferences || []), ...asTextList(result.authorPreferences, 8)])).slice(-20),
-          };
-          setEditingProject(current => current?.id === merged.id ? merged : current);
-          setActiveChapter(current => current?.id === latestChapter.id ? latestChapter : current);
-          const nextProjects = currentProjects.map(project => project.id === merged.id ? merged : project);
-          if ('__TAURI_INTERNALS__' in window) {
-            void nativeClient.saveProjects(nextProjects);
-          } else {
-            localStorage.setItem('projects', JSON.stringify(nextProjects));
-          }
-          return nextProjects;
-        });
-        setNotice({ title: '章节记忆更新完成', content: '本章结构化摘要已写入本地；若期间再次编辑，旧摘要会被自动丢弃。' });
-      } catch (error) {
-        if (isQuotaExceededError(error)) {
-          memoryQuotaRetryAt = Date.now() + memoryQuotaCooldownMs;
-          setNotice({ title: '章节已保存', content: '正文和本地章节记忆已更新；API 中转额度已用尽，本章智能摘要会在额度恢复后再更新。' });
-          return;
-        }
-        // 标成“本章记忆未更新”而不是“章节已保存”：记忆提炼失败会让这本书的伏笔/时间线永远停住，
-        // 混在一句“已保存”里作者根本注意不到（实测某本书就是这样丢了 170 章的记忆）
-        setNotice({ title: '本章记忆未更新', content: `${String(error)}。正文和本地快照不受影响；可以稍后在知识面板里从本章补全记忆。` });
-      }
-    })();
+    refineChapterMemoryInBackground(localProject, chapter, { notifyOnSuccess: true });
   };
 
   persistCurrentChapterRef.current = persistCurrentChapter;
@@ -5137,23 +5223,29 @@ function App() {
     const local = buildLocalStructuredMemory(chapter, project);
     const existing = project.memories.find(memory => memory.chapterId === chapter.id);
     const keywords = existing?.keywords?.length ? existing.keywords : local.keywords;
-    const result = await agentRpc<AgentMemoryResult>('memory.write', {
-      projectTitle: project.title,
-      chapterTitle: chapter.title,
-      content: chapter.content,
-      cards: project.cards.filter(card => card.title.trim() && chapter.content.includes(card.title)).slice(0, 10),
-      apiKey: agentConfig.apiKey.trim(),
-      baseURL: agentConfig.baseURL.trim(),
-      model: agentConfig.model.trim() || fallbackModels[0],
-      apiMode: agentConfig.apiMode,
-      reasoningMode: agentConfig.reasoningMode,
-      contextWindow: agentConfig.contextWindow,
-      knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
-      ...agentNetworkParams(agentConfig),
-    });
-    const withMemory = buildProjectWithChapterMemory(project, chapter, buildChapterMemoryPatch({ result, local, keywords, existing }));
-    const mentioned = new Set(withMemory.cards.filter(card => cardSearchTerms(card).some(term => chapter.content.includes(term))).map(card => card.id));
-    return refreshCardStatesForProject(mergeKnowledgeGraph(withMemory, chapter, result), mentioned);
+    // 登记在册，后台自动提炼看到这一章正在提就不再发第二次请求
+    memoryRefineInFlightRef.current.add(chapter.id);
+    try {
+      const result = await agentRpc<AgentMemoryResult>('memory.write', {
+        projectTitle: project.title,
+        chapterTitle: chapter.title,
+        content: chapter.content,
+        cards: project.cards.filter(card => card.title.trim() && chapter.content.includes(card.title)).slice(0, 10),
+        apiKey: agentConfig.apiKey.trim(),
+        baseURL: agentConfig.baseURL.trim(),
+        model: agentConfig.model.trim() || fallbackModels[0],
+        apiMode: agentConfig.apiMode,
+        reasoningMode: agentConfig.reasoningMode,
+        contextWindow: agentConfig.contextWindow,
+        knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
+        ...agentNetworkParams(agentConfig),
+      });
+      const withMemory = buildProjectWithChapterMemory(project, chapter, buildChapterMemoryPatch({ result, local, keywords, existing }));
+      const mentioned = new Set(withMemory.cards.filter(card => cardSearchTerms(card).some(term => chapter.content.includes(term))).map(card => card.id));
+      return refreshCardStatesForProject(mergeKnowledgeGraph(withMemory, chapter, result), mentioned);
+    } finally {
+      memoryRefineInFlightRef.current.delete(chapter.id);
+    }
   };
 
   /**
@@ -5369,7 +5461,9 @@ function App() {
       const updatedChapter: Chapter = { ...pushChapterSnapshot(chapter, '按审查意见修订'), content, wordCount: countNovelCharacters(content), updatedAt: now };
       const latest = editingProjectRef.current || project;
       const chapters = latest.chapters.map(entry => entry.id === updatedChapter.id ? updatedChapter : entry);
-      await applyProjectChange({ ...latest, chapters, wordCount: chapters.reduce((sum, entry) => sum + entry.wordCount, 0), updatedAt: now });
+      const revised: Project = { ...latest, chapters, wordCount: chapters.reduce((sum, entry) => sum + entry.wordCount, 0), updatedAt: now };
+      await applyProjectChange(revised);
+      refineChapterMemoryInBackground(revised, updatedChapter);
       setReviseStates(current => ({ ...current, [item.number]: { status: 'done', message: `已修订（${countNovelCharacters(content)} 字）`, startedAt: Date.now() } }));
       return true;
     } catch (error) {
@@ -5462,8 +5556,8 @@ function App() {
           if (isQuotaExceededError(error)) throw error;
           setNotice({ title: `第 ${number} 章记忆未提炼`, content: `${String(error)}。正文已保存，下一章只能靠本章摘要承接。` });
         }
-        // 每十章把全部卡片对着近期正文校准一遍：逐章提炼只更新本章点到名的卡，没出场的卡状态会停在旧处
-        if (number % 10 === 0) {
+        // 每写满十章把全部卡片对着近期正文校准一遍：逐章提炼只更新本章点到名的卡，没出场的卡状态会停在旧处
+        if (cardStatesRefreshDue(project)) {
           setContinuousWriting({ done: done + 1, total, message: `第 ${number} 章：写满十章，正在刷新全部卡片状态` });
           try {
             project = await refreshAllCardStates(project, number);
@@ -5596,6 +5690,8 @@ function App() {
       setEditingProject(applied.project);
       setActiveChapter(applied.chapter);
       setProjects(current => current.map(project => project.id === applied.project.id ? applied.project : project));
+      // 采用的草稿只带本地摘要，结构化记忆与卡片状态在后台提炼；不然手动一章章写的书记忆中心永远只有正文开头
+      refineChapterMemoryInBackground(applied.project, applied.chapter);
       window.setTimeout(() => chapterEditorRef.current?.focus(), 0);
     }
     setAgentDraft(null);
@@ -6497,17 +6593,10 @@ function App() {
     }
     const total = project.chapters.length;
     const from = Math.min(Math.max(1, Math.round(memoryBackfillFrom) || 1), total);
-    // 只有兜底记忆的章也算待补：摘要就是正文开头、结构化字段全空，等于没提炼过
-    const hasRealMemory = new Set(project.memories
-      .filter(memory => (memory.summary || '').trim()
-        && [memory.characterStateChanges, memory.knowledgeChanges, memory.foreshadowingChanges, memory.timelineEvents, memory.canonFacts, memory.conflicts]
-          .some(list => (list || []).length > 0))
-      .map(memory => memory.chapterId));
-    const targets = project.chapters
-      .map((chapter, index) => ({ chapter, number: index + 1 }))
-      .filter(({ chapter, number }) => number >= from && !hasRealMemory.has(chapter.id));
+    // 待补的章：没有记忆、只有本地兜底（摘要是正文开头、结构化字段全空）、或正文在上次提炼之后又改过
+    const targets = staleMemoryChapters(project).filter(({ number }) => number >= from);
     if (!targets.length) {
-      setNotice({ title: '无需补全', content: `第 ${from} 章之后没有缺记忆的章节。` });
+      setNotice({ title: '无需补全', content: `第 ${from} 章之后没有缺记忆或记忆落后于正文的章节。` });
       return;
     }
     memoryBackfillAbortRef.current = false;
@@ -6567,6 +6656,11 @@ function App() {
   const activeWritingStyle = editingProject?.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) ?? null : null;
   const activeMemoryDocument = editingProject?.memoryDocuments.find(document => document.id === activeMemoryDocumentId) ?? null;
   const activeChapterMemory = editingProject?.memories.find(memory => memory.id === activeChapterMemoryId) ?? null;
+  // 记忆落后于正文的章：只在记忆中心打开时算，别的页面用不着
+  const staleMemoryChapterIds = useMemo(
+    () => editingProject && editorSidebarTab === 'knowledge' ? new Set(staleMemoryChapters(editingProject).map(item => item.chapter.id)) : new Set<number>(),
+    [editingProject, editorSidebarTab],
+  );
   const activeGraphNode = editingProject?.graphNodes.find(node => node.id === activeGraphNodeId) ?? null;
   // 图谱的派生数据全部按输入缓存，并且只在图谱页打开时才算：
   // 一本书近千个节点、近三千条关系时，力导向布局一次七八百毫秒、文档视图排序三百毫秒，
@@ -7107,7 +7201,7 @@ function App() {
                     </select>
                     <button className="btn-add-chapter" onClick={startNewCard}>+ 新建</button>
                     <button className="btn-secondary" onClick={() => updateCardStatesFromBook()}>一键更新状态</button>
-                    <button className="btn-secondary" disabled={cardRefreshing} title="一次模型调用，按最近十章正文重写全部卡片的当前状态；连续创作每十章自动做一次" onClick={() => void refreshCardStatesNow()}>{cardRefreshing ? '刷新中...' : '按近期正文刷新状态'}</button>
+                    <button className="btn-secondary" disabled={cardRefreshing} title="一次模型调用，按最近十章正文重写全部卡片的当前状态；每写满十章会自动做一次" onClick={() => void refreshCardStatesNow()}>{cardRefreshing ? '刷新中...' : '按近期正文刷新状态'}</button>
                   </div>
                   <div className="card-list">
                     {visibleCards.map(card => (
@@ -7159,8 +7253,11 @@ function App() {
                         disabled={memoryBackfillProgress !== null}
                         onChange={event => setMemoryBackfillFrom(Number(event.target.value) || 1)}
                       />
-                      章开始补章节记忆（只补没有记忆的章）
+                      章开始补章节记忆（只补没有记忆、或正文改过后没重新提炼的章）
                     </label>
+                    {staleMemoryChapterIds.size > 0 && memoryBackfillProgress === null && (
+                      <p className="empty-hint">{staleMemoryChapterIds.size} 章没有记忆或记忆落后于正文；本次会话里改过的章会自动补，更早的要点“开始补全”。</p>
+                    )}
                     <div className="knowledge-backfill-actions">
                       {memoryBackfillProgress ? (
                         <>
@@ -7186,7 +7283,7 @@ function App() {
                   {activeMemoryDocumentId === memoryDocumentId('章节快照') && (
                     <section className="snapshot-section">
                       <div className="panel-section-title">章节记忆 <span>{editingProject.memories.length} 章</span></div>
-                      {editingProject.memories.length === 0 ? <p className="empty-hint">保存有正文的章节后，会在这里形成逐章记忆快照。</p> : [...editingProject.memories].sort((left, right) => chapterOrder(left) - chapterOrder(right)).map(memory => (
+                      {editingProject.memories.length === 0 ? <p className="empty-hint">写完或改完一章后会自动提炼这一章的记忆；导入的旧章用上面的补全。</p> : [...editingProject.memories].sort((left, right) => chapterOrder(left) - chapterOrder(right)).map(memory => (
                         <button
                           type="button"
                           className={`memory-item memory-item-button ${activeChapterMemoryId === memory.id ? 'active' : ''}`}
@@ -7199,6 +7296,7 @@ function App() {
                           <small>{memory.keywords.join(' · ') || '暂无关键词'}</small>
                           <div className="memory-details">
                             <span>{memory.characterStateChanges.length} 条人物变化 · {memory.foreshadowingChanges.length} 条伏笔 · {memory.timelineEvents.length} 条时间线</span>
+                            {staleMemoryChapterIds.has(memory.chapterId) && <span>记忆落后于正文，待重新提炼</span>}
                             {memory.endingHook && <span>章末钩子：{memory.endingHook}</span>}
                           </div>
                         </button>

@@ -77,8 +77,33 @@ export const buildChapterMemoryPatch = (options: {
     nextChapterPromise: typeof result.nextChapterPromise === 'string' && result.nextChapterPromise.trim() ? result.nextChapterPromise.trim() : (existing?.nextChapterPromise || ''),
     newlyIntroduced: asTextList(result.newlyIntroduced, 12).length ? asTextList(result.newlyIntroduced, 12) : (existing?.newlyIntroduced || []),
     endingHook: typeof result.endingHook === 'string' && result.endingHook.trim() ? result.endingHook.trim() : (local.endingHook || existing?.endingHook || ''),
+    // 这份补丁只在模型返回之后才会构造，合并时间就是提炼时间
+    refinedAt: new Date().toISOString(),
   };
 };
+
+/** 有没有模型提炼出的结构化字段：本地兜底只有摘要和关键词，结构化列表全空 */
+export const hasStructuredMemory = (memory: ChapterMemory) => Boolean((memory.summary || '').trim())
+  && [memory.characterStateChanges, memory.knowledgeChanges, memory.foreshadowingChanges, memory.timelineEvents, memory.canonFacts, memory.conflicts]
+    .some(list => (list || []).length > 0);
+
+/** 记忆最近一次模型提炼的时间；2026-09-21 之前的记忆没有 refinedAt，带结构化字段的就按 updatedAt 当作提炼过 */
+export const memoryRefinedAt = (memory: ChapterMemory) => memory.refinedAt || (hasStructuredMemory(memory) ? memory.updatedAt : '');
+
+/**
+ * 这一章的记忆是不是落后于正文：没有记忆、只有本地兜底、或正文在提炼之后又改过
+ * 空章不算，删空正文时记忆本来就会被移除
+ */
+export const chapterMemoryStale = (memory: ChapterMemory | undefined, chapter: Chapter) => {
+  if (!chapter.content.trim()) return false;
+  const refinedAt = memory ? memoryRefinedAt(memory) : '';
+  return !refinedAt || refinedAt < chapter.updatedAt;
+};
+
+/** 记忆落后于正文的章，按目录顺序带章号；补全记忆和记忆中心的提示都用它 */
+export const staleMemoryChapters = (project: Pick<Project, 'chapters' | 'memories'>) => project.chapters
+  .map((chapter, index) => ({ chapter, number: index + 1, memory: project.memories.find(memory => memory.chapterId === chapter.id) }))
+  .filter(({ chapter, memory }) => chapterMemoryStale(memory, chapter));
 
 export const buildMemoryDocuments = (memories: ChapterMemory[], existingDocuments: MemoryDocument[] = [], force = false): MemoryDocument[] => {
   const ordered = [...memories].sort((left, right) => chapterOrder(left) - chapterOrder(right));
@@ -152,6 +177,7 @@ export const normalizeChapterMemory = (memory: Partial<ChapterMemory>, fallbackC
     sourceChapterNumber: typeof memory.sourceChapterNumber === 'number' ? memory.sourceChapterNumber : undefined,
     createdAt: typeof memory.createdAt === 'string' ? memory.createdAt : now,
     updatedAt: typeof memory.updatedAt === 'string' ? memory.updatedAt : (typeof memory.createdAt === 'string' ? memory.createdAt : now),
+    refinedAt: typeof memory.refinedAt === 'string' ? memory.refinedAt : undefined,
   };
 };
 

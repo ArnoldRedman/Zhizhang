@@ -87,6 +87,11 @@ export interface ChapterMemory {
   sourceChapterNumber?: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * 模型提炼结果最近一次合并进来的时间；没有就只有本地兜底
+   * 正文的 updatedAt 晚于它，记忆就落后于正文，要重新提炼。updatedAt 本地兜底也会刷，分不出来
+   */
+  refinedAt?: string;
 }
 
 export type MemoryDocumentKind = '章节快照' | '人物状态' | '角色认知' | '伏笔追踪' | '时间线' | '设定事实' | '冲突';
@@ -195,6 +200,8 @@ export interface Project {
   defaultSkillNames?: string[];
   /** 单章 AI 率上限（本地启发式，百分比）：写完超过就对疑似段落去一次 AI 味；缺省 30 */
   maxAIRate?: number;
+  /** 全部卡片状态最近一次按近期正文校准到第几章；再写满十章就自动刷一次，不分连续创作还是手写 */
+  cardStatesRefreshedThrough?: number;
   githubRepositoryUrl?: string;
   /** 每日码字量，键为本地日期 YYYY-MM-DD */
   dailyWords?: Record<string, number>;
