@@ -151,12 +151,12 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
   "canonFacts": ["后续必须遵守的事实"],
   "conflicts": ["冲突和结果"],
   "endingHook": "章末未解决事项",
-  "entities": [{"name":"实体","type":"人物|物品|地点|势力|事件|设定"}],
+  "entities": [{"name":"实体","type":"人物|物品|地点|势力|设定"}],
   "relations": [{"source":"实体","target":"实体","label":"关系","weight":0.7}],
   "cardUpdates": [{"cardId":"卡片 ID","cardTitle":"卡片名称","status":"changed|acquired|lost|revealed|updated","changes":"有正文依据的变化"}]
 }
 
-实体只写具名的人物、地点、物件、势力：名字用上面卡片里的正名（正文叫"姜老""爷爷""姜老董事长"的都写成卡片正名），不给名字加"（人物）"这类后缀；"爷爷""韩律师""圆框眼镜的女学徒""四名年轻学徒"这种称谓、职务、描述不是实体，不要写；同一个人只出现一次。物品只记有名字且会再出现的（信物、文件、作品），一次性的杯子桌子不记。
+实体只写具名的人物、地点、物件、势力、设定：名字用上面卡片里的正名（正文叫"姜老""爷爷""姜老董事长"的都写成卡片正名），不给名字加"（人物）"这类后缀；"爷爷""韩律师""圆框眼镜的女学徒""四名年轻学徒"这种称谓、职务、描述不是实体，不要写；同一个人只出现一次。事件不算实体（婚礼、家宴、庭审写进时间线）。物品只记有名字且会再出现的（信物、文件、作品），一次性的杯子桌子饭菜不记；同一件东西只写一个名字，不写"XX原件""XX复印件"这类版本变体。
 关系 weight 为 0.1 到 1.0 的正文证据强度：明确行动、身份、持有或状态变化为 0.85 以上；直接提及为 0.65 至 0.8；推断性弱关联不超过 0.6。实体不超过 20 个，关系不超过 40 条；无内容使用空数组或空字符串。`;
       const optimizedResponse = await client.chat([
         { role: "system", content: memoryEditorSystemPrompt },

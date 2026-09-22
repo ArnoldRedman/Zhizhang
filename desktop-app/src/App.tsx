@@ -4261,8 +4261,8 @@ function App() {
     const suggestion = await agentRpc<{ merges?: Array<{ from: string; to: string; reason?: string }>; removes?: Array<{ name: string; reason?: string }> }>('graph.dedupe', {
       projectTitle: local.project.title,
       cards: local.project.cards.map(card => ({ title: card.title, aliases: cardAliasTerms(card).filter(term => term !== card.title.trim()) })),
-      // 只送人物、势力、地点：物品长尾靠规则就够了，送给模型只会撑爆输出
-      entities: entities.filter(node => /人物|角色|势力|组织|地点|场景/u.test(node.category || '')).slice(0, 300).map(node => ({
+      // 人物、势力、地点全送；物品只送被提过三次以上的（规则已经删了一两次的道具），送给模型的是它们之间的变体
+      entities: entities.filter(node => /人物|角色|势力|组织|地点|场景/u.test(node.category || '') || (mentionedIn.get(node.id) || []).length >= 3).slice(0, 320).map(node => ({
         label: node.label,
         category: node.category,
         chapters: (mentionedIn.get(node.id) || []).slice(0, 6).map(label => label.replace(/^(第\s*\d+\s*章).*$/u, '$1')),

@@ -1,6 +1,6 @@
 import type { KnowledgeGraphEdge, KnowledgeGraphNode, Project } from './project.ts';
 import { cardAliasTerms } from './cards.ts';
-import { isGenericEntityLabel, isSurnamedHonorific, stripEntityTypeSuffix } from './entity-terms.ts';
+import { entityCoreLabel, isGenericEntityLabel, isSurnamedHonorific, matchesCardTitleFragment, stripEntityTypeSuffix } from './entity-terms.ts';
 import { graphNodeProfileIsEmpty, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge } from './knowledge-graph.ts';
 
 /**
@@ -9,6 +9,10 @@ import { graphNodeProfileIsEmpty, normalizeKnowledgeGraphEdges, upsertKnowledgeG
  * 同一个人裂成"姜正霖""姜正林""姜老太爷""老太爷""爷爷""姜正林（人物）"六个节点。
  * 这里是不调模型的那一半：并同名、并别名、并类型后缀、删泛称、删长尾；拿不准的错别字与尊称交给模型那一半
  */
+
+/** 类别家族：势力与组织、地点与场景互相算同类 */
+const familyOf = (value: string | undefined) => /人物|角色/u.test(value || '') ? '人物' : /势力|组织/u.test(value || '') ? '势力' : /地点|场景/u.test(value || '') ? '地点' : /物品|金手指/u.test(value || '') ? '物品' : /事件/u.test(value || '') ? '事件' : /设定/u.test(value || '') ? '设定' : '实体';
+const sameFamily = (left: string | undefined, right: string | undefined) => familyOf(left) === familyOf(right);
 
 /** 只表示"这一章提到了它"的边：长尾判断时不算真正的关系 */
 const mentionLabels = new Set(['章节提及', '正文提及', '状态引用', '本章引用']);
@@ -121,22 +125,32 @@ export const cleanupKnowledgeGraph = (project: Project, options: { deferHonorifi
     next = mergeGraphNodes(next, node.id, target);
   }
 
-  // 2. 同名实体互并：剥掉后缀后标签相同，留边最多的那个
-  const byLabel = new Map<string, KnowledgeGraphNode[]>();
+  // 1b. 地点、势力、物品实体是某张同类卡标题的一段（"梧桐路601"对"江城梧桐路58号老洋房顶楼601"）：并进那张卡
   for (const node of entityNodes()) {
-    const label = stripEntityTypeSuffix(node.label);
-    byLabel.set(label, [...(byLabel.get(label) || []), node]);
+    if (/人物|角色/u.test(node.category || '')) continue;
+    const card = project.cards.find(item => sameFamily(item.type, node.category) && matchesCardTitleFragment(node.label, item.title));
+    if (!card || !next.graphNodes.some(item => item.id === `card:${card.id}`)) continue;
+    report.merged.push({ from: node.label, to: card.title, reason: '卡片标题片段' });
+    next = mergeGraphNodes(next, node.id, `card:${card.id}`);
   }
-  for (const [label, group] of byLabel) {
-    if (group.length < 2) continue;
+
+  // 2. 同名与同核心名的实体互并：剥掉类型后缀、书名号、组织或版本后缀后相同，留边最多的那个，名字取最短的
+  const byCore = new Map<string, KnowledgeGraphNode[]>();
+  for (const node of entityNodes()) {
+    const key = `${familyOf(node.category)}｜${entityCoreLabel(node.label, node.category)}`;
+    byCore.set(key, [...(byCore.get(key) || []), node]);
+  }
+  for (const [key, group] of byCore) {
+    if (group.length < 2 || key.endsWith('｜')) continue;
     const counts = degree();
-    const keep = [...group].sort((left, right) => (counts.get(right.id) || 0) - (counts.get(left.id) || 0) || (right.label === label ? 1 : 0) - (left.label === label ? 1 : 0))[0];
+    const keep = [...group].sort((left, right) => (counts.get(right.id) || 0) - (counts.get(left.id) || 0) || left.label.length - right.label.length)[0];
+    const shortest = [...group].sort((left, right) => left.label.length - right.label.length)[0].label;
     for (const node of group) {
       if (node.id === keep.id) continue;
-      report.merged.push({ from: node.label, to: keep.label, reason: '同名' });
+      report.merged.push({ from: node.label, to: shortest, reason: stripEntityTypeSuffix(node.label) === stripEntityTypeSuffix(keep.label) ? '同名' : '同一事物的变体' });
       next = mergeGraphNodes(next, node.id, keep.id);
     }
-    if (keep.label !== label) next = { ...next, graphNodes: next.graphNodes.map(node => node.id === keep.id ? { ...node, label } : node) };
+    if (keep.label !== shortest) next = { ...next, graphNodes: next.graphNodes.map(node => node.id === keep.id ? { ...node, label: shortest } : node) };
   }
 
   // 3. 错别字并进卡片
@@ -163,19 +177,29 @@ export const cleanupKnowledgeGraph = (project: Project, options: { deferHonorifi
   // 4. 泛称删掉；带姓的尊称（"姜老太爷""夏老"）被提过两次以上的先留着，等模型判它是谁再并进正主，模型不跑时才删
   const degreesBeforeRemoval = degree();
   for (const node of entityNodes()) {
-    if (!isGenericEntityLabel(node.label)) continue;
+    if (!isGenericEntityLabel(node.label, node.category)) continue;
     if (options.deferHonorifics && isSurnamedHonorific(node.label) && (degreesBeforeRemoval.get(node.id) || 0) >= 2) continue;
     report.removed.push({ label: node.label, reason: '称谓或泛称，不是具名实体' });
     next = removeGraphNode(next, node.id);
   }
 
-  // 5. 长尾删掉：只有一条提及边、没人写过档案
+  // 4b. 事件实体全删：章节本身就是事件，记忆的时间线也记着，一个"冬至家宴"节点什么都不多给
+  for (const node of entityNodes()) {
+    if (!/事件/u.test(node.category || '') || !graphNodeProfileIsEmpty(node)) continue;
+    report.removed.push({ label: node.label, reason: '事件不建节点，章节与时间线已经记着' });
+    next = removeGraphNode(next, node.id);
+  }
+
+  // 5. 长尾删掉：没人写过档案、只有提及边；人物与地点被提过一次就删，物品与设定被提过两次以内都删
+  // （一本书里出现两次的杯子碗碟仍然是道具，不是设定；出现三次以上才可能是信物）
   const counts = degree();
   for (const node of entityNodes()) {
     if (!graphNodeProfileIsEmpty(node)) continue;
     const edges = next.graphEdges.filter(edge => edge.source === node.id || edge.target === node.id);
-    if ((counts.get(node.id) || 0) > 1 || edges.some(edge => !mentionLabels.has(edge.label))) continue;
-    report.removed.push({ label: node.label, reason: '只在一章被提到过，没有任何关系与档案' });
+    if (edges.some(edge => !mentionLabels.has(edge.label))) continue;
+    const threshold = /物品|设定|实体/u.test(node.category || '') && !/^[《「『]/u.test(node.label) ? 2 : 1;
+    if ((counts.get(node.id) || 0) > threshold) continue;
+    report.removed.push({ label: node.label, reason: threshold === 1 ? '只在一章被提到过，没有任何关系与档案' : '只在一两章被提到过的道具，没有任何关系与档案' });
     next = removeGraphNode(next, node.id);
   }
   return { project: next, report };
@@ -183,7 +207,7 @@ export const cleanupKnowledgeGraph = (project: Project, options: { deferHonorifi
 
 /** 规则清理时留给模型判的带姓尊称：模型那步过后仍在图里的，说明模型也不知道是谁，按泛称删 */
 export const deferredHonorifics = (project: Project): KnowledgeGraphNode[] => project.graphNodes
-  .filter(node => node.type === 'entity' && isGenericEntityLabel(node.label) && isSurnamedHonorific(node.label));
+  .filter(node => node.type === 'entity' && isGenericEntityLabel(node.label, node.category) && isSurnamedHonorific(node.label));
 
 /** 模型那一半返回的合并与删除建议 */
 export interface GraphDedupeSuggestion {

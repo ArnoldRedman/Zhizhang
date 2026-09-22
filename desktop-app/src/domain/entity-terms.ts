@@ -21,6 +21,38 @@ const typeSuffixPattern = /[（(]\s*(?:人物|角色|角色卡|地点|场景|物
 
 export const stripEntityTypeSuffix = (label: string) => label.replace(typeSuffixPattern, '').trim();
 
+/** 势力名常见的部门与组织后缀："天宇法务 / 天宇法务部 / 天宇法务天团"是一回事；长的在前，先匹配长的 */
+const orgSuffixes = ['有限公司', '天团', '团队', '总部', '分部', '部门', '集团', '公司', '方面', '一方', '部', '处', '组', '科', '室', '局', '团', '所', '方'];
+/** 物品名常见的版本与形态后缀："信托母本契约 / 信托母本契约正本 / 信托母本契约复印件"指同一份东西 */
+const itemSuffixes = ['复印件', '扫描件', '原件', '正本', '副本', '样本', '试样', '样纸', '残卷', '残本', '母本', '抄本', '拓本', '拓片', '一册', '一卷', '一份', '照片'];
+
+/**
+ * 实体名归到"核心名"：剥类型后缀、括号说明、书名号与引号，再按类别剥组织或版本后缀
+ * 图谱合并与图谱清理都用它判"是不是同一个东西"；核心名相同才并，不做模糊匹配
+ */
+export const entityCoreLabel = (label: string, category?: string): string => {
+  let core = stripEntityTypeSuffix(label).replace(/[（(][^）)]*[）)]/gu, '').trim();
+  core = core.replace(/^[《「『‘'"“]+|[》」』’'"”]+$/gu, '').trim();
+  const suffixes = /势力|组织/u.test(category || '') ? orgSuffixes : /物品|设定/u.test(category || '') ? itemSuffixes : [];
+  // 最多剥两层："沈氏实业集团有限公司"先去"有限公司"再去"集团"，和"沈氏实业"才对得上
+  for (let round = 0; round < 2; round += 1) {
+    const suffix = suffixes.find(item => core.length > item.length + 1 && core.endsWith(item));
+    if (!suffix) break;
+    core = core.slice(0, -suffix.length).trim();
+  }
+  return core;
+};
+
+/** 地点、势力这类卡的标题是长描述（"江城梧桐路58号老洋房顶楼601"），实体名是它的一段就算命中；这些通用词除外 */
+const genericPlaceWords = new Set(['研究所', '研究院', '医院', '学院', '大学', '中心', '法庭', '法院', '别墅', '书肆', '老宅', '酒店', '机场', '车站', '公司', '集团', '博物馆', '图书馆', '庄园', '殿堂', '画室', '展厅', '病房', '疗养', '苏黎世', '瑞士', '江城', '京城', '临安', '南洋', '西湖']);
+
+/** 实体名剥掉数字后至少三个字、不是通用词、且是某张同类卡片标题的一段：并进那张卡 */
+export const matchesCardTitleFragment = (label: string, cardTitle: string): boolean => {
+  const core = entityCoreLabel(label).replace(/[0-9０-９]+/gu, '').trim();
+  if (core.length < 3 || genericPlaceWords.has(core)) return false;
+  return cardTitle.includes(core);
+};
+
 /** 带姓的尊称、简称："姜老太爷""夏老""韩律师"：多半是某个具名人物的称呼，规则不知道是谁，要交给模型并进正主 */
 export const isSurnamedHonorific = (label: string) => {
   const normalized = stripEntityTypeSuffix(label).replace(/[（(][^）)]*[）)]/gu, '').trim();
@@ -30,8 +62,9 @@ export const isSurnamedHonorific = (label: string) => {
 /**
  * 是不是一个不该单独成节点的泛称
  * 整个词在称谓表里、以"的"引出的描述（"林素华的徒弟""圆框眼镜的女学徒"）、带数量的群体（"四名年轻学徒"）、以"们"结尾的都算
+ * 姓氏加称谓、描述加身份这两条只对人物用："天宇法务"是势力，结尾的"法务"不能让它变成泛称
  */
-export const isGenericEntityLabel = (label: string) => {
+export const isGenericEntityLabel = (label: string, category?: string) => {
   // 括号里的说明剥掉再判："阿婆（秦有娣之母）"就是"阿婆"
   const normalized = stripEntityTypeSuffix(label).replace(/[（(][^）)]*[）)]/gu, '').trim();
   if (!normalized) return true;
@@ -42,6 +75,8 @@ export const isGenericEntityLabel = (label: string) => {
   if (/的/u.test(normalized) && normalized.length >= 4) return true;
   if (/^[一二两三四五六七八九十几数百千][名个位群批些]/u.test(normalized)) return true;
   if (/们$/u.test(normalized)) return true;
+  const personLike = !category || /人物|角色|实体/u.test(category);
+  if (!personLike) return false;
   // "沈妄之父""秦有娣之兄"：某人的亲属，正文没给名字
   if (/之(?:父|母|兄|弟|姐|妹|妻|夫|子|女|友)$/u.test(normalized)) return true;
   // 姓氏加称谓："韩律师""陆师傅""孙院长""夏老"：是某个具名人物的称呼，不是独立的人

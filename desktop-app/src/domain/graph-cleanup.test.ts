@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { applyGraphDedupeSuggestion, cleanupKnowledgeGraph, deferredHonorifics, mergeGraphNodes } from './graph-cleanup.ts';
 import { cardAliasLines, cardAliasTerms, cardSearchTermGroups } from './cards.ts';
-import { isGenericEntityLabel, stripEntityTypeSuffix } from './entity-terms.ts';
+import { entityCoreLabel, isGenericEntityLabel, stripEntityTypeSuffix } from './entity-terms.ts';
 import type { KnowledgeCard, KnowledgeGraphEdge, KnowledgeGraphNode, Project } from './project.ts';
 
 const now = '2026-01-01T00:00:00.000Z';
@@ -31,6 +31,10 @@ test('泛称判定：称谓、姓氏加职务、"的"字描述、群体都算；
   for (const label of ['姜正霖', '沈妄', '韩正', '夏承安', '阿德里安·韦伯', '小满', '老程', '《破晓的四合院》', '沈崇义']) {
     assert.equal(isGenericEntityLabel(label), false, label);
   }
+  // 势力、物品不套人物的称谓规则："天宇法务"是势力，"审核责任说明"是文件
+  assert.equal(isGenericEntityLabel('天宇法务', '势力'), false);
+  assert.equal(isGenericEntityLabel('天宇法务', '人物'), true);
+  assert.equal(isGenericEntityLabel('法务', '势力'), true);
   assert.equal(stripEntityTypeSuffix('沈妄（人物）'), '沈妄');
   assert.equal(stripEntityTypeSuffix('民政局(地点)'), '民政局');
 });
@@ -82,6 +86,36 @@ test('本地清理：别名与后缀并进卡片、错别字并进卡片、泛�
   assert.equal(again.report.merged.length + again.report.removed.length, 0);
 });
 
+test('本地清理：势力与物品的变体按核心名并成一个，地点并进卡片标题片段，事件全删，两章提到的道具也删', () => {
+  const place: KnowledgeCard = { ...card(5, '江城梧桐路58号老洋房顶楼601'), type: '地点卡' };
+  const base = project({
+    cards: [place],
+    graphNodes: [
+      { id: 'card:5', label: place.title, type: 'card', category: '地点卡' },
+      entity('天宇法务', '势力'), entity('天宇法务部', '势力'), entity('天宇法务天团', '势力'),
+      entity('《不可撤销家族信托母本契约正本》', '物品'), entity('不可撤销家族信托母本契约', '物品'), entity('信托母本复印件', '物品'),
+      entity('梧桐路601', '地点'), entity('老洋房', '地点'), entity('冬至家宴', '事件'), entity('钢印机', '物品'), entity('宫灯', '物品'),
+      { id: 'chapter:3', label: '第 3 章', type: 'chapter' }, { id: 'chapter:4', label: '第 4 章', type: 'chapter' }, { id: 'chapter:5', label: '第 5 章', type: 'chapter' },
+    ],
+    graphEdges: [
+      mention(3, 'entity:天宇法务'), mention(4, 'entity:天宇法务部'), mention(5, 'entity:天宇法务天团'),
+      mention(3, 'entity:《不可撤销家族信托母本契约正本》'), mention(4, 'entity:《不可撤销家族信托母本契约正本》'), mention(5, 'entity:不可撤销家族信托母本契约'), mention(5, 'entity:信托母本复印件'),
+      mention(3, 'entity:梧桐路601'), mention(4, 'entity:老洋房'), mention(3, 'entity:冬至家宴'), mention(4, 'entity:冬至家宴'),
+      mention(3, 'entity:钢印机'), mention(4, 'entity:钢印机'), mention(3, 'entity:宫灯'), mention(4, 'entity:宫灯'), mention(5, 'entity:宫灯'),
+    ],
+  });
+  const { project: cleaned, report } = cleanupKnowledgeGraph(base);
+  const labels = cleaned.graphNodes.filter(node => node.type === 'entity').map(node => node.label).sort();
+  // 天宇法务三个并成一个（名字取最短，结尾的"法务"不算称谓）；信托契约两个并成一个共三章留下，"信托母本复印件"核心名不同不并、且只提过一次删掉；梧桐路与老洋房并进地点卡；冬至家宴删；钢印机两章删；宫灯三章留
+  assert.deepEqual(labels, ['不可撤销家族信托母本契约', '天宇法务', '宫灯']);
+  assert.equal(cleaned.graphEdges.filter(edge => edge.target === 'entity:天宇法务').length, 3);
+  assert.ok(report.merged.some(item => item.from === '天宇法务天团' && item.to === '天宇法务' && item.reason === '同一事物的变体'));
+  assert.ok(report.merged.some(item => item.from === '梧桐路601' && item.to === place.title && item.reason === '卡片标题片段'));
+  assert.ok(cleaned.graphEdges.some(edge => edge.target === 'card:5' && edge.source === 'chapter:4'));
+  assert.ok(report.removed.some(item => item.label === '冬至家宴'));
+  assert.ok(report.removed.some(item => item.label === '钢印机'));
+});
+
 test('模型建议：from 对得上实体、to 对得上卡片称呼或实体才合并；对不上的跳过', () => {
   const base = project({
     cards: [card(1, '姜正霖')],
@@ -108,4 +142,14 @@ test('带姓的尊称：deferHonorifics 时被提过两次以上的先留给模�
   assert.deepEqual(deferredHonorifics(deferred.project).map(node => node.label), ['姜老太爷']);
   const strict = cleanupKnowledgeGraph(base);
   assert.equal(strict.project.graphNodes.length, 0);
+});
+
+test('核心名：势力剥组织后缀最多两层，物品剥书名号与版本后缀，人物不剥', () => {
+  assert.equal(entityCoreLabel('沈氏实业集团有限公司', '势力'), '沈氏实业');
+  assert.equal(entityCoreLabel('天宇法务天团', '势力'), '天宇法务');
+  assert.equal(entityCoreLabel('天宇集团', '势力'), '天宇');
+  assert.equal(entityCoreLabel('《不可撤销家族信托母本契约正本》', '物品'), '不可撤销家族信托母本契约');
+  assert.equal(entityCoreLabel('桑皮纸样本', '物品'), '桑皮纸');
+  assert.equal(entityCoreLabel('韩正（人物）', '人物'), '韩正');
+  assert.equal(entityCoreLabel('陆师傅', '人物'), '陆师傅');
 });

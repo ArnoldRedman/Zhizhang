@@ -239,6 +239,11 @@ export interface Project {
   cardCandidates?: CardCandidate[];
   /** 作者点过"忽略"的候选名，之后再出现也不再提 */
   ignoredCardCandidates?: string[];
+  /**
+   * 只在一章出现过的实体：先记在这里，第二次在别的章出现才升为图谱节点
+   * 记忆提炼每章抽十几个"实体"，一次性的杯子桌子直接建节点会攒出上千个空档案；一个东西得出现两次才配有节点
+   */
+  graphPendingEntities?: Array<{ label: string; category: string; chapterIds: number[] }>;
   githubRepositoryUrl?: string;
   /** 每日码字量，键为本地日期 YYYY-MM-DD */
   dailyWords?: Record<string, number>;
