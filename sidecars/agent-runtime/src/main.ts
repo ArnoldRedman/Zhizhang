@@ -141,7 +141,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
   "relationshipState": ["人物关系与情绪：谁对谁现在是什么态度、这一章两人之间发生了什么变化、各自的情绪落在哪里；一条一人或一对。主角两人同时出场的章必须有一条，哪怕只是一个小动作或一句话带来的变化，也要写出来；只有事务没有关系变化时写'主角关系：本章无变化'"],
   "readerKnown": ["本章读者新知道的事，一条一句"],
   "authorTruth": ["本章埋下但读者还不知道的真相，没有就空数组"],
-  "nextChapterPromise": "本章结尾对下一章的承诺，一到两句：下一章必须接住什么",
+  "nextChapterPromise": "本章结尾对下一章的承诺，一到两句：下一章必须接住什么。每章都要写，结尾没有明显悬念时写'本章结尾停在哪个场面、人物下一步大概率做什么'，不要空着",
   "newlyIntroduced": ["本章第一次出现、之后大概率还会再出现的具名人物、地点、势力、关键物件（信物、文件、作品、遗物），一条一个；食物、日用品、交通工具、一次露面的路人和工作人员不写"],
   "characterStateChanges": ["角色名：持续状态变化"],
   "knowledgeChanges": ["角色名：得知或隐瞒的信息"],

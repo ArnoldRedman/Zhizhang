@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isWorkLogDocumentTitle } from "@zhizhang/contracts";
 
 export interface ContextReport {
   cache: "hit" | "miss";
@@ -232,6 +233,31 @@ export class LruCache<Value> {
  * 以前写死 6000 字节头尾截断：作者一份 11.6KB 的《写作风格与反 AI 味规范》，中段"人物声音 DNA"表整段被裁掉，
  * 模型只拿到目录和黑名单词；写出来的人自然没有声音。按窗口给，128K 时一份 24KB，小窗口才退到 8KB
  */
+/**
+ * 不该进写作提示词的"世界观"文档：修订日志、变更记录、评审意见这类是工作台账，不是作品设定
+ * 实测一份 28KB 的《修订日志》每章都以"作者定的固定规则"身份进提示词，里面全是"旧书名""已废弃设定"的历史
+ */
+export const isWorkLogDocument = (title: unknown): boolean => isWorkLogDocumentTitle(title);
+
+/**
+ * 一份设定文档里过期的进度字段：`current_timeline`、`latest_completed_chapter`、"已完成至第 N 章"这类
+ * 它们是某一天写下的进度快照，不是规则；写第 205 章时读到"latest_completed_chapter：155"，模型就按第 155 章的时点写
+ */
+const progressLinePattern = /^\s*[-*]?\s*\*{0,2}(?:current_timeline|latest_completed_chapter|active_volume|as_of_chapter|state_architecture|_calendar_anchor|status)\*{0,2}\s*[：:]/iu;
+/** 只剥"已完成至第 N 章"这个短语本身（连同紧跟的书名），后面的话是别的信息，留着 */
+const progressPhrasePattern = /[，,]?\s*已(?:完成|写)至第\s*\d+\s*章(?:《[^》]*》)?/gu;
+export function stripProgressSnapshots(content: string): string {
+  return content
+    .split("\n")
+    .filter(line => !progressLinePattern.test(line))
+    .join("\n")
+    .replace(progressPhrasePattern, "")
+    // 短语剥掉后留下的孤零零的分隔符："（156～205章，）""- ；桑皮纸试制……"
+    .replace(/[，,]\s*[）)]/gu, "）")
+    .replace(/^(\s*[-*]\s*)[；;，,：:]\s*/gmu, "$1")
+    .replace(/\n{3,}/gu, "\n\n");
+}
+
 export function worldSettingDocumentBytes(contextWindowKTokens?: number): number {
   const window = Math.max(16, Number(contextWindowKTokens) || 128);
   return Math.max(8000, Math.min(24000, Math.floor(window * 1024 * 3 * 0.07)));
@@ -275,6 +301,13 @@ export function contextBudgetBytes(contextWindowKTokens?: number, capKB?: number
 function compactList(value: unknown, maxItems: number, itemBytes: number): string[] {
   return Array.isArray(value)
     ? value.map(item => compactText(item, itemBytes)).filter(Boolean).slice(0, maxItems)
+    : [];
+}
+
+/** 列表项按句尾截，超长的整句砍掉：账本、感情线这种一句话一条的资料，头尾截断留下的是两截碎片 */
+function leadList(value: unknown, maxItems: number, itemBytes: number): string[] {
+  return Array.isArray(value)
+    ? value.map(item => leadText(item, itemBytes)).filter(Boolean).slice(0, maxItems)
     : [];
 }
 
@@ -340,6 +373,53 @@ const heuristicCardState = /出现“[^”]*”：|当前全文未检索到可�
 /** 单张卡的正文上限：角色卡写到性格、目标、关系一般八九 KB，再往上就是流水账了 */
 const cardContentBytes = 10000;
 
+/** 卡片里对写作没用的小节：项目职责、能力边界、各种"当前……状态"快照（状态另有 currentState 字段，正文里那份是某一章的旧快照） */
+const cardSkippableHeading = /(项目职责|能力边界|专业能力|职责|当前[^\n]{0,6}状态|状态历史|initial_state|inventory|状态快照)/u;
+/** 卡片里必须整段保留的小节：写出来的人有没有性格全看这几段 */
+const cardCoreHeading = /(性格|声音|voice|说话|表达|感情|关系|相处|目标|驱动|恐惧|盲点|选择|禁用|psychological|relationship)/u;
+
+/**
+ * 卡片正文按小节裁：先去掉对写作没用的小节；还装不下就按比例缩非核心小节，核心小节一个字不裁
+ * 以前按字节头尾截断：沈妄卡 15KB 截到 10KB，被截掉的正好是"核心目标与心理驱动""与主要人物的关系与相处方式"，
+ * 留下的是身份、硬事实和微习惯，模型写出来的人有动作没有心
+ */
+export function compactCardContent(content: string, maxBytes: number): string {
+  const normalized = normalizePromptWhitespace(content);
+  if (byteLength(normalized) <= maxBytes) return normalized;
+  const sections = splitOutlineSections(normalized);
+  if (sections.filter(section => section.heading).length < 2) return compactText(normalized, maxBytes);
+  const kept = sections.filter(section => !section.heading || !cardSkippableHeading.test(section.heading));
+  const sectionText = (section: OutlineSection) => [section.heading, section.body].filter(Boolean).join("\n");
+  const render = (texts: string[]) => texts.filter(Boolean).join("\n\n");
+  const texts = kept.map(sectionText);
+  if (byteLength(render(texts)) <= maxBytes) return render(texts);
+  const isCore = (section: OutlineSection) => Boolean(section.heading && cardCoreHeading.test(section.heading));
+  const coreBytes = kept.reduce((sum, section, index) => sum + (isCore(section) ? byteLength(texts[index]) + 2 : 0), 0);
+  const otherBytes = kept.reduce((sum, section, index) => sum + (isCore(section) ? 0 : byteLength(texts[index]) + 2), 0);
+  // 核心小节本身就装不下：只能整体头尾截
+  if (coreBytes >= maxBytes - 200 || otherBytes === 0) return compactText(render(texts), maxBytes);
+  const budget = maxBytes - coreBytes;
+  const shrunk = kept.map((section, index) => isCore(section)
+    ? texts[index]
+    : headLines(texts[index], Math.max(80, Math.floor(budget * (byteLength(texts[index]) + 2) / otherBytes) - 2)));
+  const rendered = render(shrunk);
+  return byteLength(rendered) <= maxBytes ? rendered : compactText(rendered, maxBytes);
+}
+
+/** 按整行截：卡片小节多是一行一条的要点，装几条算几条，末尾标"…"；比头尾截断留两截碎片好读 */
+function headLines(text: string, maxBytes: number): string {
+  if (byteLength(text) <= maxBytes) return text;
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of text.split("\n")) {
+    const size = byteLength(line) + 1;
+    if (used + size > maxBytes - 4) break;
+    kept.push(line);
+    used += size;
+  }
+  return `${kept.join("\n")}\n…`.trim();
+}
+
 function compactCards(cards: ContextCard[], text: string, maxBytes: number): Array<{ type: string; title: string; content: string }> {
   const ranked = cards
     .filter(card => card && card.title?.trim())
@@ -352,14 +432,15 @@ function compactCards(cards: ContextCard[], text: string, maxBytes: number): Arr
     const history = (card.stateHistory || [])
       .filter(item => !heuristicCardState.test(String(item.changes || "")))
       .slice(-3)
-      .map(item => `${compactText(item.chapterTitle || "最近章节", 70)}：${compactText(item.changes || item.status || "", 240)}`)
+      .map(item => `${compactText(item.chapterTitle || "最近章节", 70)}：${leadText(item.changes || item.status || "", 240)}`)
       .filter(Boolean).join("；");
     const rawState = String(card.currentState || "");
-    const state = heuristicCardState.test(rawState) ? "" : compactText(rawState, 600);
+    // 状态是一句话一条的近况，按句尾截；头尾截断会在一句话中间留一个裁剪标记
+    const state = heuristicCardState.test(rawState) ? "" : leadText(rawState, 600);
     const label = `[${compactText(card.type || "知识卡", 40)}] ${compactText(card.title, 100)}`;
     const fixed = [label, state && `当前状态：${state}`, history && `近期变化：${history}`].filter(Boolean).join("\n");
     // 出场人物的卡尽量整张带入：性格、目标、恐惧、相处方式都在正文中后段，截成几百字节只剩 id 和别名
-    const knowledge = compactText(card.content || "", Math.max(120, Math.min(cardContentBytes, remaining - byteLength(fixed) - 20)));
+    const knowledge = compactCardContent(String(card.content || ""), Math.max(120, Math.min(cardContentBytes, remaining - byteLength(fixed) - 20)));
     const content = [fixed, knowledge && `知识：${knowledge}`].filter(Boolean).join("\n");
     packed.push({ type: compactText(card.type || "知识卡", 40), title: compactText(card.title, 100), content });
     remaining -= byteLength(content) + 2;
@@ -452,7 +533,7 @@ function compactMemories(memories: unknown, maxBytes: number): Array<Record<stri
       canonFacts: compactList(memory.canonFacts, 3, 180),
       conflicts: compactList(memory.conflicts, 2, 180),
       // 人物关系与情绪：以前的记忆全是事务（湿度 62、帘纹差半道），感情线没有任何可承接的东西
-      relationshipState: compactList(memory.relationshipState, 4, 200),
+      relationshipState: leadList(memory.relationshipState, 4, 260),
       endingHook: compactText(memory.endingHook || "", 260),
     };
     const size = byteLength(JSON.stringify(value));
@@ -717,7 +798,8 @@ export function compactMasterOutline(content: unknown, text: string, maxBytes: n
       const subtree = outlineSubtreeText(sections, current.section.index, routeIndexes);
       if (located) {
         locatedByNumber = true;
-        const byStage = compactVolumeByStage(subtree, chapterNumber, currentBudget);
+        // 卷标题里的"已完成至第 N 章"是某天写下的进度快照，写到第 205 章还读到"已完成至第178章"，模型会把 179 章以后当成没写过
+        const byStage = compactVolumeByStage(stripProgressSnapshots(subtree), chapterNumber, currentBudget);
         atVolumeEnd = byStage.atVolumeEnd;
         blocks.push(`${byStage.position ? `本章位置：${current.section.heading.replace(/^#+\s*/u, "")}；${byStage.position}\n\n` : ""}【当前卷】\n${byStage.text}`);
       } else {
@@ -836,7 +918,8 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
     const summary = leadText(memory.summary || "", 200);
     if (!summary) continue;
     const hook = leadText(memory.endingHook || "", 80);
-    const relationship = leadText(compactList(memory.relationshipState, 3, 120).join("；"), 160);
+    // 关系与情绪整条带：以前截 160 字节，一条"沈妄→姜冷月：她协助核对并提议集…[裁剪]…情绪克制"读起来是碎片
+    const relationship = leadList(memory.relationshipState, 2, 320).join("；");
     const line = `- ${chapterLabel(memory)}：${summary}${relationship ? `（人物：${relationship}）` : ""}${hook ? `（章末：${hook}）` : ""}`;
     if (used + byteLength(line) + 1 > summaryBudget) break;
     events.unshift(line);
@@ -880,7 +963,8 @@ function relationshipBlock(ordered: Array<Record<string, unknown>>): string {
   }
   if (lastIndex < 0) return recent.length >= 2 ? `感情线：最近 ${recent.length} 章的记忆里都没有人物关系变化，感情线已经停了，本章要有一处实打实的推进。` : "";
   const latest = recent[lastIndex];
-  const lines = compactList(latest.relationshipState, 4, 160).map(text => `- ${text}`);
+  // 感情线那几行整条带：它是本章要往前推的起点，裁成"她记录地址、把关流…[裁剪]…无新摩擦"等于没给
+  const lines = leadList(latest.relationshipState, 4, 400).map(text => `- ${text}`);
   const stalled = recent.length - 1 - lastIndex;
   const stallNote = stalled >= 2 ? `\n之后 ${stalled} 章没有关系变化，感情线停在这里，本章要有一处实打实的推进。` : stalled === 1 ? "\n上一章没有关系变化，本章接着往前走。" : "";
   return `感情线（${chapterLabel(latest)}时的人物关系与情绪，本章从这里往前推）：\n${lines.join("\n")}${stallNote}`;
@@ -954,9 +1038,9 @@ export function prepareChapterInput(input: {
   // Canon is fixed by the author and must stay outside relevance sorting so it
   // remains a stable upstream prompt-cache prefix across chapter requests.
   const worldSetting = allOutlines
-    .filter(item => item.kind === "世界观与作品设定" && String(item.content || "").trim())
+    .filter(item => item.kind === "世界观与作品设定" && String(item.content || "").trim() && !isWorkLogDocument(item.title))
     .sort((left, right) => String(left.id ?? left.title ?? "").localeCompare(String(right.id ?? right.title ?? ""), "zh-CN"))
-    .map(item => `## ${compactText(item.title || item.kind || "世界观与作品设定", 80)}\n${compactText(item.content, worldSettingDocumentBytes(input.contextWindowKTokens))}`)
+    .map(item => `## ${compactText(item.title || item.kind || "世界观与作品设定", 80)}\n${compactText(stripProgressSnapshots(String(item.content)), worldSettingDocumentBytes(input.contextWindowKTokens))}`)
     .join("\n\n");
   // 总纲不参与相关度排序，也不走头尾截断：它有自己的骨架加相关段落的压法
   const masterOutlineSource = allOutlines

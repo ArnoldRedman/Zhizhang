@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, leadText, LruCache, normalizePromptWhitespace, prepareChapterInput, stableHash, stageBeatLines, tailText } from "../src/context/context-optimizer.js";
+import { buildStoryLedger, byteLength, compactCardContent, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, isWorkLogDocument, leadText, LruCache, normalizePromptWhitespace, prepareChapterInput, stableHash, stageBeatLines, stripProgressSnapshots, tailText } from "../src/context/context-optimizer.js";
 
 describe("context optimizer", () => {
   it("keeps both ends of oversized chapter material", () => {
@@ -407,5 +407,65 @@ describe("buildStoryLedger · 感情线", () => {
     // 最近几章一条关系记录都没有：直接说停了
     const none = buildStoryLedger(memories.map(memory => ({ ...memory, relationshipState: [] })), { number: 204, total: 203 }, 4000);
     expect(none).toContain("都没有人物关系变化，感情线已经停了");
+  });
+});
+
+describe("世界观文档与卡片的裁法", () => {
+  it("修订日志、评审意见这类工作台账不进世界观资料；进度快照字段被剥掉", () => {
+    expect(isWorkLogDocument("修订日志")).toBe(true);
+    expect(isWorkLogDocument("变更记录")).toBe(true);
+    expect(isWorkLogDocument("写作风格与反 AI 味规范")).toBe(false);
+    const stripped = stripProgressSnapshots("- **current_timeline**：D114 大年初三\n- **latest_completed_chapter**：155\n- **active_volume**：5\n\n## hard_facts\n- 沈妄肉身 24 岁\n### 第四卷（156～205章，已完成至第178章）\n- 核心：书肆二期");
+    expect(stripped).not.toContain("current_timeline");
+    expect(stripped).not.toContain("latest_completed_chapter");
+    expect(stripped).not.toContain("已完成至第178章");
+    expect(stripped).toContain("沈妄肉身 24 岁");
+    expect(stripped).toContain("### 第四卷（156～205章）");
+    const prepared = prepareChapterInput({
+      instruction: "写第 205 章",
+      outlines: [
+        { id: 1, kind: "世界观与作品设定", title: "修订日志", content: "## 2026-08-23 第 9 次修订\n旧书名改掉了。" },
+        { id: 2, kind: "世界观与作品设定", title: "都市现实规则", content: "- 手机要充电。" },
+      ],
+      contextWindowKTokens: 128,
+      chapterPosition: { number: 205, total: 205 },
+    });
+    expect(prepared.worldSetting).toContain("手机要充电");
+    expect(prepared.worldSetting).not.toContain("旧书名改掉了");
+  });
+
+  it("卡片按小节裁：先丢项目职责与状态快照，再丢非核心小节，性格与关系整段保留", () => {
+    const card = [
+      "- **name**：沈妄",
+      "## 当前身份", "书肆店主。".repeat(40),
+      "## 前世与穿越", "前世是编辑。".repeat(60),
+      "## 性格与声音", "句子短，不解释。".repeat(30),
+      "## 主要项目职责", "造纸温室。".repeat(80),
+      "## 核心目标与心理驱动", "把手艺留下来。".repeat(30),
+      "## 与主要人物的关系与相处方式", "把她让到路灯内侧。".repeat(30),
+      "## 专业能力边界", "会失手。".repeat(40),
+      "## 微习惯与身体细节", "把东西码齐。".repeat(40),
+      "## 当前状态（第171章末）", "在温室。".repeat(40),
+    ].join("\n");
+    const packed = compactCardContent(card, 2600);
+    expect(byteLength(packed)).toBeLessThanOrEqual(2600);
+    expect(packed).toContain("## 性格与声音");
+    expect(packed).toContain("## 核心目标与心理驱动");
+    expect(packed).toContain("## 与主要人物的关系与相处方式");
+    expect(packed).toContain("- **name**：沈妄");
+    expect(packed).not.toContain("主要项目职责");
+    expect(packed).not.toContain("当前状态（第171章末）");
+    expect(packed).not.toContain("已按相关性与预算裁剪");
+    // 装得下就原样
+    expect(compactCardContent("## 性格与声音\n短。", 1000)).toBe("## 性格与声音\n短。");
+  });
+
+  it("账本里的关系与情绪整条带，不再截成碎片", () => {
+    const ledger = buildStoryLedger([
+      { chapterNumber: 200, title: "第 200 章", summary: "选址。", relationshipState: [`沈妄与姜冷月：${"她记录地址、把关流程，不催不问；他蹲渠试水、判院、比对，她在台侧挪灯看比对却不问结论。".repeat(2)}`] },
+      { chapterNumber: 201, title: "第 201 章", summary: "看纸坊。" },
+    ], { number: 202, total: 201 }, 4000);
+    expect(ledger).not.toContain("已按相关性与预算裁剪");
+    expect(ledger).toContain("挪灯看比对却不问结论");
   });
 });

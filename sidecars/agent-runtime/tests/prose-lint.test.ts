@@ -398,3 +398,15 @@ describe("lintProse 整体", () => {
     expect(hasBlocking(mixed)).toBe(true);
   });
 });
+
+describe("terse-dialogue", () => {
+  it("四字以内的对话行占三成以上且够密才报；正常对话不报", () => {
+    const terse = Array.from({ length: 8 }, (_, index) => ["“嗯。”", "“多久。”", "“收了。”", "“拆吧。”", "“我去。”", "“走吧。”", "“结果。”", "“这回。”"][index]).join("\n\n");
+    const hits = of(`${filler(20)}\n\n${terse}\n\n“他走了。”\n\n“你去问问周伯，他昨晚回来得晚。”`, "terse-dialogue");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].severity).toBe("advisory");
+    expect(hits[0].message).toContain("电报体对话");
+    const normal = Array.from({ length: 12 }, (_, index) => `“今天先不去城西，等湿度稳了再说，第${index + 1}批纸坏了四十一张。”`).join("\n\n");
+    expect(types(`${filler(20)}\n\n${normal}\n\n“嗯。”\n\n“好。”`)).not.toContain("terse-dialogue");
+  });
+});

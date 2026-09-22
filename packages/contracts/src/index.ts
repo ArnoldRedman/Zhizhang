@@ -5,6 +5,11 @@ export { allocateChapterParts, chapterCharacterCount, maxChapterParts, minChapte
 // 正文本地验证门与标点归一：运行时在连续创作里按 blocking 决定是否定向修订，桌面端在草稿面板即时显示，两端必须报出同一份结果
 export { classifyEnding, classifyOpening, firstSentence, hasBlocking, lastSentence, lintProse } from "./prose-lint.js";
 export type { LintContext, LintFinding, LintSeverity } from "./prose-lint.js";
+/**
+ * 不该进写作提示词的"世界观"文档：修订日志、变更记录、评审意见这类是工作台账，不是作品设定
+ * 桌面端与运行时都按这一条过滤：一份 28KB 的《修订日志》曾每章都以"作者定的固定规则"身份进提示词
+ */
+export const isWorkLogDocumentTitle = (title: unknown): boolean => /(修订|变更|更新)(日志|记录|台账|历史)|评审意见|审稿|问题台账|changelog|revision/iu.test(String(title || ""));
 export { detectQuoteStyle, normalizePauses, normalizeQuotes } from "./punctuation.js";
 export type { PunctuationReport, QuoteStyle } from "./punctuation.js";
 

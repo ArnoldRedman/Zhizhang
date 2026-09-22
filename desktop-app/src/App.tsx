@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ChangeEvent
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
-import { detectQuoteStyle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
+import { detectQuoteStyle, isWorkLogDocumentTitle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
@@ -4849,7 +4849,7 @@ function App() {
         instruction: `「${title}」在第 ${chapters.join('、')} 章出现过，为它建一张${type}。只写正文片段里能证实的信息，写不到的标"待揭示"，不要编造。`,
         chapterTitle: latest?.title,
         chapterContent: candidateExcerpts(project, candidate),
-        outlines: project.outlines.filter(item => item.kind === '世界观与作品设定').slice(0, 2).map(outline => ({ kind: outline.kind, content: outline.content })),
+        outlines: project.outlines.filter(item => item.kind === '世界观与作品设定' && !isWorkLogDocumentTitle(item.title)).slice(0, 2).map(outline => ({ kind: outline.kind, content: outline.content })),
         cards: project.cards.slice(-8),
         apiKey: agentConfig.apiKey.trim(),
         baseURL: agentConfig.baseURL.trim(),
@@ -4948,7 +4948,7 @@ function App() {
         cards: effectiveCards(project, selectedOutlineCardIds, `${targetOutline.title}\n${targetOutline.content}\n${String(sourceChapter?.content || '').slice(-8000)}\n${instruction}`),
         knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
         worldSetting: project.outlines
-          .filter(item => item.kind === '世界观与作品设定' && item.content.trim())
+          .filter(item => item.kind === '世界观与作品设定' && item.content.trim() && !isWorkLogDocumentTitle(item.title))
           .map(item => ({ id: item.id, title: item.title, content: item.content })),
         // 总纲原文和目标章之前的记忆：章纲不能只看上一章正文，得知道本章在全书哪一段、前文写过什么
         masterOutline: project.outlines.filter(item => item.kind === '总纲' && item.content.trim()).map(item => item.content).join('\n\n'),
@@ -7427,7 +7427,7 @@ function App() {
                           </button>
                           {!collapsed && items.map(outline => (
                             <div key={outline.id} className={`outline-document-item ${activeOutlineId === outline.id ? 'active' : ''}`} onClick={() => setActiveOutlineId(outline.id)}>
-                              <div><strong>{outline.title}</strong><small>{outline.kind === '章纲' && outline.chapterId ? editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节' : outline.kind}{outline.snapshots?.length ? ` · ${outline.snapshots.length} 个历史版本` : ''}</small></div>
+                              <div><strong>{outline.title}</strong><small>{outline.kind === '章纲' && outline.chapterId ? editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节' : outline.kind}{outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title) ? ' · 工作台账，不进写作提示词' : ''}{outline.snapshots?.length ? ` · ${outline.snapshots.length} 个历史版本` : ''}</small></div>
                               <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}><Icon name="trash" size={14} /></button>
                             </div>
                           ))}
@@ -7724,7 +7724,7 @@ function App() {
                 <section className="memory-snapshot-editor">
                   <div className="memory-document-header">
                     <div><span>逐章记忆快照</span><h3>{activeChapterMemory.chapterTitle}</h3></div>
-                    <button className="btn-primary" onClick={saveActiveChapterMemory}>保存本章记忆</button>
+                    <div className="memory-document-actions"><button className="btn-secondary" title="用当前正文重新调模型提炼这一章的记忆：关系与情绪、下一章承诺、新出现的事物都会重来" onClick={() => { const chapter = editingProject.chapters.find(item => item.id === activeChapterMemory.chapterId); if (chapter) { refineChapterMemoryInBackground(editingProject, { ...chapter, updatedAt: new Date().toISOString() }, { notifyOnSuccess: true }); setNotice({ title: '正在重新提炼', content: `${chapter.title} 的记忆正在后台重新提炼，几十秒后刷新。` }); } }}>重新提炼</button><button className="btn-primary" onClick={saveActiveChapterMemory}>保存本章记忆</button></div>
                   </div>
                   <div className="memory-snapshot-form">
                     <label>章节摘要<textarea value={activeChapterMemory.summary} onChange={(event) => updateChapterMemory({ summary: event.target.value })} /></label>

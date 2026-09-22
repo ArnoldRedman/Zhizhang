@@ -755,6 +755,15 @@ function findQuoteEmphasisTic(lines: readonly ProseLine[]): LintFinding[] {
 const timeOpeningPattern = /^(?:周[一二三四五六日]|\d+月\d+日|清晨|入夜|傍晚|上午|下午|中午|深夜|次日|三日后|一周后|正月|初春|三月|冬至|启程当日)/;
 const lampNightOpeningPattern = /灯亮了一夜|天没亮|天还没亮|一夜|天亮/;
 const stillnessEndingPattern = /没再说|没动|没关|没答|没催|没去动|没抹平|没再碰|没再问|没有挪|站着没动/;
+/**
+ * 电报体对话：整行只是一对引号里四个字以内的话（"嗯。""多久。""收了。""拆吧。"）
+ * 本书实测第 199、200 章四十几条对话里近三十条是这种，人人都用同一种腔调说话，人物分不开；
+ * 每千字超过 4 行、且占对话三成以上才报，短对话本身不是病，满篇都是才是
+ */
+const terseDialoguePattern = /^[“「"]([^”」"]{1,4})[”」"][。！？!?]?(?:[^“「"]{0,12})?$/;
+const terseDialoguePerKilo = 4;
+const terseDialogueMinShare = 0.3;
+const terseDialogueMinHits = 6;
 const liftEndingPattern = /温暖|辽阔|苍茫|宁谧|流淌|金光|余晖|相知相契|浩然|永安|阴霾|属于他们的|新的一天/;
 /** 沉默词：引号外「没问 / 默默 / 点了点头」这类零反应词，本书实测过一整章人人只在沉默点头 */
 const silencePattern = /没问|没说话|没再说|没接话|没接这|没有说|默默|淡淡|没吭声|没应|没回头|嗯了一声|应了一声|点了点头|点头/g;
@@ -850,6 +859,20 @@ function findDialogueSparse(lines: readonly ProseLine[]): LintFinding[] {
   return [finding('dialogue-sparse', 'advisory', lines[0].line, 1, `对话 ${dialogueLines} 行 / 全文 ${total} 字`, `对话过少：每千字只有 ${perKilo.toFixed(1)} 行对话；叙述压着人物不开口，读者听不到人物的声线`)];
 }
 
+/** 电报体对话密度：四字以内的对话行占比过高，人人一个腔调 */
+function findTerseDialogue(lines: readonly ProseLine[]): LintFinding[] {
+  const total = lines.reduce((sum, line) => sum + visibleLength(line.trimmed), 0);
+  if (total < dialogueMinChars) return [];
+  const dialogueLines = lines.filter(line => dialogueLinePattern.test(line.trimmed));
+  const terse = dialogueLines.filter(line => terseDialoguePattern.test(line.styled.trim()));
+  if (terse.length < terseDialogueMinHits) return [];
+  const perKilo = (terse.length / total) * 1000;
+  const share = terse.length / Math.max(1, dialogueLines.length);
+  if (perKilo < terseDialoguePerKilo || share < terseDialogueMinShare) return [];
+  const samples = terse.slice(0, 6).map(line => line.trimmed.slice(0, 8)).join(' ');
+  return [finding('terse-dialogue', 'advisory', terse[0].line, 1, samples, `电报体对话：${terse.length} 行对话只有四个字以内（占对话 ${Math.round(share * 100)}%）；每个人都这么说话就分不出谁是谁，让至少一半的话说完整、带上这个人自己的口气`)];
+}
+
 /**
  * 照搬章纲：正文与章纲都只留汉字后比对，标点、加粗、【】标注造成的差异不算。
  * 贪心扫描：每个起点二分求「仍是章纲子串」的最长延伸（子串的前缀仍是子串，单调），命中区间不重叠。
@@ -907,7 +930,7 @@ export function lintProse(text: string, context: LintContext = {}): LintFinding[
     ...findPeriodStutter(lines), ...findLongParagraph(lines), ...findMicroActionTic(lines), ...findStockReactionTic(lines), ...findActionListTic(lines),
     ...findAbstractSummaryTic(lines), ...findClicheDensityTic(lines), ...findMetaphorDensityTic(lines), ...findReasoningChainTic(lines),
     ...findQuoteEmphasisTic(lines), ...findFormulaicParallelism(lines),
-    ...findOutlineCopy(lines, context.outline), ...findEchoes(lines, context), ...findSilenceDensity(lines), ...findDialogueSparse(lines),
+    ...findOutlineCopy(lines, context.outline), ...findEchoes(lines, context), ...findSilenceDensity(lines), ...findDialogueSparse(lines), ...findTerseDialogue(lines),
   ];
   return findings.sort((a, b) => a.line - b.line || a.column - b.column);
 }
