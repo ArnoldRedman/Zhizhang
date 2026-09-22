@@ -387,7 +387,13 @@ function chapterMaterialPacket(state: ChapterStateType): string {
     : "";
   const promiseSection = state.previousPromise ? `\n## 上一章留给本章的事\n${state.previousPromise}\n` : "";
   const directionSection = storyDirectionPacket(state);
-  return [skillsSection, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, graphSection, continuitySection, promiseSection, echoSection, contextSection].filter(Boolean).join("");
+  // 重写历史章：卡片正文和设定文档里难免写着后面章的事（"第 204 章体检""第 194 章改称阿妄"），这些在本章时点还没发生
+  const number = typeof state.chapterNumber === "number" ? state.chapterNumber : 0;
+  const historical = number > 0 && typeof state.totalChapters === "number" && number < state.totalChapters;
+  const historyNote = historical
+    ? `\n## 本章的时点\n本章是第 ${number} 章，正在重写。资料里凡是标着第 ${number} 章及以后章号的事（卡片里的"第 194 章起改称""第 204 章体检"、设定文档里的后续进展）在本章时点都还没发生，不能写进来、不能让人物知道；人物关系与状态以第 ${number - 1} 章之前的记忆为准。\n`
+    : "";
+  return [skillsSection, historyNote, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, graphSection, continuitySection, promiseSection, echoSection, contextSection].filter(Boolean).join("");
 }
 
 /** 修订类调用（验证门定向修订、事实矛盾定点修订）返回的整章正文：剥围栏、标题行与【给作者】，和首稿走同一套拆法 */

@@ -466,3 +466,25 @@ describe("skills and cast in the writing graph", () => {
     store.close();
   });
 });
+
+describe("重写历史章的时点提醒", () => {
+  it("章号小于总章数时正文提示词带本章的时点，最后一章不带", async () => {
+    const seen: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const messages = messagesOf(init);
+      seen.push(messages);
+      if (messages.includes("待审查章节")) return ok(passReview);
+      if (messages.includes("先想一想")) return ok("承接敲门。");
+      return ok("林砚僵在门前。");
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "history-note", title: "时点测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    await graph.invoke({ projectId: "history-note", chapterId: "130", chapterNumber: 130, totalChapters: 204, instruction: "重写第 130 章", previousChapters: [{ id: "129", title: "第 129 章", content: "门外传来三声敲门。" }] });
+    expect(seen.some(messages => messages.includes("本章是第 130 章，正在重写") && messages.includes("第 129 章之前的记忆为准"))).toBe(true);
+    seen.length = 0;
+    await graph.invoke({ projectId: "history-note", chapterId: "204", chapterNumber: 204, totalChapters: 204, instruction: "继续写", previousChapters: [{ id: "203", title: "第 203 章", content: "门外传来三声敲门。" }] });
+    expect(seen.some(messages => messages.includes("本章的时点"))).toBe(false);
+    store.close();
+  });
+});
