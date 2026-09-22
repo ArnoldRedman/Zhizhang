@@ -3,6 +3,7 @@ import type { Skill } from '../../domain/skill';
 import type { DismantleAggregate, WritingStyle } from '../../domain/library';
 import { firstSentence, lastSentence } from '@zhizhang/contracts';
 import { buildMemoryDocuments, recentChapterMemories } from '../../domain/memory.ts';
+import { answeredAuthorQuestions } from '../../domain/outline.ts';
 import { cardSearchTermGroups } from '../../domain/cards.ts';
 import { chapterBoundToOutline } from '../outline/model.ts';
 
@@ -190,6 +191,8 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
       allowedPhrases: project.allowedPhrases || [],
       ...recentChapterEcho(project, chapterNumber),
       previousPromise: previousChapter ? project.memories.find(memory => memory.chapterId === previousChapter.id)?.nextChapterPromise || undefined : undefined,
+      // 作者对模型提问的答复：之后每章按答复写，模型不再重复问
+      authorAnswers: answeredAuthorQuestions(project),
       // 对标资料只传写作要用的三样，文风档案已经作为 WritingStyle 单独绑定，不重复带
       benchmark: input.benchmark ? { anchors: input.benchmark.anchors, emotionModules: input.benchmark.emotionModules, rhythm: input.benchmark.rhythm } : undefined,
     },

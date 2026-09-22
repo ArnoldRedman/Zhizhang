@@ -132,7 +132,18 @@ function stableProjectPacket(state: ChapterStateType): string {
     projectProfileSection(state.projectProfile),
     state.worldSetting ? `## 世界观与作品设定（作者定的固定规则）\n${state.worldSetting}` : "",
     state.writingStyle ? `## 绑定文风\n名称：${state.writingStyle.name}\n${state.writingStyle.content}` : "",
+    authorAnswersSection(state.authorAnswers),
   ].filter(Boolean).join("\n\n");
+}
+
+/**
+ * 作者已答复的问题：模型之前用【给作者】问过、作者拍了板的事，之后每章都按答复写
+ * 没有这一段，模型每章都会把同一个问题再问一遍，作者答了也白答
+ */
+export function authorAnswersSection(answers: Array<{ question: string; answer: string }> | undefined): string {
+  const items = (answers || []).filter(item => item.question.trim() && item.answer.trim()).slice(-20);
+  if (!items.length) return "";
+  return `## 作者已答复（你之前问过的，按答复写，不要再问）\n${items.map(item => `- 问：${compactText(item.question, 240)}\n  答：${compactText(item.answer, 400)}`).join("\n")}`;
 }
 
 /**
@@ -240,6 +251,8 @@ export const ChapterState = Annotation.Root({
   instruction: Annotation<string>,
   /** 作品定位：类型、标签、简介、主角；进稳定资料，构思、正文、审查三步都看 */
   projectProfile: Annotation<ProjectProfile | undefined>,
+  /** 作者对模型【给作者】提问的答复：进稳定资料，之后每章按答复写 */
+  authorAnswers: Annotation<Array<{ question: string; answer: string }>>({ reducer: (_prev, next) => next, default: () => [] }),
   worldSetting: Annotation<string | undefined>,
   writingStyle: Annotation<{ name: string; content: string } | undefined>,
   /** 总纲骨架与当前相关段落，见 compactMasterOutline */

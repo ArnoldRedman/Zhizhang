@@ -12,6 +12,7 @@ import { addChapterAnnotation, applyParagraphRevision, paragraphNeighbors, remov
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories, staleMemoryChapters } from './domain/memory';
 import { cardSearchTerms, refreshCardStatesForProject, stripHeuristicCardStates } from './domain/cards';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
+import { addCardCandidates, answerAuthorQuestion, answeredAuthorQuestions, dismissAuthorQuestion, groupOutlines, mergeGeneratedOutline, migrateCardCandidatesFromNotes, outlineKeepsHistory, outlineSnapshotLimit, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeCardCandidate, removeReviewReportsForChapter, restoreOutlineSnapshot } from './domain/outline';
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
 import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
@@ -146,14 +147,14 @@ const reviewPerspectiveLabel = (perspective: string): string => ({
 } as Record<string, string>)[perspective] || perspective;
 
 /**
- * 把模型这一章的【给作者】和审查意见追加进"给作者｜待答"文档（大纲页里能看，kind 复用审查报告）
+ * 把模型这一章的审查意见追加进"给作者｜待答"文档（大纲页里能看，kind 复用审查报告）
+ * 模型的【给作者】提问和"本章新出现"不再进这里：提问进 authorQuestions 让作者能答，新出现进 cardCandidates 让作者一键建卡；
  * 连续创作不为一句疑问停下来，作者有空再看；同一章重跑时先删掉这一章的旧条目，不堆重复
  */
-const appendAuthorNotes = (project: Project, number: number, chapterTitle: string, notes: string[], review?: AgentReviewResult, lintFindings: Array<{ type: string; severity: 'blocking' | 'advisory'; line: number; excerpt: string; message: string }> = [], newlyIntroduced: string[] = []): Project => {
+const appendAuthorNotes = (project: Project, number: number, chapterTitle: string, review?: AgentReviewResult, lintFindings: Array<{ type: string; severity: 'blocking' | 'advisory'; line: number; excerpt: string; message: string }> = []): Project => {
   // 验证门的 blocking 已经合并进审查 findings（source 记 lint），这里按 lintFindings 单独列，结构化项里就不再重复
   const structured = (review?.findings || []).filter(item => (item.severity === 'S1' || item.severity === 'S2') && item.source !== 'lint');
   const items = [
-    ...notes.map(note => `- ${note}`),
     ...(structured.length
       ? structured.map(item => `- 审查 ${item.severity}${item.location ? `｜${item.location}` : ''}：${item.issue}${item.fix ? `（${item.fix}）` : ''}`)
       : [
@@ -162,13 +163,12 @@ const appendAuthorNotes = (project: Project, number: number, chapterTitle: strin
       ]),
     ...(review?.nextChapterRisks || []).map(item => `- 下一章要接住：${item}`),
     ...lintFindings.filter(item => item.severity === 'blocking').map(item => `- 验证门未改净｜第 ${item.line} 行｜${item.type}：${item.excerpt}`),
-    ...newlyIntroduced.map(item => `- 本章新出现，要不要建卡：${item}`),
   ];
   if (!items.length) return project;
   const now = new Date().toISOString();
   const existing = project.outlines.find(outline => outline.title === authorNotesDocumentTitle);
   const heading = `## 第 ${number} 章 ${chapterTitle.replace(/^第\s*\d+\s*章\s*/u, '')}`.trim();
-  const previous = (existing?.content || `# ${authorNotesDocumentTitle}\n\n模型写作时拿不准、想和作者商量的事，按章记在这里。回复可以写进创作指令，或补进卡片、总纲，模型会照着改；处理过的条目直接删掉。\n`)
+  const previous = (existing?.content || `# ${authorNotesDocumentTitle}\n\n每章审查报出的 S1/S2 问题、下一章要接住的事、验证门没改净的句子，按章记在这里。模型的提问在章节页"待答"里答，本章新出现的人物物件在卡片页"待建卡"里建卡；处理过的条目直接删掉。\n`)
     .split(/\n(?=## )/u)
     .filter(section => !section.startsWith(heading))
     .join('\n');
@@ -364,6 +364,8 @@ interface AgentMemoryResult {
   canonFacts?: string[];
   conflicts?: string[];
   endingHook?: string;
+  /** 本章第一次出现的具名人物、地点、物件、规则：进卡片页待建卡 */
+  newlyIntroduced?: string[];
   entities?: Array<{ name?: string; type?: string }>;
   relations?: Array<{ source?: string; target?: string; label?: string; weight?: number }>;
   cardUpdates?: Array<{ cardId?: number | string; cardTitle?: string; status?: string; changes?: string }>;
@@ -829,14 +831,18 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       continue;
     }
     if (change.type === 'outline.upsert') {
+      const previous = change.targetId ? next.outlines.find(item => item.id === change.targetId) : undefined;
+      // 项目 Agent 改总纲、世界观同样先留历史版本，改坏了能回退
+      const kept = previous ? pushOutlineSnapshot(previous, '项目 Agent 更新') : undefined;
       const outline: OutlineDocument = {
         id: change.targetId ?? ++serial,
         kind: change.kind,
         chapterId: change.chapterId,
         title: change.title,
         content: change.content,
-        createdAt: change.targetId ? next.outlines.find(item => item.id === change.targetId)?.createdAt || now : now,
+        createdAt: previous?.createdAt || now,
         updatedAt: now,
+        snapshots: kept?.snapshots,
       };
       next = {
         ...next,
@@ -1712,6 +1718,12 @@ function App() {
   const [exportOptions, setExportOptions] = useState<ExportOptions>(defaultExportOptions);
   const [exportRunning, setExportRunning] = useState(false);
   const [showChapterHistory, setShowChapterHistory] = useState(false);
+  const [showOutlineHistory, setShowOutlineHistory] = useState(false);
+  // 大纲页哪些分组收起：章纲和审查报告一本书攒几十份，默认收起；其余展开
+  const [collapsedOutlineGroups, setCollapsedOutlineGroups] = useState<Set<string>>(() => new Set(['章纲', '审查报告']));
+  // 待答面板里正在敲的答复，按问题 id 存；点"答复"才写进项目
+  const [questionDrafts, setQuestionDrafts] = useState<Record<string, string>>({});
+  const [cardCandidateBuildingId, setCardCandidateBuildingId] = useState<string | null>(null);
   const [showRecycleBin, setShowRecycleBin] = useState(false);
   const [showWritingStats, setShowWritingStats] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
@@ -2075,7 +2087,8 @@ function App() {
               createdAt: chapter.createdAt ?? new Date().toISOString(),
               updatedAt: chapter.updatedAt ?? new Date().toISOString(),
             })) : [];
-            return {
+            // 旧版把"本章新出现，要不要建卡"堆在待答文档里，读档时搬进卡片页的待建卡列表
+            return migrateCardCandidatesFromNotes({
               ...project,
               status: project.status === 'completed' ? 'completed' : 'writing',
               chapters,
@@ -2093,7 +2106,7 @@ function App() {
               wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
               createdAt: project.createdAt ?? project.updatedAt ?? new Date().toISOString(),
               updatedAt: project.updatedAt ?? new Date().toISOString(),
-            };
+            });
           }));
         }
       })
@@ -4370,7 +4383,10 @@ function App() {
             ...refreshCardStatesForProject(withGraph, new Set([...resultCardIds, ...selectedCardIds])),
             authorPreferences: Array.from(new Set([...(latestProject.authorPreferences || []), ...asTextList(result.authorPreferences, 8)])).slice(-20),
           };
-          return currentProjects.map(item => item.id === merged.id ? merged : item);
+          // 本章新出现的人物物件进卡片页待建卡，作者点建卡才生成
+          const number = merged.chapters.findIndex(item => item.id === latestChapter.id) + 1;
+          const withCandidates = addCardCandidates(merged, number, latestChapter.title, asTextList(result.newlyIntroduced, 12));
+          return currentProjects.map(item => item.id === withCandidates.id ? withCandidates : item);
         });
         memoryRefineFailedAtRef.current.delete(chapter.id);
         if (options.notifyOnSuccess) setNotice({ title: '章节记忆更新完成', content: '本章结构化摘要已写入本地；若期间再次编辑，旧摘要会被自动丢弃。' });
@@ -4693,6 +4709,94 @@ function App() {
     if (activeOutlineId === id) setActiveOutlineId(editingProject.outlines.find(outline => outline.id !== id)?.id ?? null);
   };
 
+  /** 总纲、世界观回滚到某个历史版本；当前版本先入栈，回滚可以再回滚 */
+  const rollbackOutlineSnapshot = (savedAt: string) => {
+    if (!editingProject || activeOutlineId === null) return;
+    updateEditorProject(project => ({
+      ...project,
+      outlines: project.outlines.map(outline => outline.id === activeOutlineId ? restoreOutlineSnapshot(outline, savedAt) : outline),
+      updatedAt: new Date().toISOString(),
+    }));
+    setShowOutlineHistory(false);
+    setNotice({ title: '已恢复历史版本', content: '当前版本已存为新快照，不满意可以再换回来。' });
+  };
+
+  /** 答复模型的提问：写进项目，之后每章的提示词都带"作者已答复" */
+  const submitAuthorAnswer = (id: string) => {
+    const answer = (questionDrafts[id] || '').trim();
+    if (!editingProject || !answer) return;
+    updateEditorProject(project => answerAuthorQuestion(project, id, answer));
+    setQuestionDrafts(current => { const next = { ...current }; delete next[id]; return next; });
+  };
+
+  /**
+   * 待建卡候选一键建卡：按名字调卡片智能体生成，生成成功直接存卡，失败时把名字填进编辑器让作者手写
+   * 名字里带说明（"小何：书肆伙计"）：说明进指令，卡名只留冒号前的部分
+   */
+  const buildCardFromCandidate = async (candidateId: string) => {
+    const project = editingProjectRef.current;
+    const candidate = project?.cardCandidates?.find(item => item.id === candidateId);
+    if (!project || !candidate || cardCandidateBuildingId) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Key，再生成知识卡片。' });
+      return;
+    }
+    const [name, ...rest] = candidate.name.split(/[：:]/u);
+    const title = name.replace(/[（(].*$/u, '').trim() || candidate.name.trim();
+    const note = rest.join('：').trim() || candidate.name.replace(title, '').replace(/^[（(]|[）)]$/gu, '').trim();
+    const type: CardType = /书肆|楼|院|宅|路|馆|庄园|医院|学院|法庭|坊|所|岛|殿堂|车站|机场|城|巷|街|室|房|厅|地窖/u.test(title) ? '地点卡'
+      : /公司|集团|研究院|书院|基金|信托|协会|学会|门|派|帮|族|家族|团队|部|局|委员会/u.test(title) ? '势力卡'
+        : /墨|纸|帖|书|册|本|图|卷|盒|杯|剪|刀|盘|服|笔|印|钥匙|信|函|清单|表|录|谱|札|笔记|遗物|拓|画|镜|表|车|药/u.test(title) ? '物品卡' : '角色卡';
+    const chapter = project.chapters[candidate.chapterNumber - 1];
+    setCardCandidateBuildingId(candidateId);
+    try {
+      await invoke<string>('start_agent_runtime');
+      const result = await agentRpc<{ title?: string; content?: string }>('card.write', {
+        runId: `card-${Date.now()}`,
+        sessionId: cardSessionId,
+        projectTitle: project.title,
+        synopsis: project.synopsis,
+        cardType: type,
+        cardTitle: title,
+        existingContent: '',
+        instruction: `为第 ${candidate.chapterNumber} 章新出现的「${title}」建一张${type}${note ? `（${note}）` : ''}。只写正文里能证实的信息，写不到的标"待揭示"，不要编造。`,
+        chapterTitle: chapter?.title,
+        chapterContent: chapter?.content?.slice(-8000),
+        outlines: project.outlines.filter(item => item.kind === '世界观与作品设定').slice(0, 2).map(outline => ({ kind: outline.kind, content: outline.content })),
+        cards: project.cards.slice(-8),
+        apiKey: agentConfig.apiKey.trim(),
+        baseURL: agentConfig.baseURL.trim(),
+        model: agentConfig.model.trim() || fallbackModels[0],
+        apiMode: agentConfig.apiMode,
+        reasoningMode: agentConfig.reasoningMode,
+        contextWindow: agentConfig.contextWindow,
+        ...agentNetworkParams(agentConfig),
+      });
+      const content = result.content?.trim();
+      if (!content) throw new Error('智能体没有返回卡片内容');
+      const now = new Date().toISOString();
+      const card: KnowledgeCard = { id: Date.now(), type, title: result.title?.trim() || title, content, createdAt: now, updatedAt: now };
+      const latest = editingProjectRef.current || project;
+      const withCard: Project = {
+        ...removeCardCandidate(latest, candidateId, false),
+        cards: [...latest.cards, card],
+        graphNodes: [...latest.graphNodes, { id: `card:${card.id}`, label: card.title, type: 'card', category: card.type }],
+        updatedAt: now,
+      };
+      await applyProjectChange(withCard);
+      setActiveCardId(card.id);
+      setCardDraft({ type: card.type, title: card.title, content: card.content });
+      setNotice({ title: '卡片已建好', content: `《${card.title}》已存进卡片库，右侧可以继续改。` });
+    } catch (error) {
+      // 生成失败不丢候选：名字先填进编辑器，作者可以自己写
+      setActiveCardId(null);
+      setCardDraft({ type, title, content: note ? `- 出处：第 ${candidate.chapterNumber} 章\n- ${note}\n` : `- 出处：第 ${candidate.chapterNumber} 章\n` });
+      setNotice({ title: '自动建卡失败', content: `${String(error)}。名字已填进右侧编辑器，可以手写后保存。` });
+    } finally {
+      setCardCandidateBuildingId(null);
+    }
+  };
+
   /**
    * 调大纲智能体生成章纲：手动生成和章节智能体自动补章纲共用这一份入参
    * 返回生成的 Markdown 正文，空串表示模型没给内容
@@ -4766,6 +4870,7 @@ function App() {
         ).map(memory => ({ chapterNumber: memory.chapterNumber, title: memory.chapterTitle, summary: memory.summary, endingHook: memory.endingHook, foreshadowingItems: memory.foreshadowingItems || [] })),
         totalChapters: project.chapters.length,
         authorPreferences: project.authorPreferences || [],
+        authorAnswers: answeredAuthorQuestions(project),
         writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
         skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
         preferredSkillNames: selectedAgentSkillNames,
@@ -4908,9 +5013,10 @@ function App() {
       }
       const result = { content: await requestOutlineWrite({ runId, project: editingProject, targetOutline, kind: outline.kind, instruction: outlineAgentInstruction.trim(), targetChapter, sourceChapter, sourceMode: intent?.sourceMode, formatOutline, formatMode: intent?.formatMode }) };
       const generatedContent = result.content || targetOutline.content;
+      // 总纲与世界观类不整份覆盖：模型标明追加就接在末尾，否则替换但先留历史版本；章纲照旧整份换
       updateEditorProject(project => ({
         ...project,
-        outlines: project.outlines.map(item => item.id === targetOutline.id ? { ...item, content: generatedContent, updatedAt: new Date().toISOString() } : item),
+        outlines: project.outlines.map(item => item.id === targetOutline.id ? mergeGeneratedOutline(item, generatedContent, '大纲智能体生成') : item),
         updatedAt: new Date().toISOString(),
       }));
       setActiveOutlineId(targetOutline.id);
@@ -5479,7 +5585,8 @@ function App() {
       const latest = editingProjectRef.current || project;
       const chapters = latest.chapters.map(entry => entry.id === updatedChapter.id ? updatedChapter : entry);
       const revised: Project = { ...latest, chapters, wordCount: chapters.reduce((sum, entry) => sum + entry.wordCount, 0), updatedAt: now };
-      await applyProjectChange(revised);
+      // 修订后旧报告作废：报告说的是改前的稿，留着作者会拿它再改一遍
+      await applyProjectChange(removeReviewReportsForChapter(revised, item.number));
       refineChapterMemoryInBackground(revised, updatedChapter);
       setReviseStates(current => ({ ...current, [item.number]: { status: 'done', message: `已修订（${countNovelCharacters(content)} 字）`, startedAt: Date.now() } }));
       return true;
@@ -5554,8 +5661,9 @@ function App() {
         }
         const applied = applyAgentDraft(drafted.project, inserted.chapter, drafted.result.draftContent, applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''), drafted.result.summary);
         project = applied.project;
-        // 模型的疑问汇总到一份"给作者｜待答"文档里，写作不中断，作者有空再看
-        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.authorNotes || [], drafted.result.reviewResult, drafted.result.lintFindings || []);
+        // 模型的提问进待答（章节页能答）、审查意见进待答文档；连续创作不为一句疑问停下来
+        project = recordAuthorQuestions(project, number, applied.chapter.title, drafted.result.authorNotes || []);
+        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.reviewResult, drafted.result.lintFindings || []);
         setActiveChapter(applied.chapter);
         setAgentDraft(null);
         setAgentDisplayContent('');
@@ -5564,9 +5672,8 @@ function App() {
         setContinuousWriting({ done: done + 1, total, message: `第 ${number} 章：正文已采用，正在提炼记忆` });
         try {
           project = await refineChapterMemory(project, applied.chapter);
-          // 记忆提炼出的"本章新出现"进待答文档：要不要建卡由作者定，不自动生成卡片
-          const introduced = project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || [];
-          if (introduced.length) project = appendAuthorNotes(project, number, applied.chapter.title, [], undefined, [], introduced);
+          // 记忆提炼出的"本章新出现"进卡片页的待建卡：要不要建卡由作者定，不自动生成卡片
+          project = addCardCandidates(project, number, applied.chapter.title, project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || []);
           await applyProjectChange(project);
         } catch (error) {
           // 额度用尽就别再往下撞了；其他失败只影响下一章的承接质量，正文已经保住
@@ -5668,8 +5775,10 @@ function App() {
         // 保事件时章名照旧；从构思重来事件变了，章名跟着重写稿走
         const title = applyDraftChapterTitle(chapter.title, drafted.result.chapterTitle || '', { overwrite: rewriteMode === 'redo' });
         const applied = applyAgentDraft(drafted.project, chapter, drafted.result.draftContent, title, drafted.result.summary);
-        project = applied.project;
-        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.authorNotes || [], drafted.result.reviewResult, drafted.result.lintFindings || []);
+        // 旧稿的审查报告说的是被换掉的那版，留着只会误导
+        project = removeReviewReportsForChapter(applied.project, number);
+        project = recordAuthorQuestions(project, number, applied.chapter.title, drafted.result.authorNotes || []);
+        project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.reviewResult, drafted.result.lintFindings || []);
         setActiveChapter(applied.chapter);
         setAgentDraft(null);
         setAgentDisplayContent('');
@@ -5679,8 +5788,7 @@ function App() {
         setChapterRewrite({ done, total, message: `第 ${number} 章：已写入，正在提炼记忆` });
         try {
           project = await refineChapterMemory(project, applied.chapter);
-          const introduced = project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || [];
-          if (introduced.length) project = appendAuthorNotes(project, number, applied.chapter.title, [], undefined, [], introduced);
+          project = addCardCandidates(project, number, applied.chapter.title, project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || []);
           await applyProjectChange(project);
         } catch (error) {
           if (isQuotaExceededError(error)) throw error;
@@ -5704,11 +5812,21 @@ function App() {
       const draftTitle = agentDraftTitle.trim()
         || applyDraftChapterTitle(activeChapter.title, draft.title || agentDraft.chapterTitle || '');
       const applied = applyAgentDraft(editingProject, activeChapter, agentDraft.draftContent, draftTitle, agentDraft.summary);
-      setEditingProject(applied.project);
+      const number = editingProject.chapters.findIndex(item => item.id === activeChapter.id) + 1;
+      // 采用即写入：这一章旧稿的审查报告作废；面板里的提问登记进待答，面板里已经敲了答复的直接记为已答
+      const notes = agentDraft.authorNotes || [];
+      let accepted = recordAuthorQuestions(removeReviewReportsForChapter(applied.project, number), number, applied.chapter.title, notes);
+      for (const note of notes) {
+        const answer = (questionDrafts[`draft:${note}`] || '').trim();
+        const question = accepted.authorQuestions?.find(item => item.question === note.trim());
+        if (answer && question) accepted = answerAuthorQuestion(accepted, question.id, answer);
+      }
+      setQuestionDrafts(current => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith('draft:'))));
+      setEditingProject(accepted);
       setActiveChapter(applied.chapter);
-      setProjects(current => current.map(project => project.id === applied.project.id ? applied.project : project));
+      setProjects(current => current.map(project => project.id === accepted.id ? accepted : project));
       // 采用的草稿只带本地摘要，结构化记忆与卡片状态在后台提炼；不然手动一章章写的书记忆中心永远只有正文开头
-      refineChapterMemoryInBackground(applied.project, applied.chapter);
+      refineChapterMemoryInBackground(accepted, applied.chapter);
       window.setTimeout(() => chapterEditorRef.current?.focus(), 0);
     }
     setAgentDraft(null);
@@ -6673,6 +6791,9 @@ function App() {
   const activeWritingStyle = editingProject?.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) ?? null : null;
   const activeMemoryDocument = editingProject?.memoryDocuments.find(document => document.id === activeMemoryDocumentId) ?? null;
   const activeChapterMemory = editingProject?.memories.find(memory => memory.id === activeChapterMemoryId) ?? null;
+  const pendingQuestions = editingProject ? pendingAuthorQuestions(editingProject) : [];
+  const pendingQuestionCount = pendingQuestions.length;
+  const cardCandidateCount = editingProject?.cardCandidates?.length || 0;
   // 记忆落后于正文的章：只在记忆中心打开时算，别的页面用不着
   const staleMemoryChapterIds = useMemo(
     () => editingProject && editorSidebarTab === 'knowledge' ? new Set(staleMemoryChapters(editingProject).map(item => item.chapter.id)) : new Set<number>(),
@@ -7024,7 +7145,7 @@ function App() {
                   className={editorSidebarTab === 'chapters' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('chapters')}
                 >
-                  <Icon name="library" size={14} />章节
+                  <Icon name="library" size={14} />章节{pendingQuestionCount > 0 && <small className="tab-alert" title={`${pendingQuestionCount} 个模型提问待答`}>{pendingQuestionCount} 待答</small>}
                 </button>
                 <button
                   className={editorSidebarTab === 'search' ? 'active' : ''}
@@ -7048,7 +7169,7 @@ function App() {
                   className={editorSidebarTab === 'cards' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('cards')}
                 >
-                  <Icon name="cards" size={14} />卡片
+                  <Icon name="cards" size={14} />卡片{cardCandidateCount > 0 && <small className="tab-alert" title={`${cardCandidateCount} 个本章新出现的事物待建卡`}>{cardCandidateCount} 待建</small>}
                 </button>
                 <button
                   className={editorSidebarTab === 'style' ? 'active' : ''}
@@ -7102,6 +7223,24 @@ function App() {
                 const recycled = editingProject.deletedChapters?.length || 0;
                 return (
                 <div className="chapters-panel">
+                  {pendingQuestions.length > 0 && (
+                    <details className="author-questions" open>
+                      <summary>模型有 {pendingQuestions.length} 个问题等你答 <small>答了之后每章都按你的答复写</small></summary>
+                      <div className="author-questions-list">
+                        {pendingQuestions.slice(0, 8).map(item => (
+                          <div key={item.id} className="author-question">
+                            <div><strong>第 {item.chapterNumber} 章问</strong><p>{item.question}</p></div>
+                            <textarea className="input" rows={2} value={questionDrafts[item.id] || ''} placeholder="一句话拍板；空着就是先不答" onChange={event => setQuestionDrafts(current => ({ ...current, [item.id]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); submitAuthorAnswer(item.id); } }} />
+                            <div className="author-question-actions">
+                              <button className="btn-primary" disabled={!(questionDrafts[item.id] || '').trim()} onClick={() => submitAuthorAnswer(item.id)}>答复</button>
+                              <button className="link-button" title="模型随便写，不用问我" onClick={() => updateEditorProject(project => dismissAuthorQuestion(project, item.id))}>不用答</button>
+                            </div>
+                          </div>
+                        ))}
+                        {pendingQuestions.length > 8 && <p className="empty-hint compact">还有 {pendingQuestions.length - 8} 个，答完上面的再显示。</p>}
+                      </div>
+                    </details>
+                  )}
                   <div className="project-writing-stats">
                     <strong>{editingProject.wordCount.toLocaleString()} <small>总字数</small></strong>
                     <span>{chapters.length} 章</span>
@@ -7192,12 +7331,22 @@ function App() {
                     <button className="outline-location-button" onClick={handleOpenOutlineLocation}>打开位置</button>
                   </div>
                   <div className="outline-document-list">
-                    {editingProject.outlines.map(outline => (
-                      <div key={outline.id} className={`outline-document-item ${activeOutlineId === outline.id ? 'active' : ''}`} onClick={() => setActiveOutlineId(outline.id)}>
-                        <div><strong>{outline.kind}</strong><small>{outline.title}{outline.kind === '章纲' && outline.chapterId ? ` · ${editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节'}` : ''}</small></div>
-                        <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}><Icon name="trash" size={14} /></button>
-                      </div>
-                    ))}
+                    {groupOutlines(editingProject.outlines).map(({ group, items }) => {
+                      const collapsed = collapsedOutlineGroups.has(group);
+                      return (
+                        <div key={group} className="outline-group">
+                          <button type="button" className="outline-group-toggle" onClick={() => setCollapsedOutlineGroups(current => { const next = new Set(current); if (next.has(group)) next.delete(group); else next.add(group); return next; })}>
+                            <span>{collapsed ? '▸' : '▾'} {group}</span><small>{items.length} 份</small>
+                          </button>
+                          {!collapsed && items.map(outline => (
+                            <div key={outline.id} className={`outline-document-item ${activeOutlineId === outline.id ? 'active' : ''}`} onClick={() => setActiveOutlineId(outline.id)}>
+                              <div><strong>{outline.title}</strong><small>{outline.kind === '章纲' && outline.chapterId ? editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节' : outline.kind}{outline.snapshots?.length ? ` · ${outline.snapshots.length} 个历史版本` : ''}</small></div>
+                              <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}><Icon name="trash" size={14} /></button>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })}
                   </div>
                   {activeOutline ? (
                     <p className="outline-editor-hint">选择大纲后，在中央编辑器顶部修改标题和正文。</p>
@@ -7221,6 +7370,21 @@ function App() {
                     <button className="btn-secondary" disabled={cardRefreshing} title="一次模型调用，按最近十章正文重写全部卡片的当前状态；每写满十章会自动做一次" onClick={() => void refreshCardStatesNow()}>{cardRefreshing ? '刷新中...' : '按近期正文刷新状态'}</button>
                   </div>
                   <div className="card-list">
+                    {(editingProject.cardCandidates?.length || 0) > 0 && (
+                      <details className="card-candidates" open>
+                        <summary>待建卡 <small>{editingProject.cardCandidates!.length} 个正文里新出现的人物、地点、物件</small></summary>
+                        <div className="card-candidates-list">
+                          {editingProject.cardCandidates!.slice(0, 12).map(item => (
+                            <div key={item.id} className="card-candidate">
+                              <div><strong>{item.name.split(/[：:]/u)[0]}</strong><small>第 {item.chapterNumber} 章{item.name.includes('：') || item.name.includes(':') ? ` · ${item.name.split(/[：:]/u).slice(1).join('：').slice(0, 60)}` : ''}</small></div>
+                              <button className="btn-primary" disabled={Boolean(cardCandidateBuildingId)} onClick={() => void buildCardFromCandidate(item.id)}>{cardCandidateBuildingId === item.id ? '建卡中…' : '建卡'}</button>
+                              <button className="link-button" title="不建卡，以后再出现也不提" onClick={() => updateEditorProject(project => removeCardCandidate(project, item.id, true))}>忽略</button>
+                            </div>
+                          ))}
+                          {editingProject.cardCandidates!.length > 12 && <p className="empty-hint compact">还有 {editingProject.cardCandidates!.length - 12} 个，处理完上面的再显示。</p>}
+                        </div>
+                      </details>
+                    )}
                     {visibleCards.map(card => (
                       <div key={card.id} className={`knowledge-card-item ${activeCardId === card.id ? 'active' : ''}`} onClick={() => editCard(card)}>
                         <div><strong>{card.title}</strong><small>{card.type} · {card.currentState ? card.currentState.slice(0, 80) : '状态未更新'}</small></div>
@@ -7376,7 +7540,7 @@ function App() {
               ) : editorSidebarTab === 'outline' ? (
                 <section className="outline-workspace">
                   {activeOutline ? <>
-                    <div className="outline-workspace-header"><div><span>{activeOutline.kind}</span><input className="outline-title-input" value={activeOutline.title} onChange={event => updateActiveOutline({ title: event.target.value })} placeholder="大纲标题" /><small>Markdown 大纲文档 · 内容会自动保存</small></div><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div>
+                    <div className="outline-workspace-header"><div><span>{activeOutline.kind}</span><input className="outline-title-input" value={activeOutline.title} onChange={event => updateActiveOutline({ title: event.target.value })} placeholder="大纲标题" /><small>Markdown 大纲文档 · 内容会自动保存{outlineKeepsHistory(activeOutline.kind) ? ' · 模型覆盖前自动留底' : ''}</small></div><div className="outline-workspace-actions">{outlineKeepsHistory(activeOutline.kind) && <button className="editor-tool-button" disabled={!activeOutline.snapshots?.length} title={activeOutline.snapshots?.length ? '查看并恢复被覆盖前的版本' : '还没有历史版本'} onClick={() => setShowOutlineHistory(true)}>历史版本{activeOutline.snapshots?.length ? ` ${activeOutline.snapshots.length}` : ''}</button>}<button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div></div>
                     {renderDocumentSearchPanel('大纲', activeOutline.content, content => updateActiveOutline({ content }))}
                     <textarea className="outline-main-editor" value={activeOutline.content} onChange={event => updateActiveOutline({ content: event.target.value })} placeholder={`编辑${activeOutline.kind}内容...`} />
                   </> : <div className="empty-state"><p>从左侧选择一个大纲开始编辑。</p></div>}
@@ -7917,9 +8081,17 @@ function App() {
                     ) : null}
                     {agentDraft.authorNotes?.length ? (
                       <div className="agent-review warning">
-                        <strong>模型给作者的话</strong>
-                        {agentDraft.authorNotes.map(note => <p key={note}>{note}</p>)}
-                        <p>回复可以写进下一次的创作指令，或补进卡片、总纲；模型会照着改。</p>
+                        <strong>模型问你 {agentDraft.authorNotes.length} 件事</strong>
+                        {agentDraft.authorNotes.map(note => {
+                          const key = `draft:${note}`;
+                          return (
+                            <div key={note} className="author-question">
+                              <p>{note}</p>
+                              <textarea className="input" rows={2} value={questionDrafts[key] || ''} placeholder="在这里答，接受草稿时一起存；空着就进章节页待答" onChange={event => setQuestionDrafts(current => ({ ...current, [key]: event.target.value }))} />
+                            </div>
+                          );
+                        })}
+                        <p>答复会进之后每章的提示词。想让这一章就按答复改，接受后在创作指令里写"按我的答复修订本章"再运行一次。</p>
                       </div>
                     ) : null}
                     <div className="agent-result-actions">
@@ -8756,6 +8928,28 @@ function App() {
       )}
 
       {/* 章节历史版本：AI 覆写、全书替换前的正文快照 */}
+      {/* 总纲与世界观的历史版本：被模型覆盖前自动留底 */}
+      {showOutlineHistory && activeOutline && (
+        <div className="modal-overlay" onClick={() => setShowOutlineHistory(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="outline-history-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="outline-history-title">历史版本·{activeOutline.title}</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowOutlineHistory(false)}><Icon name="x" size={16} /></button>
+            </div>
+            <div className="modal-body history-body">
+              {!activeOutline.snapshots?.length ? <p className="empty-hint">这份文档还没有历史版本。大纲智能体和项目 Agent 覆盖它之前会自动存一条。</p> : <>
+                <p className="empty-hint">最多保留 {outlineSnapshotLimit} 条，最新在前。恢复时当前版本会存为新快照，所以恢复可以再恢复。</p>
+                {activeOutline.snapshots.map(snapshot => <article className="history-entry" key={snapshot.savedAt}>
+                  <div><strong>{snapshot.reason}</strong><small>{new Date(snapshot.savedAt).toLocaleString('zh-CN', { hour12: false })} · {snapshot.content.length.toLocaleString()} 字</small></div>
+                  <pre>{snapshot.content.slice(0, 400)}{snapshot.content.length > 400 ? '…' : ''}</pre>
+                  <button className="btn-secondary" onClick={() => rollbackOutlineSnapshot(snapshot.savedAt)}>恢复这个版本</button>
+                </article>)}
+              </>}
+            </div>
+          </div>
+        </div>
+      )}
+
       {showChapterHistory && activeChapter && (
         <div className="modal-overlay" onClick={() => setShowChapterHistory(false)}>
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="history-title" onClick={event => event.stopPropagation()}>

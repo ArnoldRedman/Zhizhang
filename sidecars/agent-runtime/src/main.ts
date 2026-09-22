@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createChapterGraph, chapterAgentSystemPrompt, projectProfileSection, selectSkillsByIntent, type ProjectProfile, type SkillDefinition } from "./graphs/chapter-write.graph.js";
+import { authorAnswersSection, createChapterGraph, chapterAgentSystemPrompt, projectProfileSection, selectSkillsByIntent, type ProjectProfile, type SkillDefinition } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
 import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
@@ -57,6 +57,16 @@ function projectProfileLine(value: unknown): string {
   ].filter(Boolean);
   return parts.length ? `
 作品定位：${parts.join("；")}` : "";
+}
+
+/** 作者对【给作者】提问的答复：一问一答，空的丢掉 */
+function normalizeAuthorAnswers(value: unknown): Array<{ question: string; answer: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+    .map(item => ({ question: String(item.question || "").trim(), answer: String(item.answer || "").trim() }))
+    .filter(item => item.question && item.answer)
+    .slice(-20);
 }
 
 function chapterBeatText(stageBeats: unknown, chapterNumber: number | undefined): string | undefined {
@@ -616,7 +626,8 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const skillSection = matchedSkills.length
         ? `\n## 本次匹配技能\n${matchedSkills.map(item => `### ${compactText(item.displayName || item.name || "技能", 80)}\n${compactText(item.content || item.description || "", 2400)}`).join("\n\n")}`
         : "";
-      const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${projectProfileLine(req.params?.projectProfile)}${worldSettingSection}${skillSection}${graphSection}${cardSection}`;
+      const answersSection = authorAnswersSection(normalizeAuthorAnswers(req.params?.authorAnswers));
+      const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${projectProfileLine(req.params?.projectProfile)}${worldSettingSection}${skillSection}${graphSection}${cardSection}${answersSection ? `\n\n${answersSection}` : ""}`;
       const outlineSessionKey = stableHash({ scope: "outline", outlineId: String(outlineId || "active"), sessionId: String(sessionId || "default"), projectTitle, kind, model, apiMode, targetChapterId: targetChapterRecord?.id, sourceChapterId: sourceChapterRecord?.id, formatOutlineId: formatOutlineRecord?.id, stableProjectPacket });
       const storedOutlineSession = await readPersistentContext<unknown>(`outline-session-${outlineSessionKey}`);
       const inheritedOutlineSession = outlineSessionCache.get(outlineSessionKey)
@@ -674,7 +685,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       if (beatSection) emitter.context("retrieve", "已装载本章节拍", { source: "阶段节拍表", status: "loaded", bytes: byteLength(beatSection), items: 1 });
       const dynamicTask = isBeatSheet
         ? `## 本次大纲任务\n类型：阶段节拍表（第 ${beatFrom}～${beatTo} 章${beatWrittenThrough >= beatFrom ? `，其中第 ${beatFrom}～${beatWrittenThrough} 章已写` : ""}）\n作者指令：${compactText(instruction || "按总纲把本阶段拆成逐章事件", 1800)}\n\n${directionSection}${stageBeatSheetProtocol}\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n只输出节拍表 Markdown。`
-        : `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${beatSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文${kind === "章纲" ? "；这一章要发生一件前文没发生过的事，总纲或节拍有安排就按它" : ""}。不要输出分析过程或前言。`;
+        : `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${beatSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## ${kind === "章纲" ? "当前待完善文档（可被替换的旧草稿，不是事实来源）" : "当前文档（作者的长期资料，你的输出会整份替换它）"}\n${compactText(existingContent || "暂无", kind === "章纲" ? 5000 : 12000)}\n\n输出该类型的大纲 Markdown 正文${kind === "章纲" ? "；这一章要发生一件前文没发生过的事，总纲或节拍有安排就按它" : "。总纲写的是分卷规划：每卷写哪些内容、感情推进到哪、大约多少章、卷末落在哪，加上当前阶段的区间目标；不要逐章列条目，逐章的事交给节拍表和章纲。要么输出完整的新版（原有各部分照抄保留，只改需要改的），要么只输出补充内容并在第一行标题里写明「追加件」，应用会把它接在原文末尾；不要输出一份只有新内容却没标「追加件」的文档，那会把原文冲掉"}。不要输出分析过程或前言。`;
       emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
       emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
       emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
@@ -920,6 +931,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           totalChapters: chapterPosition.total,
           instruction: String(instruction),
           projectProfile: normalizeProjectProfile(req.params?.projectProfile),
+          authorAnswers: normalizeAuthorAnswers(req.params?.authorAnswers),
           worldSetting: prepared.worldSetting,
           masterOutline: prepared.masterOutline,
           storyLedger: prepared.storyLedger,

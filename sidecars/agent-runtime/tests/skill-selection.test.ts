@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectProfileSection, selectSkillsByIntent } from "../src/graphs/chapter-write.graph.js";
+import { authorAnswersSection, projectProfileSection, selectSkillsByIntent } from "../src/graphs/chapter-write.graph.js";
 
 describe("chapter skill intent selection", () => {
   const catalog = [
@@ -71,5 +71,20 @@ describe("projectProfileSection", () => {
     expect(section).toContain("简介：核心题材：慢热高甜。");
     expect(projectProfileSection(undefined)).toBe("");
     expect(projectProfileSection({ tags: [], protagonists: [] })).toBe("");
+  });
+});
+
+describe("authorAnswersSection", () => {
+  it("只带有问有答的条目，最多二十条；空答复不进提示词", () => {
+    const section = authorAnswersSection([
+      { question: "沈砚的母亲是否在世？", answer: "在世，住在灯塔。" },
+      { question: "电台频率要不要固定？", answer: "" },
+    ]);
+    expect(section).toContain("作者已答复");
+    expect(section).toContain("问：沈砚的母亲是否在世？");
+    expect(section).toContain("答：在世，住在灯塔。");
+    expect(section).not.toContain("电台频率");
+    expect(authorAnswersSection([])).toBe("");
+    expect(authorAnswersSection(undefined)).toBe("");
   });
 });

@@ -43,6 +43,37 @@ export interface OutlineDocument {
   content: string;
   createdAt: string;
   updatedAt: string;
+  /** 被模型覆盖前的历史版本，最新在前；总纲和世界观类文档才存，章纲每次重来本来就该换 */
+  snapshots?: OutlineSnapshot[];
+}
+
+export interface OutlineSnapshot {
+  content: string;
+  savedAt: string;
+  /** 产生快照的原因，例如"大纲智能体生成""项目 Agent 更新" */
+  reason: string;
+}
+
+/** 模型写作时向作者提的问题；答复进后续每章的提示词，模型照着写 */
+export interface AuthorQuestion {
+  id: string;
+  /** 提问时正在写第几章 */
+  chapterNumber: number;
+  chapterTitle: string;
+  question: string;
+  /** 作者的答复；空串就是还没答 */
+  answer: string;
+  askedAt: string;
+  answeredAt?: string;
+}
+
+/** 记忆提炼发现的"本章新出现"：人物、地点、物件、规则；作者点建卡才生成卡片，点忽略就不再提 */
+export interface CardCandidate {
+  id: string;
+  name: string;
+  chapterNumber: number;
+  chapterTitle: string;
+  createdAt: string;
 }
 
 export type CardType = '角色卡' | '物品卡' | '地点卡' | '势力卡' | '金手指卡';
@@ -202,6 +233,12 @@ export interface Project {
   maxAIRate?: number;
   /** 全部卡片状态最近一次按近期正文校准到第几章；再写满十章就自动刷一次，不分连续创作还是手写 */
   cardStatesRefreshedThrough?: number;
+  /** 模型提给作者的问题与答复；未答的在章节页标出，已答的进每章提示词 */
+  authorQuestions?: AuthorQuestion[];
+  /** 待建卡候选：记忆提炼发现的本章新出现事物，作者建卡或忽略后移除 */
+  cardCandidates?: CardCandidate[];
+  /** 作者点过"忽略"的候选名，之后再出现也不再提 */
+  ignoredCardCandidates?: string[];
   githubRepositoryUrl?: string;
   /** 每日码字量，键为本地日期 YYYY-MM-DD */
   dailyWords?: Record<string, number>;

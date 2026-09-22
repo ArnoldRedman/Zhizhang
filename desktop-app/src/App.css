@@ -4698,3 +4698,38 @@ select.input {
 .annotation-item p small { margin-left: 6px; color: var(--warn-fg); font-size: 10px; }
 .annotation-item .icon-delete { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
 .knowledge-card-item .link-button.card-pinned { color: var(--accent-2-fg); font-weight: 600; }
+
+/* 大纲页分组：总纲、世界观、阶段节拍、章纲、审查报告各一组，章纲与报告默认收起 */
+.outline-group { display: grid; gap: 6px; }
+.outline-group-toggle { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 4px 2px; border: 0; background: transparent; color: var(--text-3); font-size: 11px; font-weight: 600; cursor: pointer; text-align: left; }
+.outline-group-toggle:hover { color: var(--text); }
+.outline-group-toggle small { color: var(--text-5); font-weight: 400; }
+.outline-workspace-actions { display: flex; align-items: center; gap: 6px; }
+.outline-workspace-actions .editor-tool-button:disabled { opacity: .5; cursor: default; }
+
+/* 侧栏 tab 上的待办数：模型提问待答、待建卡 */
+.tab-alert { margin-left: auto; padding: 1px 6px; border-radius: 999px; background: var(--warn-line); color: var(--text); font-size: 10px; font-weight: 600; white-space: nowrap; }
+
+/* 章节页顶部的待答面板与草稿面板里的提问 */
+.author-questions { margin: 0 0 8px; border: 1px solid var(--warn-line); border-radius: var(--r-sm); background: var(--surface-sunken); }
+.author-questions summary { display: flex; align-items: center; gap: 8px; padding: 8px 10px; color: var(--text-2); font-size: 12px; font-weight: 600; cursor: pointer; }
+.author-questions summary small { color: var(--text-5); font-weight: 400; }
+.author-questions-list { display: grid; gap: 8px; padding: 0 10px 10px; max-height: 320px; overflow-y: auto; }
+.author-question { display: grid; gap: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+.author-question strong { color: var(--text-4); font-size: 10px; }
+.author-question p { margin: 0; color: var(--text); font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+.author-question textarea { min-height: 44px; font-size: 12px; }
+.author-question-actions { display: flex; align-items: center; gap: 10px; }
+.author-question-actions .btn-primary { padding: 4px 12px; font-size: 11px; }
+.agent-review .author-question { margin-top: 6px; }
+
+/* 卡片页顶部的待建卡候选 */
+.card-candidates { margin-bottom: 6px; border: 1px solid var(--accent-line); border-radius: var(--r-sm); background: var(--surface-sunken); }
+.card-candidates summary { display: flex; align-items: center; gap: 8px; padding: 8px 10px; color: var(--text-2); font-size: 12px; font-weight: 600; cursor: pointer; }
+.card-candidates summary small { color: var(--text-5); font-weight: 400; }
+.card-candidates-list { display: grid; gap: 6px; padding: 0 10px 10px; max-height: 300px; overflow-y: auto; }
+.card-candidate { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+.card-candidate > div { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.card-candidate strong { color: var(--text-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-candidate small { color: var(--text-5); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-candidate .btn-primary { padding: 4px 10px; font-size: 11px; }
