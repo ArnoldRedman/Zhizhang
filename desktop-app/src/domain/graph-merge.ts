@@ -1,5 +1,6 @@
 import type { Chapter, KnowledgeCard, KnowledgeGraphEdge, KnowledgeGraphNode, Project } from './project.ts';
-import { cardSearchTerms } from './cards.ts';
+import { cardAliasTerms } from './cards.ts';
+import { isGenericEntityLabel, stripEntityTypeSuffix } from './entity-terms.ts';
 import { createGraphNodeProfile, normalizeKnowledgeGraphEdges, normalizeKnowledgeGraphWeight, upsertKnowledgeGraphEdge } from './knowledge-graph.ts';
 
 /**
@@ -24,13 +25,25 @@ export const mergeKnowledgeGraph = (
   const edges: KnowledgeGraphEdge[] = normalizeKnowledgeGraphEdges(project.graphEdges);
   const now = new Date().toISOString();
   let cards: KnowledgeCard[] = project.cards;
-  const findNodeId = (label: string) => nodes.find(node => node.label === label)?.id
-    || project.cards.find(card => cardSearchTerms(card).includes(label))?.id.toString().replace(/^/, 'card:');
-  const ensureEntity = (label: string, category = '实体') => {
-    const normalized = label.trim().slice(0, 80);
+  // 称呼 → 卡片节点：模型抽出"姜老董事长""大伯""沈妄（人物）"时都该落到已有的卡上，而不是各自成一个空节点
+  const aliasIndex = new Map<string, string>();
+  for (const card of project.cards) {
+    for (const term of cardAliasTerms(card)) {
+      if (term.length >= 2 && !aliasIndex.has(term)) aliasIndex.set(term, `card:${card.id}`);
+    }
+  }
+  const findNodeId = (raw: string) => {
+    const label = stripEntityTypeSuffix(raw);
+    return aliasIndex.get(label) || aliasIndex.get(raw)
+      || nodes.find(node => node.label === label || node.label === raw)?.id;
+  };
+  const ensureEntity = (raw: string, category = '实体') => {
+    const normalized = stripEntityTypeSuffix(raw).slice(0, 80);
     if (!normalized) return null;
     const existingId = findNodeId(normalized);
     if (existingId) return existingId;
+    // "爷爷""韩律师""四名年轻学徒"不是实体：对不上任何卡片就不建节点，关系也跟着丢
+    if (isGenericEntityLabel(normalized)) return null;
     const id = `entity:${normalized}`;
     nodes.push({ id, label: normalized, type: 'entity', category, content: createGraphNodeProfile('entity', category), updatedAt: now });
     return id;

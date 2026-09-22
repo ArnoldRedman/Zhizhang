@@ -449,6 +449,8 @@ fn save_projects_blocking(app: tauri::AppHandle, projects: Value) -> Result<Stri
         let graph_node_snapshots: &[Value] = project.get("graphNodes").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
         // 索引建一次：以前近千个节点各自扫一遍近三千条关系、再线性查对端标签，一次保存要几百万次比较
         let graph_index = build_graph_index(graph_node_snapshots, graph_edges);
+        // 图谱档案也只写有变化的，最后删掉不再对应任何节点的旧文件：整理图谱并掉几百个节点后，它们的档案不能还留在目录里
+        let mut kept_graph_files = HashSet::new();
         if let Some(nodes) = metadata.get_mut("graphNodes").and_then(Value::as_array_mut) {
             for node in nodes.iter_mut() {
                 let relative_path = graph_node_relative_path(node);
@@ -457,8 +459,14 @@ fn save_projects_blocking(app: tauri::AppHandle, projects: Value) -> Result<Stri
                     fs::create_dir_all(parent).map_err(|error| format!("创建图谱档案目录失败: {error}"))?;
                 }
                 write_if_changed(&path, graph_node_markdown_with_index(node, &graph_index).as_bytes())?;
+                kept_graph_files.insert(path);
                 node["sourcePath"] = Value::String(relative_path.to_string_lossy().into_owned());
                 node["content"] = Value::String(String::new());
+            }
+        }
+        if let Ok(entries) = fs::read_dir(&graph_dir) {
+            for entry in entries.filter_map(Result::ok).filter(|entry| entry.path().is_dir()) {
+                remove_stale_markdown(&entry.path(), &kept_graph_files)?;
             }
         }
 

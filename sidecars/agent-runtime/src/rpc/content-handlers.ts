@@ -123,3 +123,45 @@ ${cardText}
     });
     return { updates, usage: response.usage };
   });
+
+/**
+ * 图谱去重的模型那一半：本地规则并完别名、后缀、错别字、泛称之后，剩下"姜老太爷 / 老太爷 / 杜老"这类尊称与简称
+ * 只有读过书的人才知道指谁；把卡片正名与别名、剩余实体名连同各自被提到的章送给模型，只收回有把握的合并与删除
+ */
+export const registerGraphDedupeHandler = (registry: RpcRegistry): RpcRegistry => registry
+  .register("graph.dedupe", async params => {
+    const { projectTitle, cards, entities } = params;
+    const cardList = Array.isArray(cards) ? cards.filter(item => item && typeof item === "object").map(item => item as Record<string, unknown>) : [];
+    const entityList = Array.isArray(entities) ? entities.filter(item => item && typeof item === "object").map(item => item as Record<string, unknown>) : [];
+    if (!entityList.length) return { merges: [], removes: [] };
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
+    const cardText = cardList.map(item => `- ${compactText(item.title || "", 60)}${stringList(item.aliases, 24).length ? `（又称：${stringList(item.aliases, 24).join("、")}）` : ""}`).join("\n") || "（暂无卡片）";
+    const entityText = entityList.slice(0, 300).map(item => `- ${compactText(item.label || "", 60)}｜${compactText(item.category || "实体", 10)}｜提到它的章：${stringList(item.chapters, 6).join("、") || "无"}${item.hint ? `｜${compactText(item.hint, 120)}` : ""}`).join("\n");
+    const prompt = `你是《${String(projectTitle || "未命名小说")}》的档案员。知识图谱里的实体名是模型逐章抽出来的，同一个人常被记成正名、尊称、简称、错别字好几个节点。下面先列出作者建了卡的人物、地点、势力及其别名，再列出图谱里剩下的实体。请判断哪些实体其实是同一个东西。
+
+## 已建卡的正名与别名
+${cardText}
+
+## 图谱里的实体
+${entityText}
+
+规则：
+1. 某个实体明显是某张卡的尊称、简称、旧称或错别字（"姜老太爷"是"姜正霖"、"杜老"是"杜秉文"），写进 merges，to 写卡片正名或另一个实体的名字。
+2. 某个实体不是具名的人、地、物、势力，只是称谓、职务、描述或一次性物件，写进 removes。
+3. 拿不准的不要写；宁可漏掉也不要把两个不同的人并在一起。
+只返回 JSON：{"merges":[{"from":"实体名","to":"正名","reason":"一句话"}],"removes":[{"name":"实体名","reason":"一句话"}]}`;
+    const response = await client.chat([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, temperature: 0.1, max_tokens: 4000, retryAttempts: 2 });
+    const parsed = parseJsonContent(response.content) || {};
+    const merges = (Array.isArray(parsed.merges) ? parsed.merges : []).flatMap(item => {
+      const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const from = trimmed(entry.from);
+      const to = trimmed(entry.to);
+      return from && to && from !== to ? [{ from, to, reason: trimmed(entry.reason) }] : [];
+    });
+    const removes = (Array.isArray(parsed.removes) ? parsed.removes : []).flatMap(item => {
+      const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const name = trimmed(entry.name);
+      return name ? [{ name, reason: trimmed(entry.reason) }] : [];
+    });
+    return { merges, removes, usage: response.usage };
+  });

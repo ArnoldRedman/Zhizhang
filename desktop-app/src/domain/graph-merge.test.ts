@@ -50,3 +50,20 @@ test('mergeKnowledgeGraph 的卡片状态更新可以关掉（补历史时统一
   assert.equal(withUpdates.cards[0].currentState, '本章确立了试讲安排。');
   assert.equal(withoutUpdates.cards[0].currentState, undefined);
 });
+
+test('mergeKnowledgeGraph 把别名、类型后缀落到已有卡片上，泛称不建节点', () => {
+  const target = chapter(9, '第 9 章', '姜老董事长坐在轮椅上，爷爷笑了。韩律师递来文件。');
+  const jiang: KnowledgeCard = { ...card(3, '姜正霖'), content: '- **name**：姜正霖\n- **aliases**：\n  - 姜老董事长\n  - 父亲' };
+  const base = project({ chapters: [target], cards: [jiang] });
+  const merged = mergeKnowledgeGraph(base, target, {
+    entities: [{ name: '姜老董事长', type: '人物' }, { name: '姜正霖（人物）', type: '人物' }, { name: '爷爷', type: '人物' }, { name: '韩律师', type: '人物' }, { name: '韩正', type: '人物' }],
+    relations: [{ source: '爷爷', target: '韩律师', label: '委托' }, { source: '姜老董事长', target: '韩正', label: '委托' }],
+  });
+  const entityLabels = merged.graphNodes.filter(node => node.type === 'entity').map(node => node.label);
+  assert.deepEqual(entityLabels, ['韩正']);
+  // 别名与后缀都指向卡片节点，章节到卡片只有一条提及边
+  assert.equal(merged.graphEdges.filter(edge => edge.target === 'card:3' && edge.label === '章节提及').length, 1);
+  assert.ok(merged.graphEdges.some(edge => edge.source === 'card:3' && edge.target === 'entity:韩正' && edge.label === '委托'));
+  // 泛称之间的关系整条丢掉
+  assert.ok(!merged.graphEdges.some(edge => edge.label === '委托' && edge.source !== 'card:3'));
+});

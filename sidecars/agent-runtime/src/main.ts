@@ -18,7 +18,7 @@ import { planChapterSplits } from "./application/chapter-split.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
 import { registerLibraryHandlers } from "./rpc/library-handlers.js";
-import { registerCardRefreshHandler, registerContentHandlers } from "./rpc/content-handlers.js";
+import { registerCardRefreshHandler, registerContentHandlers, registerGraphDedupeHandler } from "./rpc/content-handlers.js";
 import { registerTextHandlers } from "./rpc/text-handlers.js";
 import type { RpcResponse } from "@zhizhang/contracts";
 
@@ -85,11 +85,15 @@ async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse>
       const memoryBudgetBytes = contextBudgetBytes(Number(contextWindow) || undefined, 20, 8);
       const chapterContent = compactText(content, memoryBudgetBytes);
       const rawCards = Array.isArray(cards) ? cards.filter(card => card && typeof card === "object") as Array<Record<string, unknown>> : [];
-      // A card that is neither named in this chapter nor selected by graph context cannot change here.
-      const relevantCards = rawCards.filter(card => {
-        const title = String(card.title || "").trim();
-        return title.length > 0 && String(content).includes(title);
-      }).slice(0, 10);
+      // 正文里叫"姜老""爷爷"的章不一定写全名：卡片带来的别名也算命中，否则模型不知道该归到哪张卡
+      const cardNames = (card: Record<string, unknown>) => [String(card.title || "").trim(), ...stringList(card.aliases, 24)].filter(name => name.length >= 2);
+      const relevantCards = rawCards.filter(card => cardNames(card).some(name => String(content).includes(name))).slice(0, 10);
+      // 正名表：模型抽实体时把各种称呼归到卡片正名，图谱才不会一个人裂成六个节点
+      const nameTable = relevantCards
+        .map(card => ({ title: String(card.title || "").trim(), aliases: stringList(card.aliases, 24).filter(alias => alias !== String(card.title || "").trim()) }))
+        .filter(item => item.title && item.aliases.length)
+        .map(item => `- ${item.title}：${item.aliases.join("、")}`)
+        .join("\n");
       const graphSummary = compactKnowledgeGraph(
         knowledgeGraph,
         `${String(chapterTitle)}\n${chapterContent}\n${relevantCards.map(card => String(card.title || "")).join(" ")}`,
@@ -124,10 +128,11 @@ async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse>
         }).join("\n\n")}`
         : "";
       const compactGraphContext = graphSummary ? `\n## 相关知识图谱（用于增量更新）\n${graphSummary}` : "";
+      const nameTableContext = nameTable ? `\n## 人物正名表（正文里出现右边任何一种称呼，实体、关系、人物状态都写左边的正名）\n${nameTable}` : "";
       const compactMemoryPrompt = `请为《${String(projectTitle || "未命名小说")}》的${String(chapterTitle)}整理可检索的结构化章节记忆，并从正文抽取有证据的实体、关系和卡片变化。
 
 ## 本章正文
-${chapterContent}${compactCardContext}${compactGraphContext}
+${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
 
 返回 JSON：
 {
@@ -151,7 +156,8 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
   "cardUpdates": [{"cardId":"卡片 ID","cardTitle":"卡片名称","status":"changed|acquired|lost|revealed|updated","changes":"有正文依据的变化"}]
 }
 
-关系 weight 为 0.1 到 1.0 的正文证据强度：明确行动、身份、持有或状态变化为 0.85 以上；直接提及为 0.65 至 0.8；推断性弱关联不超过 0.6。实体不超过 30 个，关系不超过 60 条；无内容使用空数组或空字符串。`;
+实体只写具名的人物、地点、物件、势力：名字用上面卡片里的正名（正文叫"姜老""爷爷""姜老董事长"的都写成卡片正名），不给名字加"（人物）"这类后缀；"爷爷""韩律师""圆框眼镜的女学徒""四名年轻学徒"这种称谓、职务、描述不是实体，不要写；同一个人只出现一次。物品只记有名字且会再出现的（信物、文件、作品），一次性的杯子桌子不记。
+关系 weight 为 0.1 到 1.0 的正文证据强度：明确行动、身份、持有或状态变化为 0.85 以上；直接提及为 0.65 至 0.8；推断性弱关联不超过 0.6。实体不超过 20 个，关系不超过 40 条；无内容使用空数组或空字符串。`;
       const optimizedResponse = await client.chat([
         { role: "system", content: memoryEditorSystemPrompt },
         { role: "user", content: compactMemoryPrompt },
@@ -161,8 +167,8 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         const contextReport: ContextReport = {
         cache: "miss",
         sourceBytes: byteLength(JSON.stringify({ content, cards: rawCards, knowledgeGraph })),
-        packedBytes: byteLength(chapterContent) + byteLength(compactCardContext) + byteLength(compactGraphContext),
-        prunedBytes: Math.max(0, byteLength(JSON.stringify({ content, cards: rawCards, knowledgeGraph })) - byteLength(chapterContent) - byteLength(compactCardContext) - byteLength(compactGraphContext)),
+        packedBytes: byteLength(chapterContent) + byteLength(compactCardContext) + byteLength(nameTableContext) + byteLength(compactGraphContext),
+        prunedBytes: Math.max(0, byteLength(JSON.stringify({ content, cards: rawCards, knowledgeGraph })) - byteLength(chapterContent) - byteLength(compactCardContext) - byteLength(nameTableContext) - byteLength(compactGraphContext)),
         budgetBytes: memoryBudgetBytes,
         sections: { chapter: byteLength(chapterContent), cards: byteLength(compactCardContext), knowledgeGraph: byteLength(compactGraphContext) },
       };
@@ -1014,7 +1020,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
   }
 }
 
-const rpcRegistry = registerTextHandlers(registerCardRefreshHandler(registerContentHandlers(registerLibraryHandlers(registerModelHandlers(new RpcRegistry(handleLegacyRequest))))));
+const rpcRegistry = registerTextHandlers(registerGraphDedupeHandler(registerCardRefreshHandler(registerContentHandlers(registerLibraryHandlers(registerModelHandlers(new RpcRegistry(handleLegacyRequest)))))));
 
 async function main() {
   process.stdin.setEncoding("utf8");

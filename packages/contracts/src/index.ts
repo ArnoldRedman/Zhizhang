@@ -30,7 +30,7 @@ export type ModelRequestParams = z.infer<typeof modelParamsSchema> & Record<stri
 /** 携带模型配置的方法；参数在 registry 处按 modelParamsSchema 校验 */
 const modelParamMethods = [
   "gateway.usage", "settings.diagnose", "models.list", "models.test", "project.generate",
-  "skill.write", "github.commit.describe", "memory.write", "card.refresh", "ranking.analyze", "book.dismantle", "book.style.distill", "book.aggregate",
+  "skill.write", "github.commit.describe", "memory.write", "card.refresh", "graph.dedupe", "ranking.analyze", "book.dismantle", "book.style.distill", "book.aggregate",
   "book.rewrite", "book.adapt", "text.transform", "project.agent.chat", "card.write",
   "outline.write", "chapter.write", "chapter.review",
 ] as const;

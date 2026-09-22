@@ -1,5 +1,6 @@
 import type { Chapter, KnowledgeCard, KnowledgeGraphEdge, KnowledgeGraphNode, Project } from './project.ts';
 import { upsertKnowledgeGraphEdge } from './knowledge-graph.ts';
+import { relationalTerms } from './entity-terms.ts';
 
 /**
  * 卡片状态回填
@@ -24,7 +25,8 @@ export const cardSearchTermGroups = (card: KnowledgeCard): { primary: string[]; 
   const secondaryTerms = new Set<string>();
   const addPrimary = (value: string) => {
     const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').replace(/[“”"']/gu, '').trim();
-    if (normalized.length >= 2 && normalized.length <= 24 && !genericCardTerms.has(normalized) && !primaryTerms.includes(normalized)) primaryTerms.push(normalized);
+    // "父亲""大伯"这类称谓是卡上写的别名，但正文里谁都可能叫"父亲"，拿它定位卡片全是假命中；只从别名表里排除，图谱合并另有一套
+    if (normalized.length >= 2 && normalized.length <= 24 && !genericCardTerms.has(normalized) && !relationalTerms.has(normalized) && !primaryTerms.includes(normalized)) primaryTerms.push(normalized);
   };
   const addSecondary = (value: string) => {
     const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').trim();
@@ -44,6 +46,9 @@ export const cardSearchTermGroups = (card: KnowledgeCard): { primary: string[]; 
   for (const match of content.matchAll(identityPattern)) {
     for (const value of match[1].split(/[、,，;；/]/u)) addPrimary(value.replace(/[（(].*$/u, '').trim());
   }
+  // 卡片生成器写的是英文字段：`- **name**：姜正霖`、`- **aliases**：` 下面缩进一串 `  - 姜老董事长`；
+  // 以前只认中文"别名："那一行，这种格式的别名一个都没进检索词，正文里的"姜老董事长"永远对不上卡
+  for (const alias of cardAliasLines(content)) addPrimary(alias);
   const abilityHeadingPattern = /^\s*#{2,6}\s*(?:[^\n：:]{0,24}[：:])\s*([^\n]+)$/gmu;
   for (const match of content.matchAll(abilityHeadingPattern)) {
     for (const value of match[1].split(/[、,，;；/]/u)) addPrimary(value.replace(/[（(].*$/u, '').trim());
@@ -55,6 +60,45 @@ export const cardSearchTermGroups = (card: KnowledgeCard): { primary: string[]; 
     primary: primaryTerms.slice(0, 24),
     secondary: [...secondaryTerms].sort((left, right) => right.length - left.length).slice(0, 40),
   };
+};
+
+/**
+ * 卡片正文里的别名与本名：认中文"别名："一行的顿号列表，也认 `- **aliases**：` 下面的缩进子项
+ * 别名后面的括号说明（"阿妄（姜正霖第194章起）"）剥掉；分号后的用法说明整段丢掉
+ */
+export const cardAliasLines = (content: string): string[] => {
+  const lines = content.split(/\r?\n/u);
+  const out: string[] = [];
+  const push = (value: string) => {
+    const cleaned = value.replace(/[（(][^）)]*[）)]/gu, '').replace(/[“”"'*]/gu, '').split(/[;；]/u)[0].trim();
+    if (cleaned.length >= 1 && cleaned.length <= 24) out.push(cleaned);
+  };
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^\s*(?:[-*]\s*)?\*{0,2}(?:aliases|alias|name|姓名|本名|别名|称号|代号|简称)\*{0,2}\s*[：:]\s*(.*)$/iu.exec(lines[index]);
+    if (!match) continue;
+    const inline = match[1].trim();
+    if (inline) {
+      for (const value of inline.split(/[、,，/]/u)) push(value);
+      continue;
+    }
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const item = /^\s{2,}[-*]\s*(.+)$/u.exec(lines[next]);
+      if (!item) break;
+      push(item[1]);
+      index = next;
+    }
+  }
+  return Array.from(new Set(out));
+};
+
+/**
+ * 图谱合并用的全部称呼：卡名、正文里的本名与别名，含"父亲""大伯"这类称谓
+ * 定位正文时不用称谓（假命中），但记忆提炼抽出"大伯"这个实体时，它该并进"沈宏业与沈淮"卡而不是自己成一个节点
+ */
+export const cardAliasTerms = (card: KnowledgeCard): string[] => {
+  const groups = cardSearchTermGroups(card);
+  const aliases = cardAliasLines(card.content || '').filter(alias => !genericCardTerms.has(alias));
+  return Array.from(new Set([card.title.trim(), ...groups.primary, ...aliases])).filter(Boolean);
 };
 
 /** 扁平检索词列表：主词在前，次词在后 */

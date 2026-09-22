@@ -10,8 +10,10 @@ import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKn
 import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './domain/chapter';
 import { addChapterAnnotation, applyParagraphRevision, paragraphNeighbors, removeChapterAnnotations, resolveAnnotationTargets } from './domain/annotation';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories, staleMemoryChapters } from './domain/memory';
-import { cardSearchTerms, refreshCardStatesForProject, stripHeuristicCardStates } from './domain/cards';
+import { cardAliasTerms, cardSearchTerms, refreshCardStatesForProject, stripHeuristicCardStates } from './domain/cards';
+import { applyGraphDedupeSuggestion, cleanupKnowledgeGraph, deferredHonorifics, removeGraphNode, type GraphCleanupReport } from './domain/graph-cleanup';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
+import { isSurnamedHonorific } from './domain/entity-terms';
 import { addCardCandidates, answerAuthorQuestion, answeredAuthorQuestions, dismissAuthorQuestion, groupOutlines, mergeGeneratedOutline, migrateCardCandidatesFromNotes, outlineKeepsHistory, outlineSnapshotLimit, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeCardCandidate, removeReviewReportsForChapter, restoreOutlineSnapshot } from './domain/outline';
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
@@ -437,6 +439,15 @@ const agentRunning = (stage: AgentStage) => !['idle', 'done', 'error'].includes(
 const memoryQuotaCooldownMs = 5 * 60 * 1000;
 let memoryQuotaRetryAt = 0;
 const isQuotaExceededError = (value: unknown) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|额度(?:已)?用尽|余额不足/iu.test(String(value));
+
+/**
+ * 记忆提炼要带的卡片：正文里出现卡名或任一别名的都算，并把别名一起送过去
+ * 正文叫"姜老""爷爷"的章不写全名，以前只按卡名匹配，这些章的实体全落不到卡上，图谱里一个人裂成六个节点
+ */
+const memoryCardsFor = (project: Project, chapter: Chapter, selectedIds: number[] = []) => project.cards
+  .filter(card => selectedIds.includes(card.id) || cardAliasTerms(card).some(term => chapter.content.includes(term)))
+  .slice(0, 10)
+  .map(card => ({ ...card, aliases: cardAliasTerms(card).filter(term => term !== card.title.trim()) }));
 // These records can contain complete novels and downloaded books. Tauri writes
 // them to the iOS app-data directory; keeping a second WebView copy exhausts
 // the WKWebView quota and is only needed by the plain-browser development mode.
@@ -1304,6 +1315,8 @@ function App() {
   const [cardTypeFilter, setCardTypeFilter] = useState<CardType | '全部'>('全部');
   const [cardDraft, setCardDraft] = useState<{ type: CardType; title: string; content: string }>({ type: '角色卡', title: '', content: '' });
   const [cardRefreshing, setCardRefreshing] = useState(false);
+  const [graphCleaning, setGraphCleaning] = useState(false);
+  const [graphCleanupReport, setGraphCleanupReport] = useState<GraphCleanupReport | null>(null);
   const [cardGenerating, setCardGenerating] = useState(false);
   // One state object so a first-run install cannot generate two different
   // profile IDs for the list and for the active pointer.
@@ -4226,6 +4239,85 @@ function App() {
     }
   };
 
+  /**
+   * 整理知识图谱：先按规则并别名、并后缀、并错别字、删泛称、删长尾，再把剩下的实体连同卡片正名送给模型判尊称与简称
+   * 模型那一步失败只影响尊称合并，规则那一步的结果照样落盘；每写满十章刷卡片时也顺带跑一次规则那一步
+   */
+  const cleanupGraphNow = async (project: Project, options: { withModel: boolean }): Promise<{ project: Project; report: GraphCleanupReport }> => {
+    // 带姓的尊称留给模型判是谁；模型不跑就按泛称删
+    const local = cleanupKnowledgeGraph(project, { deferHonorifics: options.withModel });
+    if (!options.withModel) return local;
+    const entities = local.project.graphNodes.filter(node => node.type === 'entity');
+    if (!entities.length) return local;
+    const chapterLabel = new Map(local.project.graphNodes.filter(node => node.type === 'chapter').map(node => [node.id, node.label]));
+    const mentionedIn = new Map<string, string[]>();
+    for (const edge of local.project.graphEdges) {
+      const entityId = edge.source.startsWith('chapter:') ? edge.target : edge.target.startsWith('chapter:') ? edge.source : '';
+      const chapterId = edge.source.startsWith('chapter:') ? edge.source : edge.target.startsWith('chapter:') ? edge.target : '';
+      if (!entityId || !chapterId) continue;
+      const label = chapterLabel.get(chapterId);
+      if (label) mentionedIn.set(entityId, [...(mentionedIn.get(entityId) || []), label]);
+    }
+    const suggestion = await agentRpc<{ merges?: Array<{ from: string; to: string; reason?: string }>; removes?: Array<{ name: string; reason?: string }> }>('graph.dedupe', {
+      projectTitle: local.project.title,
+      cards: local.project.cards.map(card => ({ title: card.title, aliases: cardAliasTerms(card).filter(term => term !== card.title.trim()) })),
+      // 只送人物、势力、地点：物品长尾靠规则就够了，送给模型只会撑爆输出
+      entities: entities.filter(node => /人物|角色|势力|组织|地点|场景/u.test(node.category || '')).slice(0, 300).map(node => ({
+        label: node.label,
+        category: node.category,
+        chapters: (mentionedIn.get(node.id) || []).slice(0, 6).map(label => label.replace(/^(第\s*\d+\s*章).*$/u, '$1')),
+        hint: isSurnamedHonorific(node.label) ? '带姓的尊称或简称，请判断是哪张卡或哪个实体' : undefined,
+      })),
+      apiKey: agentConfig.apiKey.trim(),
+      baseURL: agentConfig.baseURL.trim(),
+      model: agentConfig.model.trim() || fallbackModels[0],
+      apiMode: agentConfig.apiMode,
+      reasoningMode: agentConfig.reasoningMode,
+      contextWindow: agentConfig.contextWindow,
+      ...agentNetworkParams(agentConfig),
+    });
+    const applied = applyGraphDedupeSuggestion(local.project, { merges: suggestion.merges || [], removes: suggestion.removes || [] });
+    // 模型也没认出来的带姓尊称，最后按泛称删掉，别留一个"姜老太爷"在图里
+    let final = applied.project;
+    const leftovers = deferredHonorifics(final).map(node => ({ id: node.id, label: node.label }));
+    for (const node of leftovers) final = removeGraphNode(final, node.id);
+    return {
+      project: final,
+      report: {
+        merged: [...local.report.merged, ...applied.report.merged],
+        removed: [...local.report.removed, ...applied.report.removed, ...leftovers.map(node => ({ label: node.label, reason: '称谓，模型也没认出是谁' }))],
+      },
+    };
+  };
+
+  const runGraphCleanup = async () => {
+    const project = editingProjectRef.current;
+    if (!project || graphCleaning) return;
+    const withModel = agentConfig.enabled && Boolean(agentConfig.apiKey.trim());
+    setGraphCleaning(true);
+    try {
+      const before = project.graphNodes.length;
+      let result: { project: Project; report: GraphCleanupReport };
+      let modelFailure = '';
+      try {
+        result = await cleanupGraphNow(project, { withModel });
+      } catch (error) {
+        // 模型那一步失败就只落规则那一步，并告诉作者哪一步没做
+        result = cleanupKnowledgeGraph(project);
+        modelFailure = String(error);
+      }
+      await applyProjectChange(result.project);
+      setGraphCleanupReport(result.report);
+      const after = result.project.graphNodes.length;
+      const tail = modelFailure ? `。模型判尊称这一步失败：${modelFailure}，可以稍后再点一次` : withModel ? '' : '（没填 API Key，只做了规则清理）';
+      setNotice({ title: '图谱整理完成', content: `节点 ${before} → ${after}：并入 ${result.report.merged.length} 个，删除 ${result.report.removed.length} 个${tail}。` });
+    } catch (error) {
+      setNotice({ title: '图谱整理失败', content: String(error) });
+    } finally {
+      setGraphCleaning(false);
+    }
+  };
+
   const updateCardStatesFromBook = async (cardId?: number) => {
     if (!editingProject) return;
     let searchProject = editingProject;
@@ -4319,7 +4411,7 @@ function App() {
     try {
       const refreshed = await refreshAllCardStates(base, base.chapters.length);
       const states = new Map(refreshed.cards.map(card => [card.id, card]));
-      setProjects(currentProjects => currentProjects.map(item => item.id !== projectId ? item : {
+      setProjects(currentProjects => currentProjects.map(item => item.id !== projectId ? item : cleanupKnowledgeGraph({
         ...item,
         cards: item.cards.map(card => {
           const next = states.get(card.id);
@@ -4327,7 +4419,8 @@ function App() {
         }),
         cardStatesRefreshedThrough: refreshed.cardStatesRefreshedThrough,
         updatedAt: new Date().toISOString(),
-      }));
+      // 每十章顺带按规则清一遍图谱：别名、后缀、泛称、长尾不清，十章又攒出几十个空节点
+      }).project));
     } catch (error) {
       if (isQuotaExceededError(error)) memoryQuotaRetryAt = Date.now() + memoryQuotaCooldownMs;
       setNotice({ title: '卡片状态未刷新', content: `${String(error)}。不影响写作，可在卡片面板手动点"按近期正文刷新状态"。` });
@@ -4358,7 +4451,7 @@ function App() {
           projectTitle: project.title,
           chapterTitle: chapter.title,
           content: chapter.content,
-          cards: project.cards.filter(card => selectedCardIds.includes(card.id) || (card.title.trim() && chapter.content.includes(card.title))).slice(0, 10),
+          cards: memoryCardsFor(project, chapter, selectedCardIds),
           apiKey: agentConfig.apiKey.trim(),
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0],
@@ -5348,7 +5441,7 @@ function App() {
         projectTitle: project.title,
         chapterTitle: chapter.title,
         content: chapter.content,
-        cards: project.cards.filter(card => card.title.trim() && chapter.content.includes(card.title)).slice(0, 10),
+        cards: memoryCardsFor(project, chapter),
         apiKey: agentConfig.apiKey.trim(),
         baseURL: agentConfig.baseURL.trim(),
         model: agentConfig.model.trim() || fallbackModels[0],
@@ -6747,7 +6840,7 @@ function App() {
           projectTitle: working.title,
           chapterTitle: chapter.title,
           content: chapter.content,
-          cards: working.cards.filter(card => card.title.trim() && chapter.content.includes(card.title)).slice(0, 10),
+          cards: memoryCardsFor(working, chapter),
           apiKey: agentConfig.apiKey.trim(),
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0],
@@ -7567,7 +7660,16 @@ function App() {
                 </section>
               ) : editorSidebarTab === 'knowledge-graph' ? (
                 <section className="knowledge-graph-workspace">
-                  <div className="knowledge-graph-header"><div><span>{graphViewMode === 'document' ? '图谱文档' : '关系视图'}</span><h3>知识图谱</h3></div><small>{editingProject.graphNodes.length} 个节点 · {editingProject.graphEdges.length} 条关系</small></div>
+                  <div className="knowledge-graph-header"><div><span>{graphViewMode === 'document' ? '图谱文档' : '关系视图'}</span><h3>知识图谱</h3></div><div className="knowledge-graph-header-actions"><small>{editingProject.graphNodes.length} 个节点 · {editingProject.graphEdges.length} 条关系</small><button className="btn-secondary" disabled={graphCleaning || !editingProject.graphNodes.length} title="并掉同一个人的别名、错别字、类型后缀，删掉“爷爷”“韩律师”这类称谓和只被提过一次的空节点；填了 API Key 会再让模型判尊称与简称" onClick={() => void runGraphCleanup()}>{graphCleaning ? '整理中…' : '整理图谱'}</button></div></div>
+                  {graphCleanupReport && (graphCleanupReport.merged.length > 0 || graphCleanupReport.removed.length > 0) && (
+                    <details className="graph-cleanup-report">
+                      <summary>上次整理：并入 {graphCleanupReport.merged.length} 个，删除 {graphCleanupReport.removed.length} 个 <button type="button" className="link-button" onClick={event => { event.preventDefault(); setGraphCleanupReport(null); }}>关闭</button></summary>
+                      <div className="graph-cleanup-report-body">
+                        {graphCleanupReport.merged.length > 0 && <p><strong>并入</strong>{graphCleanupReport.merged.map(item => `${item.from} → ${item.to}（${item.reason}）`).join('；')}</p>}
+                        {graphCleanupReport.removed.length > 0 && <p><strong>删除</strong>{graphCleanupReport.removed.map(item => item.label).join('、')}</p>}
+                      </div>
+                    </details>
+                  )}
                   {editingProject.graphNodes.length === 0 ? <div className="empty-state"><p>保存章节并勾选知识卡后，这里会显示章节、设定和卡片的引用关系。</p></div> : <>
                     <div className="knowledge-graph-view-switch" role="tablist" aria-label="图谱显示模式">
                       <button className={graphViewMode === 'document' ? 'active' : ''} onClick={() => setGraphViewMode('document')}>文档</button>

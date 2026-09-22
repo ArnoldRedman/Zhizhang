@@ -68,6 +68,12 @@ export const graphNodeRelativePath = (node: KnowledgeGraphNode) => node.sourcePa
 export const graphNodeProfile = (node: KnowledgeGraphNode) => node.content?.trim() || `## 基础信息\n- 节点类型：${graphNodeTypeLabel(node)}\n- 当前状态：${node.status || '待补充'}\n\n## 档案\n待补充。`;
 export const createGraphNodeProfile = (type: KnowledgeGraphNode['type'], category?: string) => `## 基础信息\n- 节点类型：${type === 'entity' ? category || '实体' : type === 'card' ? category || '知识卡' : type === 'chapter' ? '章节' : '大纲'}\n- 当前状态：待补充\n\n## 档案\n待补充。`;
 
+/** 档案是不是还是建节点时那份模板：只有"待补充"，没有任何人写过内容 */
+export const graphNodeProfileIsEmpty = (node: KnowledgeGraphNode) => {
+  const text = (node.content || '').replace(/^#+\s*[^\n]*$/gmu, '').replace(/^-\s*(?:节点类型|当前状态|来源路径)\s*[：:][^\n]*$/gmu, '').replace(/待补充[。.]?/gu, '').replace(/暂无/gu, '').trim();
+  return text.length < 8;
+};
+
 /** 没有打开小说时用的空数组：引用稳定，图谱页的缓存才不会因为每次渲染新建一个 [] 而失效 */
 export const noGraphNodes: KnowledgeGraphNode[] = Object.freeze([]) as unknown as KnowledgeGraphNode[];
 export const noGraphEdges: KnowledgeGraphEdge[] = Object.freeze([]) as unknown as KnowledgeGraphEdge[];
