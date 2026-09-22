@@ -11,10 +11,11 @@ import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, r
 import { addChapterAnnotation, applyParagraphRevision, paragraphNeighbors, removeChapterAnnotations, resolveAnnotationTargets } from './domain/annotation';
 import { memoryDocumentKinds, memoryDocumentId, asTextList, memoryTextList, chapterOrder, buildMemoryDocuments, hydrateMemoryDocuments, normalizeChapterMemory, buildLocalChapterSummary, buildLocalStructuredMemory, buildChapterMemoryPatch, recentChapterMemories, staleMemoryChapters } from './domain/memory';
 import { cardAliasTerms, cardSearchTerms, refreshCardStatesForProject, stripHeuristicCardStates } from './domain/cards';
-import { applyGraphDedupeSuggestion, cleanupKnowledgeGraph, deferredHonorifics, removeGraphNode, type GraphCleanupReport } from './domain/graph-cleanup';
+import { applyGraphDedupeSuggestion, cleanupKnowledgeGraph, deferredHonorifics, mergeGraphNodes, removeGraphNode, type GraphCleanupReport } from './domain/graph-cleanup';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
 import { isSurnamedHonorific } from './domain/entity-terms';
-import { addCardCandidates, answerAuthorQuestion, answeredAuthorQuestions, dismissAuthorQuestion, groupOutlines, mergeGeneratedOutline, migrateCardCandidatesFromNotes, outlineKeepsHistory, outlineSnapshotLimit, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeCardCandidate, removeReviewReportsForChapter, restoreOutlineSnapshot } from './domain/outline';
+import { answerAuthorQuestion, answeredAuthorQuestions, dismissAuthorQuestion, groupOutlines, mergeGeneratedOutline, outlineKeepsHistory, outlineSnapshotLimit, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeReviewReportsForChapter, restoreOutlineSnapshot, stripLegacyCardCandidateNotes } from './domain/outline';
+import { candidateExcerpts, deriveCardCandidates, ignoreCardCandidate, type DerivedCardCandidate } from './domain/card-candidates';
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
 import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
@@ -2100,8 +2101,8 @@ function App() {
               createdAt: chapter.createdAt ?? new Date().toISOString(),
               updatedAt: chapter.updatedAt ?? new Date().toISOString(),
             })) : [];
-            // 旧版把"本章新出现，要不要建卡"堆在待答文档里，读档时搬进卡片页的待建卡列表
-            return migrateCardCandidatesFromNotes({
+            // 旧版把"本章新出现，要不要建卡"堆在待答文档里、又存过一批候选：读档时删掉，候选现在从图谱按反复出现推导
+            return stripLegacyCardCandidateNotes({
               ...project,
               status: project.status === 'completed' ? 'completed' : 'writing',
               chapters,
@@ -4476,10 +4477,7 @@ function App() {
             ...refreshCardStatesForProject(withGraph, new Set([...resultCardIds, ...selectedCardIds])),
             authorPreferences: Array.from(new Set([...(latestProject.authorPreferences || []), ...asTextList(result.authorPreferences, 8)])).slice(-20),
           };
-          // 本章新出现的人物物件进卡片页待建卡，作者点建卡才生成
-          const number = merged.chapters.findIndex(item => item.id === latestChapter.id) + 1;
-          const withCandidates = addCardCandidates(merged, number, latestChapter.title, asTextList(result.newlyIntroduced, 12));
-          return currentProjects.map(item => item.id === withCandidates.id ? withCandidates : item);
+          return currentProjects.map(item => item.id === merged.id ? merged : item);
         });
         memoryRefineFailedAtRef.current.delete(chapter.id);
         if (options.notifyOnSuccess) setNotice({ title: '章节记忆更新完成', content: '本章结构化摘要已写入本地；若期间再次编辑，旧摘要会被自动丢弃。' });
@@ -4824,24 +4822,20 @@ function App() {
 
   /**
    * 待建卡候选一键建卡：按名字调卡片智能体生成，生成成功直接存卡，失败时把名字填进编辑器让作者手写
-   * 名字里带说明（"小何：书肆伙计"）：说明进指令，卡名只留冒号前的部分
+   * 正文依据是提到它的最近三章里围绕它的片段，不是某一章的尾巴
    */
-  const buildCardFromCandidate = async (candidateId: string) => {
+  const buildCardFromCandidate = async (candidate: DerivedCardCandidate) => {
     const project = editingProjectRef.current;
-    const candidate = project?.cardCandidates?.find(item => item.id === candidateId);
-    if (!project || !candidate || cardCandidateBuildingId) return;
+    if (!project || cardCandidateBuildingId) return;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Key，再生成知识卡片。' });
       return;
     }
-    const [name, ...rest] = candidate.name.split(/[：:]/u);
-    const title = name.replace(/[（(].*$/u, '').trim() || candidate.name.trim();
-    const note = rest.join('：').trim() || candidate.name.replace(title, '').replace(/^[（(]|[）)]$/gu, '').trim();
-    const type: CardType = /书肆|楼|院|宅|路|馆|庄园|医院|学院|法庭|坊|所|岛|殿堂|车站|机场|城|巷|街|室|房|厅|地窖/u.test(title) ? '地点卡'
-      : /公司|集团|研究院|书院|基金|信托|协会|学会|门|派|帮|族|家族|团队|部|局|委员会/u.test(title) ? '势力卡'
-        : /墨|纸|帖|书|册|本|图|卷|盒|杯|剪|刀|盘|服|笔|印|钥匙|信|函|清单|表|录|谱|札|笔记|遗物|拓|画|镜|表|车|药/u.test(title) ? '物品卡' : '角色卡';
-    const chapter = project.chapters[candidate.chapterNumber - 1];
-    setCardCandidateBuildingId(candidateId);
+    const title = candidate.key;
+    const type = candidate.type;
+    const chapters = candidate.chapterNumbers;
+    const latest = project.chapters[chapters[chapters.length - 1] - 1];
+    setCardCandidateBuildingId(candidate.key);
     try {
       await invoke<string>('start_agent_runtime');
       const result = await agentRpc<{ title?: string; content?: string }>('card.write', {
@@ -4852,9 +4846,9 @@ function App() {
         cardType: type,
         cardTitle: title,
         existingContent: '',
-        instruction: `为第 ${candidate.chapterNumber} 章新出现的「${title}」建一张${type}${note ? `（${note}）` : ''}。只写正文里能证实的信息，写不到的标"待揭示"，不要编造。`,
-        chapterTitle: chapter?.title,
-        chapterContent: chapter?.content?.slice(-8000),
+        instruction: `「${title}」在第 ${chapters.join('、')} 章出现过，为它建一张${type}。只写正文片段里能证实的信息，写不到的标"待揭示"，不要编造。`,
+        chapterTitle: latest?.title,
+        chapterContent: candidateExcerpts(project, candidate),
         outlines: project.outlines.filter(item => item.kind === '世界观与作品设定').slice(0, 2).map(outline => ({ kind: outline.kind, content: outline.content })),
         cards: project.cards.slice(-8),
         apiKey: agentConfig.apiKey.trim(),
@@ -4869,13 +4863,14 @@ function App() {
       if (!content) throw new Error('智能体没有返回卡片内容');
       const now = new Date().toISOString();
       const card: KnowledgeCard = { id: Date.now(), type, title: result.title?.trim() || title, content, createdAt: now, updatedAt: now };
-      const latest = editingProjectRef.current || project;
-      const withCard: Project = {
-        ...removeCardCandidate(latest, candidateId, false),
-        cards: [...latest.cards, card],
-        graphNodes: [...latest.graphNodes, { id: `card:${card.id}`, label: card.title, type: 'card', category: card.type }],
+      const current = editingProjectRef.current || project;
+      // 实体节点并进新卡：它的提及边全部改指向卡片节点，图谱里不再留一个同名的空实体
+      const withCard = mergeGraphNodes({
+        ...current,
+        cards: [...current.cards, card],
+        graphNodes: [...current.graphNodes, { id: `card:${card.id}`, label: card.title, type: 'card', category: card.type }],
         updatedAt: now,
-      };
+      }, `entity:${candidate.label}`, `card:${card.id}`);
       await applyProjectChange(withCard);
       setActiveCardId(card.id);
       setCardDraft({ type: card.type, title: card.title, content: card.content });
@@ -4883,7 +4878,7 @@ function App() {
     } catch (error) {
       // 生成失败不丢候选：名字先填进编辑器，作者可以自己写
       setActiveCardId(null);
-      setCardDraft({ type, title, content: note ? `- 出处：第 ${candidate.chapterNumber} 章\n- ${note}\n` : `- 出处：第 ${candidate.chapterNumber} 章\n` });
+      setCardDraft({ type, title, content: `- 出处：第 ${chapters.join('、')} 章` + String.fromCharCode(10) });
       setNotice({ title: '自动建卡失败', content: `${String(error)}。名字已填进右侧编辑器，可以手写后保存。` });
     } finally {
       setCardCandidateBuildingId(null);
@@ -5765,8 +5760,6 @@ function App() {
         setContinuousWriting({ done: done + 1, total, message: `第 ${number} 章：正文已采用，正在提炼记忆` });
         try {
           project = await refineChapterMemory(project, applied.chapter);
-          // 记忆提炼出的"本章新出现"进卡片页的待建卡：要不要建卡由作者定，不自动生成卡片
-          project = addCardCandidates(project, number, applied.chapter.title, project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || []);
           await applyProjectChange(project);
         } catch (error) {
           // 额度用尽就别再往下撞了；其他失败只影响下一章的承接质量，正文已经保住
@@ -5881,7 +5874,6 @@ function App() {
         setChapterRewrite({ done, total, message: `第 ${number} 章：已写入，正在提炼记忆` });
         try {
           project = await refineChapterMemory(project, applied.chapter);
-          project = addCardCandidates(project, number, applied.chapter.title, project.memories.find(memory => memory.chapterId === applied.chapter.id)?.newlyIntroduced || []);
           await applyProjectChange(project);
         } catch (error) {
           if (isQuotaExceededError(error)) throw error;
@@ -6886,7 +6878,9 @@ function App() {
   const activeChapterMemory = editingProject?.memories.find(memory => memory.id === activeChapterMemoryId) ?? null;
   const pendingQuestions = editingProject ? pendingAuthorQuestions(editingProject) : [];
   const pendingQuestionCount = pendingQuestions.length;
-  const cardCandidateCount = editingProject?.cardCandidates?.length || 0;
+  // 待建卡候选从图谱推导：一个东西在好几章里被提到、有节点、却没有卡；只在卡片页打开时算
+  const cardCandidates = useMemo(() => editingProject && editorSidebarTab === 'cards' ? deriveCardCandidates(editingProject) : [], [editingProject, editorSidebarTab]);
+  const cardCandidateCount = cardCandidates.length;
   // 记忆落后于正文的章：只在记忆中心打开时算，别的页面用不着
   const staleMemoryChapterIds = useMemo(
     () => editingProject && editorSidebarTab === 'knowledge' ? new Set(staleMemoryChapters(editingProject).map(item => item.chapter.id)) : new Set<number>(),
@@ -7463,18 +7457,19 @@ function App() {
                     <button className="btn-secondary" disabled={cardRefreshing} title="一次模型调用，按最近十章正文重写全部卡片的当前状态；每写满十章会自动做一次" onClick={() => void refreshCardStatesNow()}>{cardRefreshing ? '刷新中...' : '按近期正文刷新状态'}</button>
                   </div>
                   <div className="card-list">
-                    {(editingProject.cardCandidates?.length || 0) > 0 && (
+                    {cardCandidates.length > 0 && (
                       <details className="card-candidates" open>
-                        <summary>待建卡 <small>{editingProject.cardCandidates!.length} 个正文里新出现的人物、地点、物件</small></summary>
+                        <summary>待建卡 <small>{cardCandidates.length} 个在多章里反复出现、还没有卡的人物、地点、势力、物件</small></summary>
                         <div className="card-candidates-list">
-                          {editingProject.cardCandidates!.slice(0, 12).map(item => (
-                            <div key={item.id} className="card-candidate">
-                              <div><strong>{item.name.split(/[：:]/u)[0]}</strong><small>第 {item.chapterNumber} 章{item.name.includes('：') || item.name.includes(':') ? ` · ${item.name.split(/[：:]/u).slice(1).join('：').slice(0, 60)}` : ''}</small></div>
-                              <button className="btn-primary" disabled={Boolean(cardCandidateBuildingId)} onClick={() => void buildCardFromCandidate(item.id)}>{cardCandidateBuildingId === item.id ? '建卡中…' : '建卡'}</button>
-                              <button className="link-button" title="不建卡，以后再出现也不提" onClick={() => updateEditorProject(project => removeCardCandidate(project, item.id, true))}>忽略</button>
+                          {cardCandidates.slice(0, 12).map(item => (
+                            <div key={item.key} className="card-candidate">
+                              <div><strong>{item.label}</strong><small>{item.type} · 第 {item.chapterNumbers.slice(0, 6).join('、')}{item.chapterNumbers.length > 6 ? ` 等 ${item.chapterNumbers.length}` : ''} 章出现</small></div>
+                              <button className="btn-primary" disabled={Boolean(cardCandidateBuildingId)} onClick={() => void buildCardFromCandidate(item)}>{cardCandidateBuildingId === item.key ? '建卡中…' : '建卡'}</button>
+                              <button className="link-button" title="不建卡，以后再反复出现也不提" onClick={() => updateEditorProject(project => ignoreCardCandidate(project, item.key))}>忽略</button>
                             </div>
                           ))}
-                          {editingProject.cardCandidates!.length > 12 && <p className="empty-hint compact">还有 {editingProject.cardCandidates!.length - 12} 个，处理完上面的再显示。</p>}
+                          {cardCandidates.length > 12 && <p className="empty-hint compact">还有 {cardCandidates.length - 12} 个，处理完上面的再显示。</p>}
+                          <p className="empty-hint compact">标准：人物在三章以上、地点势力物件在四章以上被提到，图谱里有节点但没有卡。只提过一两次的东西不会出现在这里。</p>
                         </div>
                       </details>
                     )}

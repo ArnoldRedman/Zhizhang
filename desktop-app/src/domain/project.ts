@@ -67,7 +67,7 @@ export interface AuthorQuestion {
   answeredAt?: string;
 }
 
-/** 记忆提炼发现的"本章新出现"：人物、地点、物件、规则；作者点建卡才生成卡片，点忽略就不再提 */
+/** 旧版存的待建卡候选（2026-09-22 之前按"本章新出现"登记）；读档时清掉，现在候选从图谱按反复出现推导 */
 export interface CardCandidate {
   id: string;
   name: string;
@@ -235,9 +235,9 @@ export interface Project {
   cardStatesRefreshedThrough?: number;
   /** 模型提给作者的问题与答复；未答的在章节页标出，已答的进每章提示词 */
   authorQuestions?: AuthorQuestion[];
-  /** 待建卡候选：记忆提炼发现的本章新出现事物，作者建卡或忽略后移除 */
+  /** 旧版存的待建卡候选，读档时清掉；候选现在由 card-candidates.ts 从图谱推导 */
   cardCandidates?: CardCandidate[];
-  /** 作者点过"忽略"的候选名，之后再出现也不再提 */
+  /** 作者点过"忽略"的候选名，之后再反复出现也不再提 */
   ignoredCardCandidates?: string[];
   /**
    * 只在一章出现过的实体：先记在这里，第二次在别的章出现才升为图谱节点

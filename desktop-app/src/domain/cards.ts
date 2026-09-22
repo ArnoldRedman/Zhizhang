@@ -15,6 +15,13 @@ const genericCardTerms = new Set([
   '详细信息', '暂无', '设定', '限制', '代价', '升级路径', '触发条件', '核心能力',
 ]);
 
+/** 一张卡写几个人或几个地方（"沈宏业与沈淮""临安古籍文献修复研究所与西湖墨庄"）：按连接词拆开，每段都是这张卡的名字 */
+export const combinedTitleParts = (title: string): string[] => {
+  const trimmed = title.trim();
+  if (!/[与和、及]/u.test(trimmed)) return [];
+  return trimmed.split(/[与和、及]/u).map(part => part.replace(/[（(].*$/u, '').trim()).filter(part => part.length >= 2 && part.length < trimmed.length);
+};
+
 /**
  * 从卡片标题和正文里抽出用于在正文中定位这张卡的检索词
  * 主词 = 卡名、别名、能力名这类能唯一定位的词；次词 = 正文里的汉字片段
@@ -36,6 +43,8 @@ export const cardSearchTermGroups = (card: KnowledgeCard): { primary: string[]; 
   if (!genericCardTerms.has(card.title.trim())) addPrimary(card.title);
   const canonicalTitle = card.title.replace(/^(主角|角色|人物|本命|关键|核心)/u, '').trim();
   if (!genericCardTerms.has(canonicalTitle)) addPrimary(canonicalTitle);
+  // 合并卡："沈宏业与沈淮"一张卡写两个人，正文里单独出现"沈宏业"也得对上这张卡
+  for (const part of combinedTitleParts(card.title)) addPrimary(part);
   // 只对“人名”长度的标题取尾字（“主角沈妄” → “沈妄”“妄”）：
   // 地点卡那种长描述标题取尾字只会得到“中心”“法庭”这种到处都有的词，反而制造假命中
   if (!genericCardTerms.has(canonicalTitle) && /^[\u3400-\u9fff]{3,6}$/u.test(canonicalTitle)) {

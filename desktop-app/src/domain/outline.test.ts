@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { addCardCandidates, answerAuthorQuestion, answeredAuthorQuestions, groupOutlines, mergeGeneratedOutline, migrateCardCandidatesFromNotes, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeCardCandidate, removeReviewReportsForChapter, restoreOutlineSnapshot } from './outline.ts';
+import { answerAuthorQuestion, answeredAuthorQuestions, groupOutlines, mergeGeneratedOutline, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeReviewReportsForChapter, restoreOutlineSnapshot, stripLegacyCardCandidateNotes } from './outline.ts';
 import type { OutlineDocument, Project } from './project.ts';
 
 const now = '2026-01-01T00:00:00.000Z';
@@ -74,27 +74,16 @@ test('作者问答：同一问题不重复登记，答复后进提示词，未�
   assert.deepEqual(answeredAuthorQuestions(book), [{ question: '沈砚的母亲是否还在世？', answer: '在世，住在灯塔。' }]);
 });
 
-test('建卡候选：已有卡、忽略过、已在候选里的不再登记；忽略后同名再出现也不提', () => {
-  const book = project({ cards: [{ id: 1, type: '角色卡', title: '沈砚', content: '', createdAt: now, updatedAt: now }] });
-  let next = addCardCandidates(book, 7, '第 7 章', ['沈砚', '小何：书肆伙计', '老孟（司机）']);
-  assert.deepEqual(next.cardCandidates?.map(item => item.name), ['小何：书肆伙计', '老孟（司机）']);
-  next = addCardCandidates(next, 8, '第 8 章', ['小何：又出现了']);
-  assert.equal(next.cardCandidates?.length, 2);
-  next = removeCardCandidate(next, next.cardCandidates![1].id, true);
-  assert.deepEqual(next.ignoredCardCandidates, ['老孟']);
-  next = addCardCandidates(next, 9, '第 9 章', ['老孟：再来']);
-  assert.equal(next.cardCandidates?.length, 1);
-});
-
-test('旧版待答文档里的建卡条目搬进待建卡列表，文档只留审查意见', () => {
-  const doc = outline(9, '审查报告', '给作者｜待答', '# 给作者｜待答\n\n说明。\n\n## 第 140 章 雪后\n- 本章新出现，要不要建卡：韩正律师\n- 审查指出：时间线矛盾\n\n## 第 147 章 昭雪\n- 本章新出现，要不要建卡：金石印谱手札\n- 本章新出现，要不要建卡：韩正律师\n');
-  const migrated = migrateCardCandidatesFromNotes(project({ outlines: [doc] }));
-  assert.deepEqual(migrated.cardCandidates?.map(item => [item.name, item.chapterNumber]), [['韩正律师', 140], ['金石印谱手札', 147]]);
+test('旧版待答文档里的建卡条目删掉，存量候选丢掉，文档只留审查意见', () => {
+  const lines = (...items: string[]) => items.join(String.fromCharCode(10));
+  const doc = outline(9, '审查报告', '给作者｜待答', lines('# 给作者｜待答', '', '说明。', '', '## 第 140 章 雪后', '- 本章新出现，要不要建卡：韩正律师', '- 审查指出：时间线矛盾', '', '## 第 147 章 昭雪', '- 本章新出现，要不要建卡：金石印谱手札', ''));
+  const migrated = stripLegacyCardCandidateNotes(project({ outlines: [doc], cardCandidates: [{ id: 'cc-1', name: '韩正律师', chapterNumber: 140, chapterTitle: '第 140 章', createdAt: now }] }));
+  assert.equal(migrated.cardCandidates, undefined);
   const content = migrated.outlines[0].content;
   assert.ok(content.includes('- 审查指出：时间线矛盾'));
   assert.ok(!content.includes('要不要建卡'));
   assert.ok(!content.includes('## 第 147 章'));
-  // 没有这类行的文档原样返回
-  const plain = project({ outlines: [outline(1, '审查报告', '给作者｜待答', '# 给作者｜待答\n\n## 第 3 章\n- 审查指出：x\n')] });
-  assert.equal(migrateCardCandidatesFromNotes(plain), plain);
+  // 没有这类行、也没有存量候选的原样返回
+  const plain = project({ outlines: [outline(1, '审查报告', '给作者｜待答', lines('# 给作者｜待答', '', '## 第 3 章', '- 审查指出：x', ''))] });
+  assert.equal(stripLegacyCardCandidateNotes(plain), plain);
 });

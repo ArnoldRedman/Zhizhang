@@ -142,7 +142,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
   "readerKnown": ["本章读者新知道的事，一条一句"],
   "authorTruth": ["本章埋下但读者还不知道的真相，没有就空数组"],
   "nextChapterPromise": "本章结尾对下一章的承诺，一到两句：下一章必须接住什么",
-  "newlyIntroduced": ["本章第一次出现的具名人物、地点、物件、规则，一条一个"],
+  "newlyIntroduced": ["本章第一次出现、之后大概率还会再出现的具名人物、地点、势力、关键物件（信物、文件、作品、遗物），一条一个；食物、日用品、交通工具、一次露面的路人和工作人员不写"],
   "characterStateChanges": ["角色名：持续状态变化"],
   "knowledgeChanges": ["角色名：得知或隐瞒的信息"],
   "foreshadowingChanges": ["伏笔进展"],

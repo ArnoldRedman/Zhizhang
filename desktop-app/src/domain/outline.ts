@@ -1,4 +1,4 @@
-import type { AuthorQuestion, CardCandidate, OutlineDocument, OutlineKind, Project } from './project';
+import type { AuthorQuestion, OutlineDocument, OutlineKind, Project } from './project';
 
 /** 同一毫秒内连续登记会拿到相同时间戳，id 是答复与忽略的定位键，必须唯一 */
 const uniqueSuffix = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -136,70 +136,25 @@ export const answeredAuthorQuestions = (project: Project, limit = 20): Array<{ q
   .slice(-limit)
   .map(item => ({ question: item.question, answer: item.answer }));
 
-/**
- * 登记记忆提炼发现的"本章新出现"为待建卡候选
- * 已有同名卡、已在候选里、作者忽略过的都不再提；一条候选只登记一次
- */
-export const addCardCandidates = (project: Project, chapterNumber: number, chapterTitle: string, names: string[]): Project => {
-  const cleaned = names.map(item => item.trim()).filter(Boolean);
-  if (!cleaned.length) return project;
-  const existing = project.cardCandidates || [];
-  const ignored = new Set(project.ignoredCardCandidates || []);
-  const cardTitles = new Set(project.cards.map(card => card.title.trim()));
-  // 候选名常带说明："小何：栖迟书肆后间伙计……"，比对时只看冒号前的名字
-  const key = (name: string) => name.split(/[：:（(]/u)[0].trim();
-  const now = new Date().toISOString();
-  const fresh: CardCandidate[] = cleaned
-    .filter(name => !cardTitles.has(key(name)) && !ignored.has(key(name)) && !existing.some(item => key(item.name) === key(name)))
-    .map(name => ({ id: `cc-${uniqueSuffix()}`, name, chapterNumber, chapterTitle, createdAt: now }));
-  if (!fresh.length) return project;
-  return { ...project, cardCandidates: [...existing, ...fresh], updatedAt: now };
-};
-
-export const removeCardCandidate = (project: Project, id: string, ignore: boolean): Project => {
-  const target = (project.cardCandidates || []).find(item => item.id === id);
-  if (!target) return project;
-  const name = target.name.split(/[：:（(]/u)[0].trim();
-  return {
-    ...project,
-    cardCandidates: (project.cardCandidates || []).filter(item => item.id !== id),
-    ignoredCardCandidates: ignore ? Array.from(new Set([...(project.ignoredCardCandidates || []), name])).slice(-200) : project.ignoredCardCandidates,
-    updatedAt: new Date().toISOString(),
-  };
-};
-
 const candidateLinePattern = /^- 本章新出现，要不要建卡：(.+)$/u;
+const NEWLINE = String.fromCharCode(10);
 
 /**
- * 把旧版"给作者｜待答"文档里堆着的"本章新出现，要不要建卡"条目搬进待建卡列表
- * 2026-09-22 之前这些条目只能在文档里看，没有任何按钮能建卡；实测一本书攒了 127 条没人动。
- * 搬完把这些行从文档里删掉，只剩审查意见的章节段落照旧；文档没有这类行时原样返回，不制造无关差异
+ * 把旧版"给作者｜待答"文档里堆着的"本章新出现，要不要建卡"条目删掉
+ * 这些条目是"模型觉得第一次出现"的原话，没有筛选价值；待建卡现在从图谱按反复出现推导（card-candidates.ts），
+ * 旧的存量候选读档时一并丢掉。文档没有这类行时原样返回，不制造无关差异
  */
-export const migrateCardCandidatesFromNotes = (project: Project): Project => {
+export const stripLegacyCardCandidateNotes = (project: Project): Project => {
   const document = project.outlines.find(outline => outline.kind === '审查报告' && outline.title === '给作者｜待答');
-  if (!document || !candidateLinePattern.test(document.content.split('\n').find(line => candidateLinePattern.test(line)) || '')) return project;
-  let next = project;
-  let chapterNumber = 0;
-  let chapterTitle = '';
-  const kept: string[] = [];
-  for (const line of document.content.split('\n')) {
-    const heading = /^## 第\s*(\d+)\s*章\s*(.*)$/u.exec(line);
-    if (heading) {
-      chapterNumber = Number(heading[1]);
-      chapterTitle = `第 ${heading[1]} 章 ${heading[2]}`.trim();
-    }
-    const candidate = candidateLinePattern.exec(line);
-    if (candidate) {
-      next = addCardCandidates(next, chapterNumber, chapterTitle, [candidate[1]]);
-      continue;
-    }
-    kept.push(line);
+  const hasLines = Boolean(document && document.content.split(NEWLINE).some(line => candidateLinePattern.test(line)));
+  if (!hasLines && !project.cardCandidates?.length) return project;
+  let outlines = project.outlines;
+  if (document && hasLines) {
+    const kept = document.content.split(NEWLINE).filter(line => !candidateLinePattern.test(line));
+    // 条目删掉后只剩标题的章节段落一并去掉
+    const sections = kept.join(NEWLINE).split(/\n(?=## )/u).filter(section => !/^## /u.test(section) || section.split(NEWLINE).slice(1).some(line => line.trim()));
+    const content = sections.join(NEWLINE).replace(/\n{3,}/gu, NEWLINE + NEWLINE).trimEnd() + NEWLINE;
+    outlines = outlines.map(outline => outline.id === document.id ? { ...outline, content, updatedAt: new Date().toISOString() } : outline);
   }
-  // 条目搬走后只剩标题的章节段落一并去掉
-  const sections = kept.join('\n').split(/\n(?=## )/u).filter(section => !/^## /u.test(section) || section.split('\n').slice(1).some(line => line.trim()));
-  const content = sections.join('\n').replace(/\n{3,}/gu, '\n\n').trimEnd() + '\n';
-  return {
-    ...next,
-    outlines: next.outlines.map(outline => outline.id === document.id ? { ...outline, content, updatedAt: new Date().toISOString() } : outline),
-  };
+  return { ...project, outlines, cardCandidates: undefined };
 };
