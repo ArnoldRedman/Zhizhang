@@ -116,6 +116,21 @@ export const boundChapterOutlineFor = (project: Project, chapter: Chapter): Outl
   project.outlines.find(outline => outline.kind === '章纲'
     && (String(outline.chapterId ?? '') === String(chapter.id) || chapterBoundToOutline(project, outline)?.id === chapter.id));
 
+/**
+ * 重写历史章时把卡片状态回退到本章之前：当前状态与状态历史都是按全书最新写的，重写第 130 章却带着"第 194 章登门受茶"，
+ * 模型就会把后面的事提前写出来。取状态历史里最后一条落在本章之前的记录当"当前状态"，更晚的历史全部去掉；
+ * 一条都没有就清空，宁可没有状态也不给未来
+ */
+export const rollbackCardState = (card: KnowledgeCard, project: Project, chapterNumber: number): KnowledgeCard => {
+  const numberOf = (chapterId: number) => project.chapters.findIndex(item => item.id === chapterId) + 1;
+  const earlier = (card.stateHistory || []).filter(entry => {
+    const number = numberOf(entry.chapterId);
+    return number > 0 && number < chapterNumber;
+  });
+  const latest = earlier[earlier.length - 1];
+  return { ...card, currentState: latest?.changes || '', stateHistory: earlier };
+};
+
 export const buildChapterWriteContext = (input: ChapterWriteContextInput): ChapterWriteContext => {
   const { project, chapter, writingStyle } = input;
   const chapterIndex = project.chapters.findIndex(item => item.id === chapter.id);
@@ -130,7 +145,8 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
   // 修订日志这类工作台账不是作品设定，写正文时不带；运行时还会再过滤一次，这里先不传省字节
   const outlines = project.outlines.filter(outline => !outline.title.startsWith('阶段节拍｜') && !(outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title)) && (outline.kind === '世界观与作品设定' || outline.kind === '总纲'
     || outline.id === boundOutline?.id || input.extraOutlineIds.includes(outline.id)));
-  const cards = effectiveCards(project, input.selectedCardIds, `${boundOutline?.content || ''}\n${(previousChapter?.content || '').slice(-8000)}\n${input.instruction}`);
+  const cards = effectiveCards(project, input.selectedCardIds, `${boundOutline?.content || ''}\n${(previousChapter?.content || '').slice(-8000)}\n${input.instruction}`)
+    .map(card => historical ? rollbackCardState(card, project, chapterNumber) : card);
   const skills = [
     ...input.skills,
     ...(writingStyle ? [{ name: `style-${writingStyle.id}`, category: 'write', description: writingStyle.description, tags: [...writingStyle.tags, '文风'], content: writingStyle.content }] : []),

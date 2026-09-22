@@ -170,3 +170,24 @@ test('作品默认技能只传技能目录里真有的名字', () => {
   assert.deepEqual(context.params.defaultSkillNames, ['story-long-write']);
   assert.deepEqual(buildChapterWriteContext({ project: project(), chapter: chapters[3], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] }).params.defaultSkillNames, []);
 });
+
+test('重写历史章时卡片状态回退到本章之前，最后一章照旧用最新状态', () => {
+  const history = [
+    { chapterId: 1, chapterTitle: '第 1 章', status: 'updated', changes: '刚搬进阁楼', updatedAt: now },
+    { chapterId: 2, chapterTitle: '第 2 章', status: 'updated', changes: '发现旧电台', updatedAt: now },
+    { chapterId: 4, chapterTitle: '第 4 章', status: 'updated', changes: '和守夜人结盟', updatedAt: now },
+  ];
+  const current = project({ cards: [{ id: 1, type: '角色卡', title: '沈砚', content: '', currentState: '和守夜人结盟', stateHistory: history, pinned: true, createdAt: now, updatedAt: now }] });
+  const cardsOf = (context: ReturnType<typeof buildChapterWriteContext>) => context.params.cards as Array<{ title: string; currentState?: string; stateHistory?: Array<{ chapterId: number }> }>;
+  // 重写第 3 章：只看得见第 1、2 章的状态，第 4 章的"结盟"不能出现
+  const rewrite = buildChapterWriteContext({ project: current, chapter: chapters[2], instruction: '重写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  const rolled = cardsOf(rewrite).find(card => card.title === '沈砚')!;
+  assert.equal(rolled.currentState, '发现旧电台');
+  assert.deepEqual(rolled.stateHistory?.map(entry => entry.chapterId), [1, 2]);
+  // 重写第 1 章：之前没有任何状态，清空
+  const first = buildChapterWriteContext({ project: current, chapter: chapters[0], instruction: '重写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal(cardsOf(first).find(card => card.title === '沈砚')!.currentState, '');
+  // 最后一章：最新状态原样
+  const latest = buildChapterWriteContext({ project: current, chapter: chapters[3], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal(cardsOf(latest).find(card => card.title === '沈砚')!.currentState, '和守夜人结盟');
+});
