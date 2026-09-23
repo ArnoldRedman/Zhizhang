@@ -20,6 +20,7 @@ export const writingGuideFacts = (title: unknown, content: string): string => {
     .map(section => section.replace(/^(##[^\n]*\n)(?:\s*\n)?[^\n]*(?:严禁|必须)[^\n]*\n/u, "$1"))
     .join("\n\n").trim();
 };
+export { draftAcceptanceIssues } from "./chapter-acceptance.js";
 export { detectQuoteStyle, normalizePauses, normalizeQuotes } from "./punctuation.js";
 export type { PunctuationReport, QuoteStyle } from "./punctuation.js";
 

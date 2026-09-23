@@ -19,6 +19,7 @@ import { candidateExcerpts, deriveCardCandidates, ignoreCardCandidate, type Deri
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
 import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
+import { draftAcceptanceIssues } from './features/chapter-agent/acceptance';
 import { analyzeAIChapter, buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
@@ -35,7 +36,6 @@ import './App.css';
 import { builtinSkills } from './data/builtin-skills';
 import {
   countNovelCharacters,
-  isWithinChapterTarget,
   stripChapterNumberPrefix,
   splitChapterTitleHeading,
   applyDraftChapterTitle,
@@ -1355,6 +1355,7 @@ function App() {
   const [outlineGenerating, setOutlineGenerating] = useState(false);
   const [agentStage, setAgentStage] = useState<AgentStage>('idle');
   const [agentDraft, setAgentDraft] = useState<AgentDraftResult | null>(null);
+  const [pendingDraftAcceptance, setPendingDraftAcceptance] = useState<{ projectId: number; chapterId: number; content: string; issues: string[] } | null>(null);
   const [agentDisplayContent, setAgentDisplayContent] = useState('');
   /** 草稿的章节标题：接受前可改，标题不能只靠模型写得对 */
   const [agentDraftTitle, setAgentDraftTitle] = useState('');
@@ -3084,7 +3085,7 @@ function App() {
   const bindStyleToCurrentProject = (styleId: string) => {
     if (!editingProject) return;
     updateEditorProject(project => ({ ...project, styleProfileId: styleId || undefined, updatedAt: new Date().toISOString() }));
-    setNotice({ title: '文风绑定已更新', content: styleId ? '章节智能体会在相关创作中加入该文风 Skill。' : '已取消绑定文风。' });
+    setNotice({ title: '文风绑定已更新', content: styleId ? '章节智能体会将该文风作为风格参考，不再重复加入技能。' : '已取消绑定文风。' });
   };
 
   const handleProjectTagToggle = (tag: string) => {
@@ -5443,7 +5444,7 @@ function App() {
    * 写满指定章数、写到总纲按卷写明的末章、出错或作者点停止为止；每章写完立刻落盘，中途停下已写的章都在
    * 只认卷里的章号区间，不认正文里的区间：总纲里“须在第174～177章完成”这类句子会把边界算错，第 178 章起就再也写不动
    */
-  /** 技能库与绑定文风：写正文与审查旧章用同一份，不能一边带一边不带 */
+  /** 技能库与绑定文风：写正文与审查旧章用同一份文风参考 */
   const resolveAgentSkillsAndStyle = (project: Project) => {
     let agentSkills = skills;
     if (!agentSkills.length) {
@@ -5730,16 +5731,15 @@ function App() {
           break;
         }
         const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
-        const actual = countNovelCharacters(drafted.result.draftContent);
-        // 字数未达目标或超过上限时只留草稿，不自动写入和继续下一章
-        if (!isWithinChapterTarget(actual, target)) {
+        const issues = draftAcceptanceIssues(drafted.result.draftContent, target, drafted.result.reviewResult);
+        if (issues.length) {
           project = drafted.project;
           await applyProjectChange(project);
           setAgentDraft(drafted.result);
           setAgentDisplayContent(drafted.result.draftContent);
           setAgentDraftTitle(applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''));
-          await finishAgentRun(`第 ${number} 章字数未达自动采用范围，已保留草稿`);
-          stopReason = `第 ${number} 章正文 ${actual} 字（需 ${target}～${Math.floor(target * 1.2)} 字），草稿已保留，未自动采用`;
+          await finishAgentRun(`第 ${number} 章未通过自动采用检查，已保留草稿`);
+          stopReason = `第 ${number} 章未自动采用：${issues.join('；')}。草稿已保留`;
           break;
         }
         const applied = applyAgentDraft(drafted.project, inserted.chapter, drafted.result.draftContent, applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''), drafted.result.summary);
@@ -5864,16 +5864,15 @@ function App() {
           break;
         }
         const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
-        const actual = countNovelCharacters(drafted.result.draftContent);
-        // 字数未达目标或超过上限时原章保持不变，重写稿留在草稿面板
-        if (!isWithinChapterTarget(actual, target)) {
+        const issues = draftAcceptanceIssues(drafted.result.draftContent, target, drafted.result.reviewResult);
+        if (issues.length) {
           project = keepAnswers(drafted.project);
           await applyProjectChange(project);
           setAgentDraft(drafted.result);
           setAgentDisplayContent(drafted.result.draftContent);
           setAgentDraftTitle(applyDraftChapterTitle(chapter.title, drafted.result.chapterTitle || '', { overwrite: rewriteMode === 'redo' }));
-          await finishAgentRun(`第 ${number} 章重写稿字数未达自动采用范围，已保留草稿`);
-          stopReason = `第 ${number} 章重写稿 ${actual} 字（需 ${target}～${Math.floor(target * 1.2)} 字），草稿已保留，原稿未动`;
+          await finishAgentRun(`第 ${number} 章重写稿未通过自动采用检查，已保留草稿`);
+          stopReason = `第 ${number} 章未自动覆盖原稿：${issues.join('；')}。草稿已保留`;
           break;
         }
         // 保事件时章名照旧；从构思重来事件变了，章名跟着重写稿走
@@ -5906,10 +5905,17 @@ function App() {
     setNotice({ title: '重写旧章结束', content: `已重写 ${done}/${total} 章${stopReason ? `；${stopReason}` : ''}。每章旧稿都在章节历史里，可逐章回退。` });
   };
 
-  const acceptAgentDraft = () => {
+  const acceptAgentDraft = (force = false) => {
     if (!agentDraft?.draftContent) return;
     if (editingProject && activeChapter) {
       const draft = splitChapterTitleHeading(agentDraft.draftContent);
+      const target = Math.round(Number(editingProject.chapterTargetWords) || 3000);
+      const issues = draftAcceptanceIssues(draft.content, target, agentDraft.reviewResult);
+      if (issues.length && (!force || pendingDraftAcceptance?.projectId !== editingProject.id || pendingDraftAcceptance.chapterId !== activeChapter.id || pendingDraftAcceptance.content !== draft.content)) {
+        setPendingDraftAcceptance({ projectId: editingProject.id, chapterId: activeChapter.id, content: draft.content, issues });
+        return;
+      }
+      setPendingDraftAcceptance(null);
       // 标题栏里的值是作者看得见也改得动的那一个，优先级最高；
       // 它被清空才回退到正文开头剥下来的标题行与运行时给的章节名，且只补占位标题
       const draftTitle = agentDraftTitle.trim()
@@ -7507,7 +7513,7 @@ function App() {
               {editorSidebarTab === 'style' && (
                 <div className="project-style-panel">
                   <div className="panel-section-title">作品绑定文风 <span>{activeWritingStyle ? '已绑定' : '未绑定'}</span></div>
-                  <p className="project-style-hint">绑定后，章节智能体和大纲智能体都会自动带入这份文风 Skill。</p>
+                  <p className="project-style-hint">绑定后，章节智能体将它作为一份文风参考，不再重复加入技能。</p>
                   <label className="project-style-select" htmlFor="project-style-profile">
                     <span>当前文风</span>
                     <select id="project-style-profile" className="select" value={editingProject.styleProfileId || ''} onChange={event => bindStyleToCurrentProject(event.target.value)}>
@@ -7517,7 +7523,7 @@ function App() {
                   </label>
                   {activeWritingStyle ? <div className="project-style-summary"><strong>{activeWritingStyle.name}</strong><small>{activeWritingStyle.sourceBookId ? '拆书蒸馏' : '自定义'} · {activeWritingStyle.tags.slice(0, 4).join('、') || '未分类'}</small><p>{activeWritingStyle.description || '暂无说明'}</p></div>
                     : editingProject.styleProfileId ? <p className="empty-hint compact">绑定的文风已不在文风库里，写作时不带任何文风。重新选一份，或先去文风页新建。</p>
-                    : <p className="empty-hint compact">选择一份全局文风后，后续生成章节和大纲都会遵循它。</p>}
+                    : <p className="empty-hint compact">未绑定文风：章节创作按作品资料和作者指令写作。</p>}
                   <button className="btn-secondary project-style-manage-button" onClick={() => { setActiveTab('styles'); setStyleDraft(activeWritingStyle || writingStyles[0] || null); setEditingProject(null); }}>管理全局文风</button>
                   <div className="panel-section-title">作品默认技能 <span>{editingProject.defaultSkillNames?.length ? `${editingProject.defaultSkillNames.length} 项` : '未设置'}</span></div>
                   <p className="project-style-hint">写正文时每章必带，奠定全书写法；章纲、节拍或指令里出现技能标签时再自动追加对应技能，日常过渡章就只带这几项。只列写作与润色类技能。</p>
@@ -8211,7 +8217,7 @@ function App() {
                     ) : null}
                     <div className="agent-result-actions">
                       <button className="btn-secondary" onClick={() => { setAgentDraft(null); setAgentDraftTitle(''); }}>放弃</button>
-                      <button className="btn-primary" onClick={acceptAgentDraft}>接受并写入</button>
+                      <button className="btn-primary" onClick={() => acceptAgentDraft()}>接受并写入</button>
                     </div>
                   </section>
                 )}
@@ -9260,6 +9266,15 @@ function App() {
             <div className="writing-console-resize" role="separator" aria-label="调整面板大小" onPointerDown={startConsoleDrag('resize')} />
           </div>
         </div>}
+      {pendingDraftAcceptance && (
+        <div className="modal-overlay draft-acceptance-overlay" onClick={() => setPendingDraftAcceptance(null)}>
+          <div className="modal draft-acceptance-modal" role="dialog" aria-modal="true" aria-labelledby="draft-acceptance-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header"><h3 id="draft-acceptance-title">草稿未通过自动采用</h3><button className="modal-close" aria-label="关闭" onClick={() => setPendingDraftAcceptance(null)}><Icon name="x" size={16} /></button></div>
+            <div className="modal-body"><ul className="draft-acceptance-issues">{pendingDraftAcceptance.issues.map((issue, index) => <li key={index}>{issue}</li>)}</ul><p>仍要覆盖当前章节吗？原稿会存入章节历史。</p></div>
+            <div className="modal-footer"><button className="btn-secondary" onClick={() => void copyText(pendingDraftAcceptance.issues.join('\n'))}>复制问题</button><button className="btn-secondary" onClick={() => setPendingDraftAcceptance(null)}>取消</button><button className="btn-primary" onClick={() => acceptAgentDraft(true)}>仍要覆盖</button></div>
+          </div>
+        </div>
+      )}
       {showWritingStats && editingProject && (
         <div className="modal-overlay" onClick={() => setShowWritingStats(false)}>
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="stats-title" onClick={event => event.stopPropagation()}>

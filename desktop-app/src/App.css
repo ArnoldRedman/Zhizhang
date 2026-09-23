@@ -955,6 +955,13 @@ main {
   flex-direction: column;
 }
 
+/* 草稿异常留在应用内，问题文字可以选择和复制 */
+.draft-acceptance-overlay { z-index: 1200; }
+.draft-acceptance-modal { max-width: min(640px, calc(100vw - 32px)); }
+.draft-acceptance-issues { margin: 0 0 16px; padding-left: 20px; user-select: text; overflow-wrap: anywhere; }
+.draft-acceptance-issues li + li { margin-top: 10px; }
+.draft-acceptance-modal .modal-footer { display: flex; gap: 8px; justify-content: flex-end; }
+
 .new-project-modal {
   width: min(1080px, calc(100vw - 40px));
   max-width: none;

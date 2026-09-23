@@ -132,7 +132,7 @@ export const rollbackCardState = (card: KnowledgeCard, project: Project, chapter
 };
 
 export const buildChapterWriteContext = (input: ChapterWriteContextInput): ChapterWriteContext => {
-  const { project, chapter, writingStyle } = input;
+  const { project, chapter } = input;
   const chapterIndex = project.chapters.findIndex(item => item.id === chapter.id);
   const chapterNumber = chapterIndex + 1;
   const previousChapter = chapterIndex > 0 ? project.chapters[chapterIndex - 1] : undefined;
@@ -149,10 +149,7 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
     .filter(outline => outline.content.trim());
   const cards = effectiveCards(project, input.selectedCardIds, `${boundOutline?.content || ''}\n${(previousChapter?.content || '').slice(-8000)}\n${input.instruction}`)
     .map(card => historical ? rollbackCardState(card, project, chapterNumber) : card);
-  const skills = [
-    ...input.skills,
-    ...(writingStyle ? [{ name: `style-${writingStyle.id}`, category: 'write', description: writingStyle.description, tags: [...writingStyle.tags, '文风'], content: writingStyle.content }] : []),
-  ].map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content }));
+  const skills = input.skills.map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content }));
   return {
     boundOutline,
     params: {
@@ -170,7 +167,7 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
       chapterNumber,
       totalChapters: project.chapters.length,
       targetWords: Number(project.chapterTargetWords) || 3000,
-      instruction: writingStyle ? `${input.instruction}\n采用绑定文风 Skill「${writingStyle.name}」，只遵循抽象写作约束。` : input.instruction,
+      instruction: input.instruction,
       outlines: outlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content })),
       activeOutlineId: boundOutline?.id,
       outline: boundOutline?.content || '',

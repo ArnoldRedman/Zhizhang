@@ -89,6 +89,8 @@ export interface ChapterReviewInput {
   chapterPlan?: string;
   /** 上一章记忆里的"下一章承诺"：一致性视角查有没有兑现 */
   previousPromise?: string;
+  /** 上一章原文：摘要可能漏掉宣判、交付等不可逆结果 */
+  previousChapter?: { title: string; content: string };
   /** 本章作者的要求：作者明确让停在同一场景时，架构视角不判"没推进" */
   instruction?: string;
 }
@@ -119,26 +121,26 @@ const fanqieRubric = `| 指标 | PASS | FAIL |
 | 实质推进 | 本章改变了目标、风险、信息、关系、资源、身份、情绪立场中至少一项 | 读完这章世界和之前一样 |
 | 人物在做事 | 人物有想要的东西并为之行动 | 人物只在感受、沉默、旁观 |
 | 人物分得开 | 遮住名字也能认出每句台词是谁说的，同一场戏里各人反应不同 | 几个人说话一个腔调，对同一件事都沉默、都点头、都"没说话" |
-| 感情有戏 | 主角之间有一处具体的靠近、真话或只对对方做的动作 | 只推事务，关系原地不动（配角章、伏笔章记 PASS） |`;
+| 感情有戏 | 涉及主角关系的场景有可信的选择或交流；本章不涉及也可 PASS | 同一场戏里只剩无意义的点头、手指和物件，人物心意无法读懂 |`;
 
 const findingsSchema = `每条 finding 是 {"severity":"S1|S2|S3|S4","category":"...","location":"第几段或引用原句前十字","evidence":"引用原文","issue":"问题","fix":"怎么改"}。
 严重度：S1 破坏主线、人物动机、世界规则或读者信任；S2 明显影响本章效果、留存、节奏、人物可信度；S3 局部措辞或轻微节奏；S4 建议项。没有原文证据的不写。`;
 
 const perspectivePrompts: Record<ReviewPerspective, string> = {
   architect: `你是这本书的结构编辑，只出报告，不改正文。对照作品定位、总纲、故事账本和本章构思读这一章，回答：
-1. 本章改变了什么？目标、风险、信息、关系、资源、身份、情绪立场里至少变了一项吗？把账本里已发生的事重写一遍、或者整章停在上一章那个场景那件事里，advances 记 false，repeatedEvents 里写清重复了什么。作者要求本章留在同一场景时不算。
+1. 本章有没有发生前文没发生过的事？先对照紧邻上一章原文中的结果（如宣判、死亡、交付），再看账本；已经完成的结果不能退回待定状态，也不能再次发生。命中时记 S1，category 用 consistency，evidence 引本章原句。整章停在上一章那件事里时 advances 记 false、repeatedEvents 写出重复内容。作者要求留在同一场景时只允许继续处理未完成的部分。
 2. 读者为什么翻下一页？结尾落在动作、画面、台词还是总结、抒情、静止？
 3. 构思里安排的事发生了吗？漏了哪件？
-4. 感情线：主角之间这一章有没有实打实的推进（一次靠近、一句真话、一个只对对方做的动作）？只有事务往前走、关系原地不动的，记一条 S2，category 用 relationship；账本"感情线"一块已经写明停了两章以上而本章仍没推进的，记 S1。主角不出场的配角章、伏笔章不算。作品定位是言情、甜宠、日常向的，还要看有没有让读者想看两人在一起的段落。
+4. 只在人物确实面对彼此的场景检查关系是否可信；不能因为本章没有升温就判失败，不能建议添一处手部动作或物件互动凑指标。若几个人只会点头沉默、说话不像真人，用原句举证。
 5. 按下面八项逐项 PASS / FAIL。人物分得开一项 FAIL 时另记一条 S2，category 用 character，evidence 里并列引用两个人的台词。
 ${fanqieRubric}
-返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话：本章把故事推进到哪","relationshipProgress":"一句话：主角关系这一章走到哪，没推进就写'无'","repeatedEvents":[],"rubric":{"开头吸引力":"PASS","翻页动力":"PASS","情绪节点":"PASS","信息密度":"PASS","实质推进":"PASS","人物在做事":"PASS","人物分得开":"PASS","感情有戏":"PASS"},"findings":[]}。category 用 structure、platform、character 或 relationship。${findingsSchema}`,
+返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话：本章把故事推进到哪","relationshipProgress":"一句话：主角关系这一章走到哪，没推进就写'无'","repeatedEvents":[],"rubric":{"开头吸引力":"PASS","翻页动力":"PASS","情绪节点":"PASS","信息密度":"PASS","实质推进":"PASS","人物在做事":"PASS","人物分得开":"PASS","感情有戏":"PASS"},"findings":[]}。已完成事件被重写或退回待定时 category 用 consistency；其他问题用 structure、platform、character 或 relationship。${findingsSchema}`,
   character: `你是这本书的人物编辑，只出报告，不改正文。对照人物卡读这一章，回答：
 1. 每个出场人物按自己卡上的性格说话和做选择了吗？哪句话换个人说也成立？
-2. 人物之间分得开吗？把本章每个人的台词单独抽出来，遮住名字能不能认出是谁？两个人对同一件事的反应是不是一样的（都沉默、都点头、都"没说话"）？同一场戏里的人像同一个模板刻出来的，记 S2，evidence 里并列引用两个人的台词或反应。
+2. 人物之间分得开吗？遮住名字还认得出他们各自想要什么？如果人物只会沉默、点头、摸物件，要指出具体位置，不要建议加另一套微动作。
 3. 有谁一整章只在沉默、点头、"没问"、"淡淡地说"？他此刻想要什么、为什么不说？
 4. 对话有没有三种病：问答式（一句问一句答，没有情绪承接）、科普嘴（整段讲设定原理）、不分场合（高压时刻插科打诨）？
-5. 关系尺度和当前阶段匹配吗？有没有突然亲密、突然信任、突然翻脸？反过来，卡上写的"对他温柔""会脸红"这类感情表现，本章有机会写却一处没写的，也记下来。
+5. 关系尺度和当前阶段匹配吗？有没有突然亲密、突然信任、突然翻脸？本章没有关系进展本身不是错误。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","findings":[]}。category 用 character。${findingsSchema}`,
   prose: `你是这本书的文字编辑，只出报告，不改正文。读这一章，回答：
 1. 哪些句子是作者跳出来讲解、剧透、总结、定性（"之所以""原来""这意味着""她不知道的是""他终于明白"）？
@@ -148,17 +150,18 @@ ${fanqieRubric}
 5. AI 味整体分级：轻 / 中 / 重，给三处最重的证据。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","aiLevel":"轻|中|重","findings":[]}。category 用 prose 或 format。${findingsSchema}`,
   consistency: `你是这本书的一致性检查员，只查事实，不评文学，不给创作建议。对照世界观、人物卡、故事账本、知识图谱读这一章，回答：
-1. 人物属性、位置、已知信息有没有和前文矛盾？谁知道了不该知道的事？
-2. 时间线自洽吗？相对上一章过了多久，正文里有没有互相打架的时间标记？
-3. 物品归属、称谓、地点、能力边界有没有前后不一致？
-4. 上一章的"下一章承诺"兑现了吗？没兑现算不算断线？
-5. 本章留下哪些下一章必须接住的事（承诺、悬而未决的动作、刚出现的人物物件）？写进 nextChapterRisks。
+1. 直接对照紧邻上一章原文的已完成结果：已经宣判、交付、死亡或揭晓的事，不能在本章回到待定状态，也不能再次发生；命中时记 S1，category 用 consistency，evidence 引本章原句。
+2. 人物属性、位置、已知信息有没有和前文矛盾？谁知道了不该知道的事？
+3. 时间线自洽吗？相对上一章过了多久，正文里有没有互相打架的时间标记？
+4. 物品归属、称谓、地点、能力边界有没有前后不一致？
+5. 上一章的"下一章承诺"兑现了吗？没兑现算不算断线？
+6. 本章留下哪些下一章必须接住的事（承诺、悬而未决的动作、刚出现的人物物件）？写进 nextChapterRisks。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","nextChapterRisks":["一句一条"],"findings":[]}。category 用 consistency、factual 或 causal；fix 只写事实统一方向（"统一为左臂旧伤"），不写怎么写得更好。${findingsSchema}`,
   solo: `你是这本书的编辑，只出报告，不改正文。对照作品定位、世界观、人物卡、总纲、故事账本读这一章，回答五件事：
-一、推进：本章有没有发生前文没发生过的事？把账本里已发生的事重写一遍、或整章停在上一章那个场景，advances 记 false，repeatedEvents 里写清重复了什么。作者要求本章留在同一场景时不算。
+一、推进：先核对紧邻上一章原文中已完成的结果，再看账本。已经宣判、交付、死亡或揭晓的事不能回到待定状态或再次发生；命中时记 S1，category 用 consistency，evidence 引本章原句。整章重复前文则 advances 记 false、repeatedEvents 写清重复内容。留在同一场景可以，只能继续未完成的事。
 二、一致性：人物状态、已知信息、时间线、物品归属、称谓有没有和前文或设定矛盾？只列明确矛盾。
 三、人物：出场的人有没有按自己的性格说话和做选择？遮住名字能不能认出台词是谁说的？有谁一整章只在沉默、点头、"没问"？同一场戏里几个人反应一样的，记 S2，category 用 character。
-四、感情线：主角之间这一章有没有实打实的推进（一次靠近、一句真话、一个只对对方做的动作）？只推事务不推关系的记 S2，账本里感情线已停两章以上而本章仍没推进的记 S1，category 用 relationship；主角不出场的配角章、伏笔章不算。
+四、人物与关系：在本章实际出现的交锋中，人物有没有按自己的处境说话和做选择？只在有具体原句证据时指出人物像模板或交流不可信，不因关系没有每章升温而扣分，不建议用手部动作凑感情线。
 五、结尾：落在动作画面上，还是总结抒情？本章留下哪些下一章必须接住的事，写进 nextChapterRisks。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话","relationshipProgress":"一句话，没推进就写'无'","repeatedEvents":[],"nextChapterRisks":[],"findings":[]}。${findingsSchema}`,
 };
@@ -184,6 +187,7 @@ export function chapterReviewRequest(input: ChapterReviewInput, perspective: Rev
   const wantsCards = perspective !== "prose";
   const wantsGraph = perspective === "consistency" || perspective === "solo";
   const directionSection = wantsDirection ? [
+    input.previousChapter?.content ? `## 紧邻上一章原文（核对已经发生的结果）\n${compactText(input.previousChapter.content, 7500)}` : "",
     input.chapterBeat ? `## 本章节拍（阶段节拍表给本章定的事件）\n${compactText(input.chapterBeat, 1200)}` : "",
     input.masterOutline ? `## 总纲（含本章位置与本章条目）\n${compactText(input.masterOutline, masterOutlineBytes)}` : "",
     input.storyLedger ? `## 故事账本（前文已发生的事与长线伏笔）\n${compactText(input.storyLedger, storyLedgerBytes)}` : "",

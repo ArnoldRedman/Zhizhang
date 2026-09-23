@@ -117,13 +117,11 @@ test('前文只传紧邻上一章，记忆只取本章之前的章并带章号�
   assert.equal(first.params.outline, '');
 });
 
-test('绑定文风时追加成一条技能并写进指令；优先技能只保留目录里真有的', () => {
+test('绑定文风只走稳定资料，不再重复塞进技能和指令', () => {
   const style = { id: 's1', name: '冷峻', description: '短句', tags: ['冷峻'], content: '# 冷峻', createdAt: now, updatedAt: now };
   const context = buildChapterWriteContext({ project: project({ chapterTargetWords: undefined }), chapter: chapters[3], instruction: '继续写', skills: [skill('story-long-write')], preferredSkillNames: ['story-long-write', 'missing'], extraOutlineIds: [], selectedCardIds: [], writingStyle: style });
-  const skillNames = (context.params.skills as Array<{ name: string; tags: string[] }>);
-  assert.deepEqual(skillNames.map(item => item.name), ['story-long-write', 'style-s1']);
-  assert.ok(skillNames[1].tags.includes('文风'));
-  assert.ok(String(context.params.instruction).includes('冷峻'));
+  assert.deepEqual((context.params.skills as Array<{ name: string }>).map(item => item.name), ['story-long-write']);
+  assert.equal(context.params.instruction, '继续写');
   assert.deepEqual(context.params.preferredSkillNames, ['story-long-write']);
   assert.equal(context.params.targetWords, 3000);
 });

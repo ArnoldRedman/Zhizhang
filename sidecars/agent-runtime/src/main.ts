@@ -756,6 +756,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         chapterNumber: Number(chapterNumber) > 0 ? Number(chapterNumber) : undefined,
         totalChapters: Number(totalChapters) >= 0 ? Number(totalChapters) : undefined,
         previousPromise: typeof req.params?.previousPromise === "string" ? req.params.previousPromise : undefined,
+        previousChapter: prepared.previousChapters.at(-1),
         chapterPlan: prepared.outline,
       }, lintFindings);
       const usage = usages.reduce<Record<string, number>>((sum, item) => {

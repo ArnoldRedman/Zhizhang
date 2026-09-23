@@ -26,6 +26,7 @@ describe("chapter review", () => {
       retrievedContext: ["第178章记忆摘要"],
       chapterPlan: "本章沈妄第一次去城西纸坊。",
       previousPromise: "第 179 章要把试讲的结果告诉齐望鹤。",
+      previousChapter: { title: "第 178 章", content: "上一章法院已经宣判信托有效。" },
       cards: [{ title: "沈妄", content: "性格：克制。" }],
     };
     const architect = chapterReviewRequest(input, "architect").messages.map(message => message.content).join("\n");
@@ -34,11 +35,14 @@ describe("chapter review", () => {
     expect(architect).toContain("第178章失败样上桌");
     expect(architect).toContain("第一次去城西纸坊");
     expect(architect).toContain("开头吸引力");
+    expect(architect).toContain("上一章法院已经宣判信托有效");
+    expect(architect).toContain('category 用 consistency');
     expect(architect).toContain("待审查章节");
     expect(architect).not.toContain("沈妄 -> 姜冷月");
 
     const consistency = chapterReviewRequest(input, "consistency").messages.map(message => message.content).join("\n");
     expect(consistency).toContain("沈妄 -> 姜冷月");
+    expect(consistency).toContain("上一章法院已经宣判信托有效");
     expect(consistency).toContain("告诉齐望鹤");
     expect(consistency).toContain("nextChapterRisks");
     expect(consistency).not.toContain("开头吸引力");
@@ -46,6 +50,7 @@ describe("chapter review", () => {
     const prose = chapterReviewRequest(input, "prose").messages.map(message => message.content).join("\n");
     expect(prose).toContain("她把试印结论盖了章");
     expect(prose).not.toContain("第178章失败样上桌");
+    expect(prose).not.toContain("上一章法院已经宣判信托有效");
     expect(prose).not.toContain("性格：克制");
     expect(prose).toContain("aiLevel");
 

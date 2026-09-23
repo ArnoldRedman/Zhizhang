@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { draftAcceptanceIssues } from "@zhizhang/contracts";
 import { createChapterGraph, chapterDraftMaxTokens, needsStructuralRepair, splitAuthorNotes, splitDraftTitleLine } from "../src/graphs/chapter-write.graph.js";
 import { StoryStore } from "../src/storage/story-store.js";
 
-// 各阶段靠任务提示词里的固定句子认出来：构思阶段说"先想一想"，审查阶段带"待审查章节"，重写阶段带"上一版的问题"
+// 各阶段靠任务提示词里的固定句子认出来：构思阶段说"先想一想"，审查阶段带"待审查章节"
 const messagesOf = (init?: RequestInit) => JSON.stringify((JSON.parse(String(init?.body || "{}")) as Record<string, unknown>).messages || "");
 const ok = (content: string) => new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
   status: 200,
@@ -108,38 +109,81 @@ describe("chapter continuity context", () => {
     store.close();
   });
 
-  it("审查判定本章没推进时换一件事重写一次，不再把重复前文的稿子直接交给作者", async () => {
+  it("重复前文时自动换事件，只有修正版重新审查通过才采用", async () => {
     const requests: Array<Record<string, unknown>> = [];
+    let reviewCalls = 0;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
       const messages = messagesOf(init);
       if (messages.includes("先想一想")) return ok("离开值班室，第二天到城门口。");
-      if (messages.includes("待审查章节")) return ok(JSON.stringify({ consistent: true, issues: [], suggestions: [], advances: false, progress: "仍停在值班室门前", repeatedEvents: ["门内第三声敲击"] }));
-      if (messages.includes("上一版的问题")) return ok("出城\n\n第二天清晨，林砚已经站在城门口。");
+      if (messages.includes("待审查章节")) {
+        reviewCalls++;
+        return ok(reviewCalls <= 2
+          ? JSON.stringify({ advances: false, repeatedEvents: ["门内第三声敲击"], findings: [] })
+          : passReview);
+      }
+      if (messages.includes("上一版重演了前文")) return ok("出城\n\n第二天林砚走出城门。");
       return ok("第三声\n\n门外又响起了第三声敲击。");
     });
 
     const store = StoryStore.inMemory();
     store.createProject({ id: "repair-project", title: "重写测试" });
     const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
-    const result = await graph.invoke({
-      projectId: "repair-project",
-      chapterId: "13",
-      instruction: "继续写下一章",
-      masterOutline: "结构骨架：\n## 第一卷 交付失控\n## 第二卷 验证与转移",
-      previousChapters: [{ id: "12", title: "第 12 章", content: "白光锁住了林砚的右肩。" }],
-    });
+    const result = await graph.invoke({ projectId: "repair-project", chapterId: "13", instruction: "继续写下一章", targetWords: 10 });
 
-    expect(result.draftContent).toBe("第二天清晨，林砚已经站在城门口。");
-    expect(result.chapterTitle).toBe("出城");
-    const repairRequest = requests.find(body => JSON.stringify(body.messages || "").includes("上一版的问题"));
-    expect(repairRequest).toBeTruthy();
-    expect(JSON.stringify(repairRequest?.messages)).toContain("门内第三声敲击");
-    // 正文请求必须带上按目标字数算的输出预算，不能再用客户端那个按短回复定的 4000
-    expect(requests.some(body => Number(body.max_tokens) > 4000)).toBe(true);
-    // 重写后的稿子不该还挂着"没有推进"的旧结论
+    expect(result.draftContent).toBe("第二天林砚走出城门。");
+    expect(result.autoRepairRounds).toBe(1);
+    expect(result.reviewResult?.advances).toBe(true);
     expect(result.reviewResult?.repeatedEvents).toEqual([]);
-    expect(result.reviewResult?.suggestions.join("")).toContain("重写");
+    expect(draftAcceptanceIssues(result.draftContent || "", 10, result.reviewResult)).toEqual([]);
+    expect(reviewCalls).toBe(4);
+    expect(requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("上一版重演了前文"))).toHaveLength(1);
+    store.close();
+  });
+
+  it("短稿自动补场景后复审，合格才交给连续创作采用", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = messagesOf(init);
+      if (messages.includes("先想一想")) return ok("确认试印结果。");
+      if (messages.includes("待审查章节")) return ok(passReview);
+      if (messages.includes("本稿验收问题")) return ok("试印已经定了，林砚笑了。");
+      return ok("试印未定。");
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "short-project", title: "短稿测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({ projectId: "short-project", chapterId: "13", instruction: "继续写", targetWords: 10 });
+
+    expect(result.draftContent).toBe("试印已经定了，林砚笑了。");
+    expect(result.autoRepairRounds).toBe(1);
+    expect(draftAcceptanceIssues(result.draftContent || "", 10, result.reviewResult)).toEqual([]);
+    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(4);
+    expect(requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("本稿验收问题"))).toHaveLength(1);
+    store.close();
+  });
+
+  it("一致性审查截断但字数已明确不足时仍自动补稿，复审仍失败则不伪造通过", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
+      const messages = messagesOf(init);
+      if (messages.includes("先想一想")) return ok("确认试印结果。");
+      if (messages.includes("你是这本书的一致性检查员")) throw new Error("一致性审查截断");
+      if (messages.includes("待审查章节")) return ok(passReview);
+      if (messages.includes("本稿验收问题")) return ok("试印已经定了，林砚笑了。");
+      return ok("试印未定。");
+    });
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "partial-review", title: "审查中断测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({ projectId: "partial-review", chapterId: "13", instruction: "继续写", targetWords: 10 });
+
+    expect(result.autoRepairRounds).toBe(1);
+    expect(result.draftContent).toBe("试印已经定了，林砚笑了。");
+    expect(requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("本稿验收问题"))).toHaveLength(1);
+    expect(draftAcceptanceIssues(result.draftContent || "", 10, result.reviewResult).some(issue => issue.startsWith("审查未完成"))).toBe(true);
     store.close();
   });
 
@@ -150,8 +194,8 @@ describe("chapter continuity context", () => {
     expect(chapterDraftMaxTokens(200)).toBe(2000);
   });
 
-  // 审查只出报告：S2 及以下的一致性问题交给作者看，不自动改。每多一轮低温改写，人物的情绪和口语就被磨平一层
-  it("审查给出 S2 一致性问题时只出报告，正文原样交给作者", async () => {
+  // 事实没修好只尝试一次，第二次审查仍显示问题，不再死循环
+  it("S2 一致性问题修一次后仍存在就保留失败结论", async () => {
     const requests: Array<Record<string, unknown>> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
@@ -173,26 +217,24 @@ describe("chapter continuity context", () => {
     expect(result.draftContent).toBe("初稿：试印结论仍未定。");
     expect(result.reviewResult?.issues).toHaveLength(2);
     expect(result.reviewResult?.verdict).toBe("CONCERNS");
+    expect(draftAcceptanceIssues(result.draftContent || "", 0, result.reviewResult).length).toBeGreaterThan(0);
     expect(result.reviewResult?.revised).toBeUndefined();
-    expect(requests.some(body => JSON.stringify(body.messages || "").includes("按以下事实矛盾修订本章"))).toBe(false);
-    // lean 档两个视角各审一次，之后没有任何改写请求（测试桩不回流式，正文会多一次非流式兜底请求，所以不数总数）
-    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(2);
-    expect(requests.some(body => JSON.stringify(body.messages || "").includes("本次仅调整正文长度"))).toBe(false);
+    expect(result.autoRepairRounds).toBe(1);
+    expect(requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("本稿验收问题"))).toHaveLength(1);
+    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(4);
     store.close();
   });
 
-  // 一致性视角给出带原文证据的 S1 事实矛盾才自动改，且只改一次：修订稿再过验证门，但不再进审查，避免审改循环
-  it("一致性视角给出带证据的 S1 事实矛盾时定点修订一次，修订稿剥掉标题行，不再二次审查", async () => {
+  it("S1 事实矛盾也只出报告，不能让未经复审的修订稿覆盖首稿", async () => {
     const requests: Array<Record<string, unknown>> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
       const messages = messagesOf(init);
       if (messages.includes("先想一想")) return ok("回院交样。");
       if (messages.includes("你是这本书的一致性检查员")) return ok(JSON.stringify({ verdict: "REJECT", findings: [
-        { severity: "S1", category: "factual", location: "第 1 段", evidence: "试印结论仍未定", issue: "第 178 章刻坊已回话定了试印结论，本章又当未定处理", fix: "统一为已定" },
+        { severity: "S1", category: "factual", location: "第 1 段", evidence: "试印结论仍未定", issue: "第 178 章结论已定，本章又当未定处理", fix: "统一为已定" },
       ] }));
       if (messages.includes("待审查章节")) return ok(passReview);
-      if (messages.includes("按以下事实矛盾修订本章")) return ok("交样\n\n修订稿：试印结论已定，只等落印。");
       return ok("交样\n\n初稿：试印结论仍未定。");
     });
 
@@ -201,14 +243,9 @@ describe("chapter continuity context", () => {
     const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
     const result = await graph.invoke({ projectId: "fix-facts-project", chapterId: "179", instruction: "继续写本章" });
 
-    expect(result.draftContent).toBe("修订稿：试印结论已定，只等落印。");
-    expect(result.reviewResult?.revised).toBe(true);
-    expect(result.reviewResult?.suggestions.join("")).toContain("定点修订一次");
-    // 修订走流式调用；测试桩不回流式，会多一次非流式兜底请求，只数兜底那一次
-    const fixRequests = requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("按以下事实矛盾修订本章"));
-    expect(fixRequests).toHaveLength(1);
-    expect(JSON.stringify(fixRequests[0].messages)).toContain("原文：试印结论仍未定");
-    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(2);
+    expect(result.draftContent).toBe("初稿：试印结论仍未定。");
+    expect(result.reviewResult?.findings.some(item => item.severity === "S1" && item.category === "factual")).toBe(true);
+    expect(requests.some(body => JSON.stringify(body.messages || "").includes("按以下事实矛盾修订本章"))).toBe(false);
     store.close();
   });
 
