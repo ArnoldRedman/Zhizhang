@@ -4,7 +4,7 @@ import { StoryStore } from "../storage/story-store.js";
 import { ModelApiClient, type ApiUsage, type ApiWireMode, type ChatMessage } from "../models/model-api.js";
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, masterOutlineBytes, storyLedgerBytes, tailText, type ContextReport } from "../context/context-optimizer.js";
-import { hasBlocking, lintProse, normalizePauses, normalizeQuotes, type LintFinding, type QuoteStyle } from "@zhizhang/contracts";
+import { lintProse, normalizePauses, normalizeQuotes, type LintFinding, type QuoteStyle } from "@zhizhang/contracts";
 import { reviewUnavailable, type ChapterReviewResult, type ReviewMode } from "../application/chapter-review.js";
 import { perspectiveLabel, runChapterReview } from "../application/review-runner.js";
 import { chapterRevisePrompt, wholeChapterTokenBudget } from "../application/text-prompts.js";
@@ -50,10 +50,10 @@ const intentLabels: Record<string, string> = {
  * 具体怎么写交给模型和作者的资料。字节稳定，兼容的中转能复用前缀缓存
  */
 export const chapterAgentSystemPrompt = `你是这本书的作者。资料里有世界观、人物卡、总纲、前文记忆和上一章结尾，写作以它们为准；资料里没有的可以自己定，但不能和已有设定冲突。
-人物按各自的性格说话和做选择：每个人有想要的东西，也有拿不到的时候；情绪要写出来，不用沉默、"没问"、"淡淡地说"来代替。
-每个人物的说话方式、在意的东西、处理情绪的办法都不一样，一句台词遮住名字也能认出是谁说的；两个人在同一场戏里对同一件事的反应必须不同。
-事务和感情一起推进：主角之间的关系每章都要往前走一点，用具体的一句话、一个动作、一次让步或一次靠近写出来，不用"默契""信任加深"这类总结代替。
-拿不准或想和作者商量的事，写在输出末尾，每条单独一行，以「【给作者】」开头；作者会看到并回复你。`;
+人物按各自的性格说话和做选择：每个人有想要的东西，也有拿不到的时候；情绪用这个人会说的话和会做的事写出来。
+每个人物的说话方式、在意的东西、处理情绪的办法都不一样，一句台词遮住名字也能认出是谁说的。
+事务和感情一起写：人物关系跟着本章事件自然变化，有靠近，也可以有误解或停顿。
+只有和已有设定打架、或会改掉后面很多章走向的事，才在输出末尾用「【给作者】」一次问完。本章怎么写、词怎么用，自己定，不要问。`;
 
 /** 【给作者】行的识别：模型按系统提示词把疑问写在末尾，逐行剥出来单独交给界面 */
 const authorNoteLine = /^\s*[【\[]\s*给作者\s*[】\]]\s*[：:]?\s*(.*)$/u;
@@ -163,7 +163,7 @@ export function projectProfileSection(profile: ProjectProfile | undefined): stri
     profile.synopsis ? `简介：${compactText(profile.synopsis, 1400)}` : "",
   ].filter(Boolean);
   if (!lines.length) return "";
-  return `## 作品定位（这本书卖什么，每章都要兑现）\n${lines.join("\n")}`;
+  return `## 作品定位\n${lines.join("\n")}`;
 }
 
 export interface ProjectProfile {
@@ -426,7 +426,7 @@ function chapterDraftPrompts(state: ChapterStateType, contextWindowKTokens?: num
   const repairSection = repair
     ? `\n\n## 上一版的问题\n上一版被判定为又写了一遍前文：${repair.repeatedEvents.join("；") || "与上一章高度重复"}${repair.progress ? `；只推进到：${repair.progress}` : ""}。这一版换一件前文没发生过的事来写。`
     : "";
-  const taskPrompt = `## 作者的要求\n${state.instruction}${planSection}${repairSection}\n\n写${chapterLabel(state)}正文，约 ${targetWords} 字。第一行只写章名（不带"第几章"），空一行后是正文；只输出正文，不要解释或复述资料。`;
+  const taskPrompt = `## 作者的要求\n${state.instruction}${planSection}${repairSection}\n\n写${chapterLabel(state)}正文，约 ${targetWords} 字，不超过 ${Math.round(targetWords * 1.2)} 字。第一行只写章名（不带"第几章"），空一行后是正文；只输出正文，不要解释或复述资料。`;
   return {
     messages: [
       { role: "system", content: chapterAgentSystemPrompt },
@@ -448,6 +448,9 @@ function parseDraftResponse(raw: string): { title: string; content: string; auth
   const split = splitDraftTitleLine(notes.content);
   return { title: split.title, content: split.content, authorNotes: notes.authorNotes };
 }
+
+const structuralLintTypes = new Set(["truncated", "placeholder-leak", "verbatim-repeat", "meta-leak"]);
+export const needsStructuralRepair = (findings: LintFinding[]): boolean => findings.some(item => item.severity === "blocking" && structuralLintTypes.has(item.type));
 
 export function createChapterGraph(config: ChapterGraphConfig) {
   const store = config.store;
@@ -567,7 +570,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const session = splitSessionContext(state.sessionContext);
       // 构思阶段多看一份对标资料：情绪模块与节奏表，让模型挑这一章的情绪链
       const material = chapterMaterialPacket(state) + benchmarkPlanSection(state.benchmark);
-      const planInstruction = `## 作者的要求\n${state.instruction}\n\n先想一想${chapterLabel(state)}怎么写，四五百字，自由格式，但要写清这几样：这一章发生什么（一件前文没发生过的事，总纲或章纲有安排就按它）；读完这章什么变了（目标、风险、信息、关系、资源、身份、情绪立场里至少一项）；相对上一章过了多久、换没换地方；每个出场人物这一章想要什么、会怎么做、和别人怎么相处，以及这个人和别人不一样的地方在本章怎么显出来（说话的句式、在意的东西、处理情绪的办法，写一处只有这个人会做的选择）；感情线：主角之间这一章走到哪一步，比上一章多了什么，用哪个具体场面写出来（一次靠近、一句真话、一个只对对方做的动作），主角不出场的配角章或伏笔章可以写"本章不推进感情线"并说明原因；情绪从什么走到什么；按顺序列四到八个情节点，每个一句话；结尾停在哪个具体动作或画面上。不要写正文，不要把情节点写成成品句子。`;
+      const planInstruction = `## 作者的要求\n${state.instruction}\n\n先想一想${chapterLabel(state)}：按总纲、章纲和前文确定本章的新事件、人物动机与结尾落点。按事件需要安排场景，不凑情节点；只记需要承接的事实或作者需要决定的问题。不要写正文。`;
       const fallbackPlan = "按总纲和章纲写这一章该发生的事，承接上一章结尾后推进；人物按各自性格行动，结尾停在能继续发展的地方。";
       let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
       try {
@@ -596,7 +599,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.context("draft", "组装稳定设定与本章资料", { source: "ContextAssembler", status: "loaded", bytes: byteLength(prompts.dynamicPacket), items: state.selectedSkills.length + (state.cards?.length || 0) });
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes: prompts.draftInputBytes } : undefined;
       if (contextReport?.cache === "hit") emitter?.context("draft", "命中本地资料指纹缓存", { source: "持久化上下文缓存", status: "cached", bytes: prompts.draftInputBytes });
-      if (contextReport?.prunedBytes) emitter?.context("draft", "按上下文预算裁剪低相关资料", { source: "ContextOptimizer", status: "pruned", bytes: contextReport.prunedBytes });
+      if (contextReport?.prunedBytes) emitter?.context("draft", "已裁掉低相关资料", { source: "ContextOptimizer", status: "pruned", bytes: contextReport.prunedBytes });
 
       emitter?.progress("draft", 46, "已提交模型请求，正在生成正文");
       // 正文走纯文本：JSON 模式里写三千字中文，模型会把力气花在转义和格式上，温度也压不上去
@@ -612,7 +615,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         upstreamUsage: addUsage(state.upstreamUsage, response.usage),
       };
     })
-    // 本地验证门：不调模型，毫秒级。引号与停顿标点直接归一；blocking 句式交给一次定向修订；其余进报告
+    // 标点统一；句式只提示作者，截断、占位符等坏稿才自动修一次
     .addNode("gate", async (state: ChapterStateType) => {
       if (!state.draftContent) return {};
       const quoted = normalizeQuotes(state.draftContent, state.quoteStyle || "curly");
@@ -623,20 +626,20 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         recentOpenings: state.recentOpenings,
         recentEndings: state.recentEndings,
         allowedPhrases: state.allowedPhrases,
-      });
-      const blocking = lintFindings.filter(item => item.severity === "blocking");
+      }).map(item => item.severity === "blocking" && !structuralLintTypes.has(item.type) ? { ...item, severity: "advisory" as const } : item);
+      const structural = lintFindings.filter(item => item.severity === "blocking" && structuralLintTypes.has(item.type));
       const normalized = quoted.changes + paused.changes;
-      emitter?.progress("review", 72, `验证门：标点归一 ${normalized} 处；句式问题 ${blocking.length} 条须改，${lintFindings.length - blocking.length} 条提示`);
-      emitter?.context("review", "本地验证门", { source: "prose-lint", status: blocking.length ? "selected" : "loaded", items: lintFindings.length });
+      emitter?.progress("review", 72, `验证门：标点归一 ${normalized} 处；结构问题 ${structural.length} 条，其他提醒 ${lintFindings.length - structural.length} 条`);
+      emitter?.context("review", "本地验证门", { source: "prose-lint", status: structural.length ? "selected" : "loaded", items: lintFindings.length });
       return { draftContent: content, lintFindings };
     })
     // 定向修订：只把验证门点名的句子交给模型改，其余原样保留。每稿最多一次，改不干净就交给作者
     .addNode("fixLint", async (state: ChapterStateType) => {
-      const blocking = state.lintFindings.filter(item => item.severity === "blocking");
+      const blocking = state.lintFindings.filter(item => item.severity === "blocking" && structuralLintTypes.has(item.type));
       if (!state.draftContent || !blocking.length) return {};
       emitter?.progress("review", 74, `正在按验证门意见定向修订 ${blocking.length} 处`);
       const instruction = [
-        "只改下面点名的句子，其余一字不动；改法：删掉否定铺垫直接写后项、破折号按功能换成动作或逗号、章尾预告改成具体动作画面、复读的句子只留一处、截断处补完结尾：",
+        "只修复以下截断、复读、占位符或工程词泄漏；未点名的句子保持原样：",
         ...blocking.map((item, index) => `${index + 1}. 第 ${item.line} 行「${item.excerpt}」：${item.message}`),
       ].join("\n");
       const prompt = chapterRevisePrompt({ projectTitle: state.projectTitle, chapterTitle: state.chapterTitle, instruction, content: state.draftContent });
@@ -750,11 +753,12 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     .addEdge("intent", "retrieve")
     .addEdge("retrieve", "continuity")
     .addEdge("continuity", "plan")
-    .addEdge("plan", "draft")
+    // 构思里已经有问题：先问完再写，不要写完一章再为每个问题重写
+    .addConditionalEdges("plan", (state: ChapterStateType) => state.authorNotes?.length ? "ask" : "draft", { ask: "__end__", draft: "draft" })
     .addEdge("draft", "gate")
     // 验证门之后：有 blocking 且还没改过 → 定向修订再过一遍门；改过或干净 → 首稿进审查，修订稿直接结束
     .addConditionalEdges("gate", (state: ChapterStateType) => {
-      if (hasBlocking(state.lintFindings) && state.lintRounds === 0 && state.draftContent) return "fixLint";
+      if (needsStructuralRepair(state.lintFindings) && state.lintRounds === 0 && state.draftContent) return "fixLint";
       return state.phase === "draft" ? "review" : "done";
     }, { fixLint: "fixLint", review: "review", done: "__end__" })
     .addEdge("fixLint", "gate")

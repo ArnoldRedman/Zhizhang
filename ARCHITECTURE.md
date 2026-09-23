@@ -93,7 +93,7 @@ React 通过 `src/services/agent-client.ts` 调用 Agent RPC，通过 `native-cl
 - `rpc/library-handlers.ts`：书籍、榜单、拆书和文风相关 RPC。
 - `sources/library-service.ts`：Fanqie、千阅、其他书源和榜单抓取。
 
-章节写作仍由 `graphs/chapter-write.graph.ts` 编排：上下文准备、检索、承接、构思（一段自由格式的想法，含情节点与本章变化）、正文（纯文本，第一行章名）、本地验证门、审查。验证门（`packages/contracts` 的 `prose-lint` 与 `punctuation`，桌面端与运行时共用）不调模型：引号与停顿标点直接归一，blocking 句式交给一次只改被点名句子的定向修订，其余进报告。审查按项目设置分 full / lean / solo 三档，单模型串行跑结构、人物、文字、一致性几个视角（`application/chapter-review.ts` 与 `review-runner.ts`），只出报告；自动改只有两种：判定“又把前文写了一遍”时换一件事重写一次，一致性视角给出带原文证据的 S1 事实矛盾时定点修订一次。重写稿与修订稿再过一遍验证门，不再进审查。模型拿不准的事写成「【给作者】」行，运行时剥出来交给界面，连续创作时汇总进大纲页的“给作者｜待答”。项目绑定了做过全书聚合的拆书时（`book.aggregate`，`application/benchmark.ts`），构思看情绪模块与节奏表，正文只带一段同基调原文锚点。
+章节写作仍由 `graphs/chapter-write.graph.ts` 编排：上下文准备、检索、承接、构思（简短确定事件、人物动机和结尾）、正文（纯文本，第一行章名）、本地验证门、审查。验证门（`packages/contracts` 的 `prose-lint` 与 `punctuation`，桌面端与运行时共用）不调模型：引号与停顿标点直接归一，风格句式只作为 advisory 提示，只有截断、复读、占位符与工程词泄漏触发一次定向修订。审查按项目设置分 full / lean / solo 三档，单模型串行跑结构、人物、文字、一致性几个视角（`application/chapter-review.ts` 与 `review-runner.ts`），只出报告；自动改只有两种：判定“又把前文写了一遍”时换一件事重写一次，一致性视角给出带原文证据的 S1 事实矛盾时定点修订一次。重写稿与修订稿再过一遍验证门，不再进审查。模型拿不准的事写成「【给作者】」行，运行时剥出来交给界面，连续创作时汇总进大纲页的“给作者｜待答”。项目绑定了做过全书聚合的拆书时（`book.aggregate`，`application/benchmark.ts`），构思看情绪模块与节奏表，正文只带一段同基调原文锚点。
 
 ## 数据所有权
 

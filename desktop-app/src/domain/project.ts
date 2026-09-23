@@ -229,7 +229,7 @@ export interface Project {
   allowedPhrases?: string[];
   /** 作品默认技能：写正文时每章必带，按章纲匹配的技能在它之上追加；文风走 styleProfileId 单独绑定 */
   defaultSkillNames?: string[];
-  /** 单章 AI 率上限（本地启发式，百分比）：写完超过就对疑似段落去一次 AI 味；缺省 30 */
+  /** 单章 AI 率上限（本地启发式，百分比）：只展示，超过不改写；缺省 30 */
   maxAIRate?: number;
   /** 全部卡片状态最近一次按近期正文校准到第几章；再写满十章就自动刷一次，不分连续创作还是手写 */
   cardStatesRefreshedThrough?: number;

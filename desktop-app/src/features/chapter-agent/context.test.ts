@@ -90,6 +90,19 @@ test('章纲、总纲、世界观自动带入，其他章纲只在作者勾选�
   assert.deepEqual((context.params.cards as Array<{ id: number }>).map(item => item.id), [1]);
 });
 
+test('写法指南不作为世界观硬规则带进章节，事实设定照常带', () => {
+  const guide = { ...outline(12, '世界观与作品设定', '写作风格与反 AI 味规范'), content: '## 二、文风法则\n严禁直接写情绪。\n\n## 四、硬事实账本\n沈妄继承 45% 控股权。' };
+  const current = project({ outlines: [
+    outline(11, '世界观与作品设定', '都市现实规则'),
+    guide,
+  ] });
+  const context = buildChapterWriteContext({ project: current, chapter: chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  const included = context.params.outlines as Array<{ title: string; content: string }>;
+  assert.deepEqual(included.map(item => item.title), ['都市现实规则', guide.title]);
+  assert.ok(included[1].content.includes('沈妄继承 45% 控股权'));
+  assert.ok(!included[1].content.includes('严禁直接写情绪'));
+});
+
 test('前文只传紧邻上一章，记忆只取本章之前的章并带章号，文档带进度基准与四份聚合文档', () => {
   const context = buildChapterWriteContext({ project: project(), chapter: chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
   assert.deepEqual((context.params.previousChapters as Array<{ id: number }>).map(item => item.id), [2]);

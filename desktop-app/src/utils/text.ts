@@ -2,6 +2,9 @@ export function countNovelCharacters(content: string): number {
   return [...content.replace(/[\s\u200B-\u200D\uFEFF]/gu, '')].length;
 }
 
+/** 自动采用必须达到目标字数，且不越过界面显示的 1.2 倍上限 */
+export const isWithinChapterTarget = (actual: number, target: number): boolean => actual >= target && actual <= Math.floor(target * 1.2);
+
 /** 模型写在正文开头的章节标题行，以及剥掉标题行之后的纯正文 */
 export interface ChapterDraftHeading {
   title: string;

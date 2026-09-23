@@ -1,9 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { appendAgentSession, normalizeMemoryResult, renderAgentSession, type AgentSessionState } from "../src/application/runtime-state.js";
+import { appendAgentSession, normalizeMemoryResult, renderAgentSession, shouldUseChapterSession, type AgentSessionState } from "../src/application/runtime-state.js";
 
 const emptySession = (): AgentSessionState => ({ version: 1, summary: "", recentTurns: [] });
 
 describe("agent session", () => {
+  it("旧章和显式重写不用跨章节会话，新章仍可用", () => {
+    expect(shouldUseChapterSession(132, 204)).toBe(false);
+    expect(shouldUseChapterSession(204, 204, true)).toBe(false);
+    expect(shouldUseChapterSession(205, 204)).toBe(true);
+  });
+
   // 症状：一章写偏了反复重跑，每次都把模型自己的稿子当成“已确认结论”记一轮，
   // 下一轮就被自己的废稿带着继续偏。同一章重跑必须替换而不是堆叠
   it("同一章重跑只保留最新一轮，不堆叠废稿", () => {

@@ -1,7 +1,7 @@
 import type { Chapter, KnowledgeCard, OutlineDocument, Project } from '../../domain/project';
 import type { Skill } from '../../domain/skill';
 import type { DismantleAggregate, WritingStyle } from '../../domain/library';
-import { firstSentence, isWorkLogDocumentTitle, lastSentence } from '@zhizhang/contracts';
+import { firstSentence, isWorkLogDocumentTitle, lastSentence, writingGuideFacts } from '@zhizhang/contracts';
 import { buildMemoryDocuments, recentChapterMemories } from '../../domain/memory.ts';
 import { answeredAuthorQuestions } from '../../domain/outline.ts';
 import { cardSearchTermGroups } from '../../domain/cards.ts';
@@ -142,9 +142,11 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
   const memoryDocuments = historical ? buildMemoryDocuments(priorMemories) : project.memoryDocuments;
   const boundOutline = boundChapterOutlineFor(project, chapter);
   // 阶段节拍表不当普通章纲带：它单独走 stageBeats，运行时只取本章那一行
-  // 修订日志这类工作台账不是作品设定，写正文时不带；运行时还会再过滤一次，这里先不传省字节
+  // 工作台账不带；混合文风文档只取硬事实与考据，其他世界设定照常带
   const outlines = project.outlines.filter(outline => !outline.title.startsWith('阶段节拍｜') && !(outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title)) && (outline.kind === '世界观与作品设定' || outline.kind === '总纲'
-    || outline.id === boundOutline?.id || input.extraOutlineIds.includes(outline.id)));
+    || outline.id === boundOutline?.id || input.extraOutlineIds.includes(outline.id)))
+    .map(outline => outline.kind === '世界观与作品设定' ? { ...outline, content: writingGuideFacts(outline.title, outline.content) } : outline)
+    .filter(outline => outline.content.trim());
   const cards = effectiveCards(project, input.selectedCardIds, `${boundOutline?.content || ''}\n${(previousChapter?.content || '').slice(-8000)}\n${input.instruction}`)
     .map(card => historical ? rollbackCardState(card, project, chapterNumber) : card);
   const skills = [

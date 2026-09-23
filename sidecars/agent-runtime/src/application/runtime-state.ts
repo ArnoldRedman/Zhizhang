@@ -23,6 +23,10 @@ export const novelSessionCache = new LruCache<AgentSessionState>(128);
 export const outlineSessionCache = new LruCache<AgentSessionState>(96);
 export const cardSessionCache = new LruCache<AgentSessionState>(96);
 
+/** 旧章重写只取本章之前的作品资料，不继承后来章节或废稿的会话摘要 */
+export const shouldUseChapterSession = (chapterNumber?: number, totalChapters?: number, isolatedSession?: boolean): boolean =>
+  !isolatedSession && !(chapterNumber && totalChapters && chapterNumber < totalChapters);
+
 const SESSION_KEEP_TURNS = 2;
 
 export function normalizeAgentSession(value: unknown): AgentSessionState {

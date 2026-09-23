@@ -10,6 +10,16 @@ export type { LintContext, LintFinding, LintSeverity } from "./prose-lint.js";
  * 桌面端与运行时都按这一条过滤：一份 28KB 的《修订日志》曾每章都以"作者定的固定规则"身份进提示词
  */
 export const isWorkLogDocumentTitle = (title: unknown): boolean => /(修订|变更|更新)(日志|记录|台账|历史)|评审意见|审稿|问题台账|changelog|revision/iu.test(String(title || ""));
+/** 写法指南由绑定文风承载，不能作为世界观硬规则每章重复灌入 */
+export const isWritingGuideDocumentTitle = (title: unknown): boolean => /写作风格|文风|反\s*AI\s*味|去\s*AI\s*味|写作规范/iu.test(String(title || ""));
+/** 混合文档里的硬事实仍是设定，只有文风/节拍/禁词不应进入正文 */
+export const writingGuideFacts = (title: unknown, content: string): string => {
+  if (!isWritingGuideDocumentTitle(title)) return content;
+  const sections = content.split(/(?=^##\s+)/gmu);
+  return sections.filter(section => /^##\s+.*(?:硬事实|考据|设定事实|世界规则)/mu.test(section.split("\n", 1)[0] || ""))
+    .map(section => section.replace(/^(##[^\n]*\n)(?:\s*\n)?[^\n]*(?:严禁|必须)[^\n]*\n/u, "$1"))
+    .join("\n\n").trim();
+};
 export { detectQuoteStyle, normalizePauses, normalizeQuotes } from "./punctuation.js";
 export type { PunctuationReport, QuoteStyle } from "./punctuation.js";
 

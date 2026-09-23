@@ -389,7 +389,7 @@ describe("story ledger promise and author truth", () => {
 });
 
 describe("buildStoryLedger · 感情线", () => {
-  it("单列最近一次人物关系状态，并写明之后停了几章", () => {
+  it("只带最近一次关系状态，不把几章没推进写成创作命令", () => {
     const memories = [
       { chapterNumber: 200, title: "第 200 章", summary: "选址。", relationshipState: ["沈妄与姜冷月：她替他挡掉话筒线，他没躲。"] },
       { chapterNumber: 201, title: "第 201 章", summary: "看纸坊。" },
@@ -397,16 +397,13 @@ describe("buildStoryLedger · 感情线", () => {
       { chapterNumber: 203, title: "第 203 章", summary: "编号争执。" },
     ];
     const ledger = buildStoryLedger(memories, { number: 204, total: 203 }, 4000);
-    expect(ledger).toContain("感情线（第 200 章时的人物关系与情绪");
+    expect(ledger).toContain("近期人物关系记录（第 200 章时）");
     expect(ledger).toContain("她替他挡掉话筒线");
-    expect(ledger).toContain("之后 3 章没有关系变化，感情线停在这里");
-    // 上一章刚有变化：只提"接着往前走"，不报停
+    expect(ledger).not.toContain("本章要有一处实打实的推进");
     const fresh = buildStoryLedger([...memories, { chapterNumber: 204, title: "第 204 章", summary: "拆信。", relationshipState: ["他当着她拆了信。"] }], { number: 205, total: 204 }, 4000);
-    expect(fresh).toContain("第 204 章时的人物关系");
-    expect(fresh).not.toContain("感情线停在这里");
-    // 最近几章一条关系记录都没有：直接说停了
+    expect(fresh).toContain("近期人物关系记录（第 204 章时）");
     const none = buildStoryLedger(memories.map(memory => ({ ...memory, relationshipState: [] })), { number: 204, total: 203 }, 4000);
-    expect(none).toContain("都没有人物关系变化，感情线已经停了");
+    expect(none).not.toContain("近期人物关系记录");
   });
 });
 
@@ -426,12 +423,16 @@ describe("世界观文档与卡片的裁法", () => {
       outlines: [
         { id: 1, kind: "世界观与作品设定", title: "修订日志", content: "## 2026-08-23 第 9 次修订\n旧书名改掉了。" },
         { id: 2, kind: "世界观与作品设定", title: "都市现实规则", content: "- 手机要充电。" },
+        { id: 3, kind: "世界观与作品设定", title: "写作风格与反 AI 味规范", content: "## 二、文风法则\n严禁直接写情绪。\n\n## 四、硬事实账本\n沈妄继承 45% 控股权。\n\n## 七、禁词表\n每章必须写微动作。" },
       ],
       contextWindowKTokens: 128,
       chapterPosition: { number: 205, total: 205 },
     });
     expect(prepared.worldSetting).toContain("手机要充电");
     expect(prepared.worldSetting).not.toContain("旧书名改掉了");
+    expect(prepared.worldSetting).not.toContain("严禁直接写情绪");
+    expect(prepared.worldSetting).not.toContain("每章必须写微动作");
+    expect(prepared.worldSetting).toContain("沈妄继承 45% 控股权");
   });
 
   it("卡片按小节裁：先丢项目职责与状态快照，再丢非核心小节，性格与关系整段保留", () => {

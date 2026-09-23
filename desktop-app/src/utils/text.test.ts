@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  countNovelCharacters,
+  isWithinChapterTarget,
   splitChapterTitleHeading,
   stripChapterNumberPrefix,
   applyDraftChapterTitle,
@@ -11,6 +13,14 @@ import {
   formatNovelForPlatform,
   combineContentAndAuthorNote,
 } from './text.ts';
+
+test('自动采用只接受目标字数到 1.2 倍上限，按正文实际字数计算', () => {
+  assert.equal(countNovelCharacters('正文  两字'), 4);
+  assert.equal(isWithinChapterTarget(1994, 2200), false);
+  assert.equal(isWithinChapterTarget(2200, 2200), true);
+  assert.equal(isWithinChapterTarget(2640, 2200), true);
+  assert.equal(isWithinChapterTarget(4002, 2200), false);
+});
 
 test('章节草稿标题：正文开头的 # 标题被剥出来，重复标题行只取第一行', () => {
   const split = splitChapterTitleHeading('# 第 151 章 黑暗中的后退\n# 第 151 章 黑暗中的后退\n\n林砚僵在门前。');

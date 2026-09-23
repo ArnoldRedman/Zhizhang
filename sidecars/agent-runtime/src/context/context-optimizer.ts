@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isWorkLogDocumentTitle } from "@zhizhang/contracts";
+import { isWorkLogDocumentTitle, writingGuideFacts } from "@zhizhang/contracts";
 
 export interface ContextReport {
   cache: "hit" | "miss";
@@ -947,11 +947,7 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
   return [header, gapNote, olderBlock, eventsBlock, promiseBlock, relationshipBlock(ordered), foreshadowingBlock, truthBlock].filter(Boolean).join("\n\n");
 }
 
-/**
- * 感情线单列一块：最近一次有记录的人物关系状态，加上已经连续几章没写关系变化
- * 事件行里的"（人物：…）"夹在摘要中间，模型读账本时看不出感情线已经断了多久；
- * 实测一本书第 201～204 章 relationshipState 全空，正文越写越像工作日志，这一块就是让构思阶段看见"该发糖了"
- */
+/** 感情线只记录最近一次已确认的关系状态，不要求每章都发生变化 */
 function relationshipBlock(ordered: Array<Record<string, unknown>>): string {
   const recent = ordered.slice(-8);
   let lastIndex = -1;
@@ -961,13 +957,10 @@ function relationshipBlock(ordered: Array<Record<string, unknown>>): string {
       break;
     }
   }
-  if (lastIndex < 0) return recent.length >= 2 ? `感情线：最近 ${recent.length} 章的记忆里都没有人物关系变化，感情线已经停了，本章要有一处实打实的推进。` : "";
+  if (lastIndex < 0) return "";
   const latest = recent[lastIndex];
-  // 感情线那几行整条带：它是本章要往前推的起点，裁成"她记录地址、把关流…[裁剪]…无新摩擦"等于没给
   const lines = leadList(latest.relationshipState, 4, 400).map(text => `- ${text}`);
-  const stalled = recent.length - 1 - lastIndex;
-  const stallNote = stalled >= 2 ? `\n之后 ${stalled} 章没有关系变化，感情线停在这里，本章要有一处实打实的推进。` : stalled === 1 ? "\n上一章没有关系变化，本章接着往前走。" : "";
-  return `感情线（${chapterLabel(latest)}时的人物关系与情绪，本章从这里往前推）：\n${lines.join("\n")}${stallNote}`;
+  return `近期人物关系记录（${chapterLabel(latest)}时）：\n${lines.join("\n")}`;
 }
 
 /**
@@ -1038,7 +1031,9 @@ export function prepareChapterInput(input: {
   // Canon is fixed by the author and must stay outside relevance sorting so it
   // remains a stable upstream prompt-cache prefix across chapter requests.
   const worldSetting = allOutlines
-    .filter(item => item.kind === "世界观与作品设定" && String(item.content || "").trim() && !isWorkLogDocument(item.title))
+    .filter(item => item.kind === "世界观与作品设定" && !isWorkLogDocument(item.title))
+    .map(item => ({ ...item, content: writingGuideFacts(item.title, String(item.content || "")) }))
+    .filter(item => item.content.trim())
     .sort((left, right) => String(left.id ?? left.title ?? "").localeCompare(String(right.id ?? right.title ?? ""), "zh-CN"))
     .map(item => `## ${compactText(item.title || item.kind || "世界观与作品设定", 80)}\n${compactText(stripProgressSnapshots(String(item.content)), worldSettingDocumentBytes(input.contextWindowKTokens))}`)
     .join("\n\n");

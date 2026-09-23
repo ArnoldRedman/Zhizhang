@@ -245,6 +245,8 @@ pub async fn call_agent_rpc(app: tauri::AppHandle, state: State<'_, AgentRuntime
 
 fn agent_runtime_script() -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
+    #[cfg(debug_assertions)]
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sidecars/agent-runtime/dist/main.js"));
     if let Some(path) = bundled_agent_resource("main.cjs") {
         candidates.push(path);
     }

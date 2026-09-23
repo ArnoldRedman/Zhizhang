@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createChapterGraph, chapterDraftMaxTokens, splitAuthorNotes, splitDraftTitleLine } from "../src/graphs/chapter-write.graph.js";
+import { createChapterGraph, chapterDraftMaxTokens, needsStructuralRepair, splitAuthorNotes, splitDraftTitleLine } from "../src/graphs/chapter-write.graph.js";
 import { StoryStore } from "../src/storage/story-store.js";
 
 // 各阶段靠任务提示词里的固定句子认出来：构思阶段说"先想一想"，审查阶段带"待审查章节"，重写阶段带"上一版的问题"
@@ -11,6 +11,11 @@ const ok = (content: string) => new Response(JSON.stringify({ model: "test-model
 const passReview = JSON.stringify({ consistent: true, issues: [], suggestions: [] });
 
 describe("chapter continuity context", () => {
+  it("风格扫描只提示，不再自动重写；截断和复读仍需修复", () => {
+    expect(needsStructuralRepair([{ type: "negation-parade", severity: "blocking", line: 1, column: 1, excerpt: "没问，没说", message: "" }])).toBe(false);
+    expect(needsStructuralRepair([{ type: "truncated", severity: "blocking", line: 1, column: 1, excerpt: "未完", message: "" }])).toBe(true);
+  });
+
   afterEach(() => vi.restoreAllMocks());
 
   // 模型偶尔仍按旧习惯把正文包成 {content, title}，或者在正文开头补标题行；两种都要拆干净
@@ -74,20 +79,13 @@ describe("chapter continuity context", () => {
     const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
     const result = await graph.invoke({ projectId: "plain-project", chapterId: "204", chapterNumber: 204, instruction: "写下一章", targetWords: 2200 });
 
-    expect(result.chapterTitle).toBe("越过书房门槛");
-    expect(result.draftContent).toBe("清晨，梧桐路601。\n\n沈妄把案角那摞信札码齐。");
-    expect(result.draftContent).not.toContain("给作者");
+    expect(result.draftContent || "").toBe("");
     expect(result.authorNotes).toEqual([
       "姜冷月是否知道体检结果，资料里没写，我按不知道处理。",
-      "越洋信的寄信人资料里没有，我留成待揭示。",
-      "周伯是否住在601？",
     ]);
-    // 正文请求走纯文本、高温度，任务里说清写第几章、约多少字
+    // 构思阶段问了作者，正文还没写
     const draftRequest = requests.find(body => JSON.stringify(body.messages || "").includes("写第 204 章正文"));
-    expect(draftRequest).toBeTruthy();
-    expect(draftRequest?.response_format).toBeUndefined();
-    expect(Number(draftRequest?.temperature)).toBeGreaterThan(0.8);
-    expect(JSON.stringify(draftRequest?.messages)).toContain("约 2200 字");
+    expect(draftRequest).toBeFalsy();
     store.close();
   });
 
@@ -214,16 +212,14 @@ describe("chapter continuity context", () => {
     store.close();
   });
 
-  // 验证门是本地规则：blocking 句式只交给模型改一次，改不干净就带着问题交给作者，不陷入改写循环
-  it("验证门命中 blocking 句式时定向修订一次；修订稿剥标题行再过门，改不净不再改", async () => {
+  // 风格句式只提示作者，不再因为一句“不是 A 而是 B”整章重新生成
+  it("验证门的句式提醒不触发自动修订，首稿原样交给作者", async () => {
     const requests: Array<Record<string, unknown>> = [];
-    let lintFix = "交样\n\n他绝望了。门开了。";
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
       const messages = messagesOf(init);
       if (messages.includes("先想一想")) return ok("回院交样。");
       if (messages.includes("待审查章节")) return ok(passReview);
-      if (messages.includes("只改下面点名的句子")) return ok(lintFix);
       return ok("交样\n\n他不是冷漠，而是绝望——门开了。");
     });
 
@@ -232,24 +228,11 @@ describe("chapter continuity context", () => {
     const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
     const result = await graph.invoke({ projectId: "lint-project", chapterId: "3", instruction: "继续写本章" });
 
-    expect(result.draftContent).toBe("他绝望了。门开了。");
-    expect(result.lintFindings).toEqual([]);
-    const fixRequests = requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("只改下面点名的句子"));
-    expect(fixRequests).toHaveLength(1);
-    expect(JSON.stringify(fixRequests[0].messages)).toContain("不是冷漠，而是绝望");
-    // 修订稿在验证门之后才进审查：审到的是改过的正文
-    const reviewRequest = requests.find(body => JSON.stringify(body.messages || "").includes("待审查章节"));
-    expect(JSON.stringify(reviewRequest?.messages)).toContain("他绝望了。门开了。");
-
-    // 改不净：仍有 blocking，但只改这一次，问题留在报告里
-    requests.length = 0;
-    lintFix = "交样\n\n他不是冷漠，而是绝望。门开了。";
-    store.createProject({ id: "lint-project-2", title: "验证门测试" });
-    const stubborn = await graph.invoke({ projectId: "lint-project-2", chapterId: "4", instruction: "继续写本章" });
-    expect(stubborn.draftContent).toBe("他不是冷漠，而是绝望。门开了。");
-    expect(stubborn.lintFindings.map(item => item.type)).toEqual(["not-is-comparison"]);
-    expect(requests.filter(body => !body.stream && JSON.stringify(body.messages || "").includes("只改下面点名的句子"))).toHaveLength(1);
-    expect(stubborn.reviewResult?.suggestions.join("")).toContain("not-is-comparison");
+    expect(result.draftContent).toBe("他不是冷漠，而是绝望，门开了。");
+    expect(result.lintFindings.map(item => item.type)).toContain("not-is-comparison");
+    expect(result.lintFindings.find(item => item.type === "not-is-comparison")?.severity).toBe("advisory");
+    expect(requests.filter(body => JSON.stringify(body.messages || "").includes("只修复以下截断"))).toHaveLength(0);
+    expect(JSON.stringify(requests.find(body => JSON.stringify(body.messages || "").includes("待审查章节"))?.messages)).toContain("他不是冷漠，而是绝望，门开了。");
     store.close();
   });
 

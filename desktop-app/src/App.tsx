@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ChangeEvent
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
-import { detectQuoteStyle, isWorkLogDocumentTitle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
+import { detectQuoteStyle, isWorkLogDocumentTitle, isWritingGuideDocumentTitle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, writingGuideFacts, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
@@ -35,6 +35,7 @@ import './App.css';
 import { builtinSkills } from './data/builtin-skills';
 import {
   countNovelCharacters,
+  isWithinChapterTarget,
   stripChapterNumberPrefix,
   splitChapterTitleHeading,
   applyDraftChapterTitle,
@@ -4812,12 +4813,26 @@ function App() {
     setNotice({ title: '已恢复历史版本', content: '当前版本已存为新快照，不满意可以再换回来。' });
   };
 
-  /** 答复模型的提问：写进项目，之后每章的提示词都带"作者已答复" */
-  const submitAuthorAnswer = (id: string) => {
-    const answer = (questionDrafts[id] || '').trim();
-    if (!editingProject || !answer) return;
-    updateEditorProject(project => answerAuthorQuestion(project, id, answer));
-    setQuestionDrafts(current => { const next = { ...current }; delete next[id]; return next; });
+  /** 左边待答一次提交：能填的都记下，涉及的章只写一遍。单个答复不触发重写 */
+  const submitAnsweredQuestions = () => {
+    if (!editingProject) return;
+    const pending = (editingProject.authorQuestions || []).filter(item => !item.answer.trim() && (questionDrafts[item.id] || '').trim());
+    if (!pending.length) return;
+    let next = editingProject;
+    for (const item of pending) next = answerAuthorQuestion(next, item.id, questionDrafts[item.id].trim());
+    setEditingProject(next);
+    setQuestionDrafts(current => {
+      const draft = { ...current };
+      for (const item of pending) delete draft[item.id];
+      return draft;
+    });
+    const chapters = [...new Set(pending.map(item => item.chapterNumber))].sort((left, right) => left - right);
+    if (chapterRewrite || agentRunning(agentStage) || continuousWriting) {
+      setNotice({ title: '答复已记下', content: '当前这轮还在跑，停了之后再点一次「答完，写一次」。' });
+      return;
+    }
+    setNotice({ title: '开始写', content: chapters.length === 1 ? `第 ${chapters[0]} 章按这些答复写一次。` : `按答复依次写第 ${chapters.join('、')} 章，每章一次。` });
+    void runChapterRewrite(chapters[0], chapters.slice(1));
   };
 
   /**
@@ -4849,7 +4864,7 @@ function App() {
         instruction: `「${title}」在第 ${chapters.join('、')} 章出现过，为它建一张${type}。只写正文片段里能证实的信息，写不到的标"待揭示"，不要编造。`,
         chapterTitle: latest?.title,
         chapterContent: candidateExcerpts(project, candidate),
-        outlines: project.outlines.filter(item => item.kind === '世界观与作品设定' && !isWorkLogDocumentTitle(item.title)).slice(0, 2).map(outline => ({ kind: outline.kind, content: outline.content })),
+        outlines: project.outlines.filter(item => item.kind === '世界观与作品设定' && !isWorkLogDocumentTitle(item.title)).map(outline => ({ kind: outline.kind, content: writingGuideFacts(outline.title, outline.content) })).filter(outline => outline.content.trim()).slice(0, 2),
         cards: project.cards.slice(-8),
         apiKey: agentConfig.apiKey.trim(),
         baseURL: agentConfig.baseURL.trim(),
@@ -4949,7 +4964,8 @@ function App() {
         knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
         worldSetting: project.outlines
           .filter(item => item.kind === '世界观与作品设定' && item.content.trim() && !isWorkLogDocumentTitle(item.title))
-          .map(item => ({ id: item.id, title: item.title, content: item.content })),
+          .map(item => ({ id: item.id, title: item.title, content: writingGuideFacts(item.title, item.content) }))
+          .filter(item => item.content.trim()),
         // 总纲原文和目标章之前的记忆：章纲不能只看上一章正文，得知道本章在全书哪一段、前文写过什么
         masterOutline: project.outlines.filter(item => item.kind === '总纲' && item.content.trim()).map(item => item.content).join('\n\n'),
         recentMemories: recentChapterMemories(
@@ -5237,7 +5253,7 @@ function App() {
    * 请求章节智能体写一章：本章没有章纲就先自动生成并绑定，再组装资料调 chapter.write
    * 单次运行与连续创作共用；返回带上新章纲的项目与已剥好标题的草稿，界面状态怎么落由调用方决定
    */
-  const requestChapterDraft = async (sourceProject: Project, chapter: Chapter, runId: string, options: { instruction?: string; skipOutline?: boolean; discardOutline?: boolean } = {}): Promise<{ project: Project; result: AgentDraftResult }> => {
+  const requestChapterDraft = async (sourceProject: Project, chapter: Chapter, runId: string, options: { instruction?: string; skipOutline?: boolean; discardOutline?: boolean; isolatedSession?: boolean } = {}): Promise<{ project: Project; result: AgentDraftResult }> => {
     activeAgentRunRef.current = runId;
     setAgentError('');
     setAgentDraft(null);
@@ -5285,6 +5301,7 @@ function App() {
     const result = await agentRpc<AgentDraftResult>('chapter.write', {
         runId,
         sessionId: chapterSessionId,
+        isolatedSession: options.isolatedSession,
         ...chapterContext.params,
         apiKey: agentConfig.apiKey.trim(),
         baseURL: agentConfig.baseURL.trim(),
@@ -5300,57 +5317,18 @@ function App() {
     // 运行时已经在图里拆过一次，这里再兜一次——非流式回退或模型二次补标题时也能拿到章节名
     const draft = splitChapterTitleHeading(chapterDraftFromStream(result.draftContent || ''));
     // 运行时的信封 title 优先（它已做过清洗和命名兵底），非流式回退时才用正文开头剥下来的那行
-    const gated = await gateAIRate(project, chapter, draft.content, runId);
+    const gated = await gateAIRate(project, chapter, draft.content);
     return { project, result: { ...result, draftContent: gated.content, chapterTitle: result.chapterTitle || draft.title, aiRate: gated.aiRate, aiRateBefore: gated.before, aiRateLimit: gated.limit } };
   };
 
   /**
-   * AI 率门：本地启发式算一遍，超过项目上限就只对"疑似 AI"段落去一次 AI 味（走批注那条只改一段的路），再算一遍
-   * 不整章重写：整章低温改写会把人物磨平；也只改一轮，改不下去就把数字带给作者
+   * 本地启发式 AI 率：只测量并展示，不改写
+   * 这个分数奖句长不齐和「咋、啊、呢」。拿它去改段落，模型会写成「没说话」「嗯」，分数还可能更高
    */
-  const gateAIRate = async (project: Project, chapter: Chapter, content: string, runId: string): Promise<{ content: string; aiRate: number; before: number; limit: number }> => {
+  const gateAIRate = async (project: Project, chapter: Chapter, content: string): Promise<{ content: string; aiRate: number; before: number; limit: number }> => {
     const limit = Math.max(1, Math.min(100, Number(project.maxAIRate) || 30));
-    const measure = (text: string) => analyzeAIChapter({ ...chapter, content: text });
-    const first = measure(content);
-    if (!content.trim() || first.aiRate <= limit) return { content, aiRate: first.aiRate, before: first.aiRate, limit };
-    const suspects = first.segments.filter(segment => segment.label !== '人工' && segment.text.trim().length >= 40);
-    if (!suspects.length) return { content, aiRate: first.aiRate, before: first.aiRate, limit };
-    const message = `AI 率 ${first.aiRate}% 超过上限 ${limit}%，正在对 ${suspects.length} 段疑似段落去 AI 味`;
-    setAgentProgress(items => items.map(item => item.id === 'review' ? { ...item, status: 'active', progress: Math.max(item.progress, 96), message } : item));
-    setAgentProgressMessage(message);
-    let next = content;
-    for (const segment of suspects) {
-      const paragraph = segment.text.trim();
-      const start = next.indexOf(paragraph);
-      if (start < 0) continue;
-      const cards = project.cards.filter(card => cardSearchTerms(card).some(term => paragraph.includes(term))).slice(0, 4).map(card => ({ title: card.title, content: card.content }));
-      try {
-        const result = await agentRpc<{ content?: string }>('text.transform', {
-          mode: 'annotate',
-          content: paragraph,
-          notes: ['这段读起来像机器写的：句子长短太齐、连接词太多、没有口语。保持事件、人物和信息不变，换成这个人物自己会说会做的写法，句子长短错开，删掉解释腔'],
-          before: next.slice(Math.max(0, start - 400), start).trim(),
-          after: next.slice(start + paragraph.length, start + paragraph.length + 400).trim(),
-          cards,
-          projectTitle: project.title,
-          chapterTitle: chapter.title,
-          runId: `${runId}:deai`,
-          apiKey: agentConfig.apiKey.trim(),
-          baseURL: agentConfig.baseURL.trim(),
-          model: agentConfig.model.trim() || fallbackModels[0],
-          apiMode: agentConfig.apiMode,
-          reasoningMode: agentConfig.reasoningMode,
-          contextWindow: agentConfig.contextWindow,
-          ...agentNetworkParams(agentConfig),
-        });
-        const revised = result.content?.trim();
-        if (revised) next = `${next.slice(0, start)}${revised}${next.slice(start + paragraph.length)}`;
-      } catch {
-        // 一段改失败就跳过：AI 率门是加分项，不能因为它让整章白跑
-      }
-    }
-    const after = measure(next);
-    return { content: next, aiRate: after.aiRate, before: first.aiRate, limit };
+    const aiRate = content.trim() ? analyzeAIChapter({ ...chapter, content }).aiRate : 0;
+    return { content, aiRate, before: aiRate, limit };
   };
 
   // 一次运行收尾：停掉打字机、同步用量、把进度条推到 100%
@@ -5387,7 +5365,13 @@ function App() {
     }
     const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
-      const { result } = await requestChapterDraft(editingProject, activeChapter, runId);
+      const { project, result } = await requestChapterDraft(editingProject, activeChapter, runId);
+      if (!result.draftContent?.trim() && result.authorNotes?.length) {
+        const number = project.chapters.findIndex(item => item.id === activeChapter.id) + 1;
+        setEditingProject(recordAuthorQuestions(project, number, activeChapter.title, result.authorNotes));
+        await finishAgentRun(`先有 ${result.authorNotes.length} 个问题，答完再点「答完，写一次」`);
+        return;
+      }
       setAgentDraft(result);
       setAgentDisplayContent(result.draftContent || '');
       // 标题当场算好并展示：作者接受前能看见、能改，不用写入后才发现标题栏还是占位章号
@@ -5721,30 +5705,41 @@ function App() {
           stopReason = '作者点了停止';
           break;
         }
-        const number = project.chapters.length + 1;
+        const pendingChapter = project.chapters.at(-1);
+        const number = pendingChapter && !pendingChapter.content.trim() ? project.chapters.length : project.chapters.length + 1;
         if (planEnd !== undefined && number > planEnd) {
           stopReason = `总纲按卷写到第 ${planEnd} 章，已经写到全书计划末章`;
           break;
         }
-        const inserted = insertChapterAfter(project, project.chapters.at(-1)?.id ?? null, `第 ${number} 章`);
+        const inserted = pendingChapter && !pendingChapter.content.trim()
+          ? { project, chapter: pendingChapter }
+          : insertChapterAfter(project, pendingChapter?.id ?? null, `第 ${number} 章`);
         project = inserted.project;
         setEditingProject(project);
         setActiveChapter(inserted.chapter);
         setContinuousWriting({ done, total, message: `第 ${number} 章：生成章纲与正文` });
         const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const drafted = await requestChapterDraft(project, inserted.chapter, runId);
-        if (!drafted.result.draftContent?.trim()) throw new Error(`第 ${number} 章没有生成出正文`);
+        if (!drafted.result.draftContent?.trim()) {
+          const notes = drafted.result.authorNotes || [];
+          if (!notes.length) throw new Error(`第 ${number} 章没有生成出正文`);
+          project = recordAuthorQuestions(drafted.project, number, inserted.chapter.title, notes);
+          await applyProjectChange(project);
+          await finishAgentRun(`第 ${number} 章先问 ${notes.length} 件事，答完再写`);
+          stopReason = `第 ${number} 章有 ${notes.length} 个问题，还没写。左边一次答完，再点「答完，写一次」。`;
+          break;
+        }
         const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
         const actual = countNovelCharacters(drafted.result.draftContent);
-        // 字数不再是停下的理由：差几百字就中断，"懒人连续创作"就从来跑不完。只有正文明显残缺（不到目标一半，多半是被截断）才停下留草稿
-        if (actual < target * 0.5) {
+        // 字数未达目标或超过上限时只留草稿，不自动写入和继续下一章
+        if (!isWithinChapterTarget(actual, target)) {
           project = drafted.project;
           await applyProjectChange(project);
           setAgentDraft(drafted.result);
           setAgentDisplayContent(drafted.result.draftContent);
           setAgentDraftTitle(applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''));
-          await finishAgentRun(`第 ${number} 章正文明显过短，已保留待处理草稿`);
-          stopReason = `第 ${number} 章正文只有 ${actual} 字（目标 ${target} 字），可能被截断，草稿已保留，未自动采用`;
+          await finishAgentRun(`第 ${number} 章字数未达自动采用范围，已保留草稿`);
+          stopReason = `第 ${number} 章正文 ${actual} 字（需 ${target}～${Math.floor(target * 1.2)} 字），草稿已保留，未自动采用`;
           break;
         }
         const applied = applyAgentDraft(drafted.project, inserted.chapter, drafted.result.draftContent, applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''), drafted.result.summary);
@@ -5793,8 +5788,10 @@ function App() {
   const keepEventsInstruction = (project: Project, chapter: Chapter, number: number): string => {
     const memory = project.memories.find(item => item.chapterId === chapter.id);
     const summary = memory?.summary?.trim() || buildLocalChapterSummary(chapter.content);
+    const target = Math.round(Number(project.chapterTargetWords) || 3000);
+    const cap = Math.round(target * 1.2);
     return [
-      `重写第 ${number} 章：事件不变，写法全换。下面是原稿已经发生的事，都要保留（顺序可调、可加细节，不加新事件，不写原稿没有的人物）：`,
+      `重写第 ${number} 章：写法全换，约 ${target} 字，不超过 ${cap} 字。下面是原稿发生过的事。字数装得下的保留，装不下的只留关系变化和结尾落点，不逐条写全。不加新事件，不写原稿里没有的人。`,
       `- 本章大意：${summary}`,
       ...(memory?.timelineEvents || []).map(item => `- 时间线：${item}`),
       ...(memory?.characterStateChanges || []).map(item => `- 人物：${item}`),
@@ -5810,14 +5807,14 @@ function App() {
    * 保事件：原稿记忆里的事当硬目标，跳过节拍表与章纲生成；从构思重来：原稿作废，走和写新章一样的懒人流程
    * 每章旧稿进章节历史，重写完立刻提炼记忆，下一章按新记忆承接；逐章串行，停止在本章写完后生效
    */
-  const runChapterRewrite = async () => {
+  const runChapterRewrite = async (onlyChapter?: number, moreChapters: number[] = []) => {
     const start = editingProjectRef.current;
     if (!start || agentRunning(agentStage) || continuousWriting || chapterRewrite) return;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setNotice({ title: '无法重写旧章', content: '请先在设置里填写模型 API Key。' });
       return;
     }
-    const range = rewriteRange ?? { from: start.chapters.length, to: start.chapters.length };
+    const range = onlyChapter ? { from: onlyChapter, to: onlyChapter } : (rewriteRange ?? { from: start.chapters.length, to: start.chapters.length });
     const from = Math.max(1, Math.min(range.from, range.to));
     const to = Math.min(start.chapters.length, Math.max(range.from, range.to));
     if (from > to) {
@@ -5826,43 +5823,64 @@ function App() {
     }
     const total = to - from + 1;
     rewriteAbortRef.current = false;
+    const keepAnswers = (current: Project): Project => {
+      const latest = editingProjectRef.current;
+      if (!latest || latest.id !== current.id || !latest.authorQuestions) return current;
+      return { ...current, authorQuestions: latest.authorQuestions };
+    };
     setChapterRewrite({ done: 0, total, message: '准备重写' });
     let project = start;
     let done = 0;
     let stopReason = '';
+    const numbers: number[] = [];
+    if (onlyChapter) numbers.push(onlyChapter, ...moreChapters.filter(item => item !== onlyChapter));
+    else for (let cursor = from; cursor <= to; cursor += 1) numbers.push(cursor);
+    const answerRewrites = new Set<number>(onlyChapter ? numbers : []);
     try {
-      for (let number = from; number <= to; number += 1) {
+      while (numbers.length) {
         if (rewriteAbortRef.current) {
           stopReason = '作者点了停止';
           break;
         }
+        const number = numbers.shift();
+        if (!number) break;
+        const byAnswer = answerRewrites.delete(number);
         const chapter = project.chapters[number - 1];
         if (!chapter) break;
+        project = keepAnswers(project);
         setActiveChapter(chapter);
-        setChapterRewrite({ done, total, message: `第 ${number} 章：${rewriteMode === 'keep' ? '保事件重写' : '从构思重来'}` });
+        setChapterRewrite({ done, total, message: byAnswer ? `第 ${number} 章：按答复再写一次` : `第 ${number} 章：${rewriteMode === 'keep' ? '保事件重写' : '从构思重来'}` });
         const runId = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const drafted = await requestChapterDraft(project, chapter, runId, rewriteMode === 'keep'
-          ? { instruction: keepEventsInstruction(project, chapter, number), skipOutline: true }
-          : { instruction: `重写第 ${number} 章：原稿作废，从构思重来，按总纲、故事账本和上一章重新安排这一章发生的事。\n${agentInstruction.trim()}`, discardOutline: true });
-        if (!drafted.result.draftContent?.trim()) throw new Error(`第 ${number} 章没有生成出正文`);
+        const drafted = await requestChapterDraft(project, chapter, runId, byAnswer || rewriteMode === 'keep'
+          ? { instruction: `${byAnswer ? `按作者已答复修订第 ${number} 章。答复里的事以作者为准，只改涉及的地方，其余事件保持。\n` : ''}${keepEventsInstruction(project, chapter, number)}`, skipOutline: true, isolatedSession: true }
+          : { instruction: `重写第 ${number} 章：原稿作废，从构思重来，按总纲、故事账本和上一章重新安排这一章发生的事。\n${agentInstruction.trim()}`, discardOutline: true, isolatedSession: true });
+        if (!drafted.result.draftContent?.trim()) {
+          const notes = drafted.result.authorNotes || [];
+          if (!notes.length) throw new Error(`第 ${number} 章没有生成出正文`);
+          project = recordAuthorQuestions(keepAnswers(drafted.project), number, chapter.title, notes);
+          await applyProjectChange(project);
+          await finishAgentRun(`第 ${number} 章先问 ${notes.length} 件事，答完再写`);
+          stopReason = `第 ${number} 章有 ${notes.length} 个问题，还没写。左边一次答完，再点「答完，写一次」。`;
+          break;
+        }
         const target = Math.round(Number(drafted.project.chapterTargetWords) || 3000);
         const actual = countNovelCharacters(drafted.result.draftContent);
-        // 明显残缺的稿不覆盖原稿：留成草稿让作者看，原文一个字不动
-        if (actual < target * 0.5) {
-          project = drafted.project;
+        // 字数未达目标或超过上限时原章保持不变，重写稿留在草稿面板
+        if (!isWithinChapterTarget(actual, target)) {
+          project = keepAnswers(drafted.project);
           await applyProjectChange(project);
           setAgentDraft(drafted.result);
           setAgentDisplayContent(drafted.result.draftContent);
           setAgentDraftTitle(applyDraftChapterTitle(chapter.title, drafted.result.chapterTitle || '', { overwrite: rewriteMode === 'redo' }));
-          await finishAgentRun(`第 ${number} 章重写稿明显过短，已保留待处理草稿`);
-          stopReason = `第 ${number} 章重写稿只有 ${actual} 字（目标 ${target} 字），可能被截断，草稿已保留，原稿未动`;
+          await finishAgentRun(`第 ${number} 章重写稿字数未达自动采用范围，已保留草稿`);
+          stopReason = `第 ${number} 章重写稿 ${actual} 字（需 ${target}～${Math.floor(target * 1.2)} 字），草稿已保留，原稿未动`;
           break;
         }
         // 保事件时章名照旧；从构思重来事件变了，章名跟着重写稿走
         const title = applyDraftChapterTitle(chapter.title, drafted.result.chapterTitle || '', { overwrite: rewriteMode === 'redo' });
         const applied = applyAgentDraft(drafted.project, chapter, drafted.result.draftContent, title, drafted.result.summary);
         // 旧稿的审查报告说的是被换掉的那版，留着只会误导
-        project = removeReviewReportsForChapter(applied.project, number);
+        project = keepAnswers(removeReviewReportsForChapter(applied.project, number));
         project = recordAuthorQuestions(project, number, applied.chapter.title, drafted.result.authorNotes || []);
         project = appendAuthorNotes(project, number, applied.chapter.title, drafted.result.reviewResult, drafted.result.lintFindings || []);
         setActiveChapter(applied.chapter);
@@ -5870,10 +5888,10 @@ function App() {
         setAgentDisplayContent('');
         await finishAgentRun(`第 ${number} 章已重写并写入`);
         await applyProjectChange(project);
-        done += 1;
+        if (!byAnswer) done += 1;
         setChapterRewrite({ done, total, message: `第 ${number} 章：已写入，正在提炼记忆` });
         try {
-          project = await refineChapterMemory(project, applied.chapter);
+          project = keepAnswers(await refineChapterMemory(project, applied.chapter));
           await applyProjectChange(project);
         } catch (error) {
           if (isQuotaExceededError(error)) throw error;
@@ -7312,19 +7330,19 @@ function App() {
                 <div className="chapters-panel">
                   {pendingQuestions.length > 0 && (
                     <details className="author-questions" open>
-                      <summary>模型有 {pendingQuestions.length} 个问题等你答 <small>答了之后每章都按你的答复写</small></summary>
+                      <summary>模型有 {pendingQuestions.length} 个问题等你答 <small>一次答完再写，不要一题写一遍</small></summary>
                       <div className="author-questions-list">
                         {pendingQuestions.slice(0, 8).map(item => (
                           <div key={item.id} className="author-question">
                             <div><strong>第 {item.chapterNumber} 章问</strong><p>{item.question}</p></div>
-                            <textarea className="input" rows={2} value={questionDrafts[item.id] || ''} placeholder="一句话拍板；空着就是先不答" onChange={event => setQuestionDrafts(current => ({ ...current, [item.id]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); submitAuthorAnswer(item.id); } }} />
+                            <textarea className="input" rows={2} value={questionDrafts[item.id] || ''} placeholder="一句话拍板；先都填上，最后点一次" onChange={event => setQuestionDrafts(current => ({ ...current, [item.id]: event.target.value }))} />
                             <div className="author-question-actions">
-                              <button className="btn-primary" disabled={!(questionDrafts[item.id] || '').trim()} onClick={() => submitAuthorAnswer(item.id)}>答复</button>
                               <button className="link-button" title="模型随便写，不用问我" onClick={() => updateEditorProject(project => dismissAuthorQuestion(project, item.id))}>不用答</button>
                             </div>
                           </div>
                         ))}
                         {pendingQuestions.length > 8 && <p className="empty-hint compact">还有 {pendingQuestions.length - 8} 个，答完上面的再显示。</p>}
+                        <button className="btn-primary" disabled={!pendingQuestions.some(item => (questionDrafts[item.id] || '').trim())} onClick={submitAnsweredQuestions}>答完，写一次</button>
                       </div>
                     </details>
                   )}
@@ -7358,7 +7376,7 @@ function App() {
                   <div className="chapter-target-row">
                     <label htmlFor="max-ai-rate">AI 率上限</label>
                     <input id="max-ai-rate" className="input" type="number" min="1" max="100" step="1" value={editingProject.maxAIRate ?? 30} onChange={event => updateEditorProject(project => ({ ...project, maxAIRate: Math.max(1, Math.min(100, Number(event.target.value) || 30)), updatedAt: new Date().toISOString() }))} />
-                    <span>%（本地启发式；写完超过就只对疑似段落去一次 AI 味）</span>
+                    <span>%（本地启发式，只展示不改写）</span>
                   </div>
                   <details className="chapter-target-row">
                     <summary>允许的句式（验证门不报）</summary>
@@ -7427,7 +7445,7 @@ function App() {
                           </button>
                           {!collapsed && items.map(outline => (
                             <div key={outline.id} className={`outline-document-item ${activeOutlineId === outline.id ? 'active' : ''}`} onClick={() => setActiveOutlineId(outline.id)}>
-                              <div><strong>{outline.title}</strong><small>{outline.kind === '章纲' && outline.chapterId ? editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节' : outline.kind}{outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title) ? ' · 工作台账，不进写作提示词' : ''}{outline.snapshots?.length ? ` · ${outline.snapshots.length} 个历史版本` : ''}</small></div>
+                              <div><strong>{outline.title}</strong><small>{outline.kind === '章纲' && outline.chapterId ? editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节' : outline.kind}{outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title) ? ' · 工作台账不进写作' : ''}{outline.kind === '世界观与作品设定' && isWritingGuideDocumentTitle(outline.title) ? ' · 写作时只取设定事实' : ''}{outline.snapshots?.length ? ` · ${outline.snapshots.length} 个历史版本` : ''}</small></div>
                               <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}><Icon name="trash" size={14} /></button>
                             </div>
                           ))}
@@ -8167,7 +8185,7 @@ function App() {
                     {typeof agentDraft.aiRate === 'number' && (
                       <div className={`agent-review ${agentDraft.aiRate <= (agentDraft.aiRateLimit || 30) ? 'passed' : 'warning'}`}>
                         <strong>AI 率 {agentDraft.aiRate}%（上限 {agentDraft.aiRateLimit || 30}%）{typeof agentDraft.aiRateBefore === 'number' && agentDraft.aiRateBefore !== agentDraft.aiRate ? ` · 去 AI 味前 ${agentDraft.aiRateBefore}%` : ''}</strong>
-                        {agentDraft.aiRate > (agentDraft.aiRateLimit || 30) && <p>疑似段落已改过一轮仍超上限，本地启发式只看句长、连接词和口语，可在 AI 检测面板逐段看。</p>}
+                        {agentDraft.aiRate > (agentDraft.aiRateLimit || 30) && <p>本地启发式只看句长、连接词和口语，超过上限不改正文。可在 AI 检测面板逐段看。</p>}
                       </div>
                     )}
                     {agentDraft.lintFindings?.length ? (

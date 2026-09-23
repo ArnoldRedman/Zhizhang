@@ -4,7 +4,7 @@ import { StoryStore } from "./storage/story-store.js";
 import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
 import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, masterOutlineBytes, prepareChapterInput, stableHash, stageBeatLines, storyLedgerBytes, tailText, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
-import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, stageBeatSheetProtocol, type AgentSessionState } from "./application/runtime-state.js";
+import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, shouldUseChapterSession, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, stageBeatSheetProtocol, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { outlineWriteTargetContext, stageBeatContentFor } from "./application/outline-target.js";
@@ -24,7 +24,7 @@ import type { RpcResponse } from "@zhizhang/contracts";
 
 /** 资料组装规则版本：改了预算或裁剪策略就加一
  * 准备结果的缓存 key 只由入参算出，代码变了 key 不变，旧缓存会一直命中、优化完全看不出效果 */
-const contextPipelineVersion = 7;
+const contextPipelineVersion = 8;
 
 /** 阶段节拍表里本章那一行压成一段：本章行是硬目标，前后行只划边界 */
 /** 项目设置里的引号风格；没设或值不认识就返回 undefined，让运行时按已有正文侦测 */
@@ -832,17 +832,18 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         cache: cachedPreparation ? "hit" : "miss",
         sections: { ...prepared.report.sections },
       };
+      const useChapterSession = shouldUseChapterSession(chapterPosition.number, chapterPosition.total, Boolean(req.params?.isolatedSession));
       const sessionKey = stableHash({ projectId: String(projectId), sessionId: String(sessionId || "default"), model: String(model || ""), apiMode: String(apiMode || "openai") });
-      const storedChapterSession = await readPersistentContext<unknown>(`chapter-session-${sessionKey}`);
-      const cachedChapterSession = novelSessionCache.get(sessionKey)
-        || (storedChapterSession !== undefined ? normalizeAgentSession(storedChapterSession) : undefined);
-      const previousChapterSession = previousSessionId && !cachedChapterSession
+      const storedChapterSession = useChapterSession ? await readPersistentContext<unknown>(`chapter-session-${sessionKey}`) : undefined;
+      const cachedChapterSession = useChapterSession ? novelSessionCache.get(sessionKey)
+        || (storedChapterSession !== undefined ? normalizeAgentSession(storedChapterSession) : undefined) : undefined;
+      const previousChapterSession = useChapterSession && previousSessionId && !cachedChapterSession
         ? await readPersistentContext<unknown>(`chapter-session-${stableHash({ projectId: String(projectId), sessionId: String(previousSessionId), model: String(model || ""), apiMode: String(apiMode || "openai") })}`)
         : undefined;
-      const chapterDocumentSummary = await readPersistentDocument(`chapter-session-${sessionKey}`);
+      const chapterDocumentSummary = useChapterSession ? await readPersistentDocument(`chapter-session-${sessionKey}`) : undefined;
       const chapterSession = compactAgentSession(chapterDocumentSummary ? { ...(cachedChapterSession || { version: 1, recentTurns: [] }), summary: chapterDocumentSummary } : (cachedChapterSession || (previousChapterSession !== undefined ? normalizeAgentSession(previousChapterSession) : undefined) || { version: 1, summary: "", recentTurns: [] }), contextWindow, prepared.report.packedBytes).state;
-      const sessionContext = renderAgentSession(chapterSession);
-      if (!cachedPreparation && (cachedChapterSession || chapterDocumentSummary || previousChapterSession)) {
+      const sessionContext = useChapterSession ? renderAgentSession(chapterSession) : "";
+      if (useChapterSession && !cachedPreparation && (cachedChapterSession || chapterDocumentSummary || previousChapterSession)) {
         contextReport.cache = "hit";
       }
       streamEmitter.progress("starting", 6, `${cachedPreparation ? "上下文缓存命中" : "上下文缓存未命中"}；已将 ${Math.max(0, contextReport.prunedBytes / 1024).toFixed(1)} KB 无关资料移出本次请求`);
@@ -989,7 +990,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         const reviewIssues = Array.isArray(reviewRecord?.issues) ? reviewRecord.issues.map(item => String(item)).filter(Boolean).join("；") : "";
         const progress = typeof reviewRecord?.progress === "string" ? reviewRecord.progress.trim() : "";
         const handoff = [progress || String(resultRecord.summary || ""), reviewIssues ? `审查指出：${reviewIssues}` : ""].filter(Boolean).join("\n");
-        if (handoff) {
+        if (handoff && useChapterSession) {
           const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes, `chapter:${String(chapterId)}`);
           novelSessionCache.set(sessionKey, nextChapterSession.state);
           void writePersistentContext(`chapter-session-${sessionKey}`, nextChapterSession.state);
