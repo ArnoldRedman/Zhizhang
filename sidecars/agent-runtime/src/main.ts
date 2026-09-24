@@ -739,7 +739,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         recentEndings: stringList(req.params?.recentEndings, 6),
         allowedPhrases: stringList(req.params?.allowedPhrases, 60),
       });
-      const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
+      const client = createModelApiClient({ ...req.params, model: String(req.params?.reviewModel || req.params?.model || "gpt-4o-mini") }, { model: "gpt-4o-mini" });
       const { result, usages } = await runChapterReview(client, reviewMode, {
         agentSystemPrompt: chapterAgentSystemPrompt,
         projectProfile: projectProfileSection(normalizeProjectProfile(req.params?.projectProfile)),
@@ -780,6 +780,8 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         activeOutlineId,
         cards,
         previousChapters,
+        followingChapters,
+        referenceChapters,
         memories,
         memoryDocuments,
         knowledgeGraph,
@@ -790,6 +792,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         apiKey,
         baseURL,
         model,
+        reviewModel,
         apiMode,
         reasoningMode,
         contextWindow,
@@ -813,7 +816,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
       };
       const preparationKey = stableHash({
         projectId, chapterId, instruction, outline, outlines, activeOutlineId, cards,
-        previousChapters, memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills, preferredSkillNames,
+        previousChapters, followingChapters, referenceChapters, memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills, preferredSkillNames,
         chapterPosition,
         contextWindow: Number(contextWindow) || 128,
         pipelineVersion: contextPipelineVersion,
@@ -925,6 +928,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
           apiKey: String(apiKey),
           baseURL: String(baseURL || ""),
           model: String(model || "gpt-4o-mini"),
+          reviewModel: String(reviewModel || ""),
           apiMode: normalizeWireMode(apiMode),
           reasoningMode: String(reasoningMode || "auto"),
           contextWindowKTokens: Number(contextWindow) || undefined,
@@ -948,6 +952,8 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
           writingStyle: writingStyle && typeof writingStyle === "object" ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) } : undefined,
           outline: prepared.outline,
           previousChapters: prepared.previousChapters,
+          followingChapters: Array.isArray(followingChapters) ? followingChapters : [],
+          referenceChapters: Array.isArray(referenceChapters) ? referenceChapters : [],
           knowledgeGraph: prepared.knowledgeGraph,
           cards: prepared.cards,
           skillCatalog: prepared.skills,

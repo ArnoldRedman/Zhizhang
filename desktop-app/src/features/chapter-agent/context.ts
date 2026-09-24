@@ -178,6 +178,11 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
       preferredSkillNames: input.preferredSkillNames.filter(name => input.skills.some(skill => skill.name === name)),
       defaultSkillNames: (project.defaultSkillNames || []).filter(name => input.skills.some(skill => skill.name === name)),
       previousChapters: previousChapter ? [{ id: previousChapter.id, title: previousChapter.title, content: previousChapter.content }] : [],
+      followingChapters: project.chapters.slice(chapterIndex + 1, chapterIndex + 4).filter(item => item.content.trim()).map(item => ({ id: item.id, title: item.title, content: item.content })),
+      referenceChapters: project.chapters
+        .map((item, index) => ({ item, number: index + 1 }))
+        .filter(entry => entry.number !== chapterNumber && entry.number >= 109 && entry.number <= 113 && entry.item.content.trim())
+        .map(entry => ({ id: entry.item.id, number: entry.number, title: entry.item.title, content: entry.item.content })),
       memories: priorMemories.map(memory => ({
         id: memory.id,
         chapterNumber: memory.chapterNumber,

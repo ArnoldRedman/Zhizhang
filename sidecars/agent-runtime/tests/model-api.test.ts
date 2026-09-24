@@ -494,6 +494,14 @@ describe("Anthropic Messages wire protocol", () => {
     expect(body).not.toHaveProperty("temperature");
   });
 
+  it("keeps the required token budget when an unbounded review uses Anthropic", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(anthropicResponse([{ type: "text", text: "OK" }]));
+    await new ModelApiClient({ apiKey: "k", apiMode: "anthropic", defaultModel: "claude-opus-5", reasoningMode: "max" })
+      .chat([{ role: "user", content: "审查正文" }], { unbounded: true });
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { max_tokens: number; thinking: { budget_tokens: number } };
+    expect(body.max_tokens).toBeGreaterThan(body.thinking.budget_tokens);
+  });
+
   it("keeps thinking blocks out of the returned prose", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(anthropicResponse([
       { type: "thinking", thinking: "内部推理不应出现在正文" },

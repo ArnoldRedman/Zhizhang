@@ -62,6 +62,8 @@ export interface ChapterReviewResult {
   findings: ReviewFinding[];
   perspectives: Array<{ perspective: ReviewPerspective; verdict: ReviewVerdict; count: number }>;
   nextChapterRisks: string[];
+  /** 视角调用失败时保留原因；有它就不能把审查当作通过 */
+  reviewFailures?: string[];
   rubric?: Record<string, "PASS" | "FAIL">;
 }
 
@@ -290,7 +292,12 @@ export function verdictFromFindings(findings: ReviewFinding[]): ReviewVerdict {
  * lint 的 blocking 一律 S2（是确定性句式问题，改法明确），advisory 一律 S4（只是读感提示）；
  * 旧界面还在读 issues / suggestions 两个数组：S1/S2 的一致性事实类进 issues，其余进 suggestions
  */
-export function mergeReviewResults(mode: ReviewMode, results: PerspectiveResult[], lintFindings: Array<{ type: string; severity: "blocking" | "advisory"; line: number; excerpt: string; message: string }> = []): ChapterReviewResult {
+export function mergeReviewResults(
+  mode: ReviewMode,
+  results: PerspectiveResult[],
+  lintFindings: Array<{ type: string; severity: "blocking" | "advisory"; line: number; excerpt: string; message: string }> = [],
+  reviewFailures: string[] = [],
+): ChapterReviewResult {
   const findings: ReviewFinding[] = [
     ...results.flatMap(result => result.findings),
     ...lintFindings.map(item => ({
@@ -322,6 +329,7 @@ export function mergeReviewResults(mode: ReviewMode, results: PerspectiveResult[
     findings,
     perspectives: results.map(result => ({ perspective: result.perspective, verdict: result.verdict, count: result.findings.length })),
     nextChapterRisks: results.flatMap(result => result.nextChapterRisks || []),
+    reviewFailures,
     rubric: results.find(result => result.rubric)?.rubric,
   };
 }
@@ -333,7 +341,7 @@ export function normalizeChapterReviewResult(value: unknown): ChapterReviewResul
 
 /** 审查失败时的占位结果：正文照常交给作者，报告里如实写审查没跑完 */
 export function reviewUnavailable(mode: ReviewMode, reason: string): ChapterReviewResult {
-  return { ...mergeReviewResults(mode, []), suggestions: [`审查未完成：${reason}`] };
+  return { ...mergeReviewResults(mode, [], [], [reason]), suggestions: [`审查未完成：${reason}`] };
 }
 
 const stringItems = (value: unknown): string[] => (Array.isArray(value)

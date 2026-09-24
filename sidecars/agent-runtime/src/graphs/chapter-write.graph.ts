@@ -8,7 +8,7 @@ import { draftAcceptanceIssues, lintProse, normalizePauses, normalizeQuotes, typ
 import { reviewUnavailable, type ChapterReviewResult, type ReviewMode } from "../application/chapter-review.js";
 import { perspectiveLabel, runChapterReview } from "../application/review-runner.js";
 import { chapterRevisePrompt, wholeChapterTokenBudget } from "../application/text-prompts.js";
-import { benchmarkDraftSection, benchmarkPlanSection, type ChapterBenchmark } from "../application/benchmark.js";
+import type { ChapterBenchmark } from "../application/benchmark.js";
 // 标题拆分与补全是纯文本处理，批量补标题也要用同一套判定，统一放在 application 层
 import { cleanChapterTitleName, splitChapterTitleHeading } from "../application/chapter-titles.js";
 
@@ -49,11 +49,7 @@ const intentLabels: Record<string, string> = {
  * "他没问，只是默默记在心里"正是那套约束下的最优解。现在只说清身份、资料从哪来、人物怎么写、拿不准怎么办；
  * 具体怎么写交给模型和作者的资料。字节稳定，兼容的中转能复用前缀缓存
  */
-export const chapterAgentSystemPrompt = `你是这本书的作者。资料里有世界观、人物卡、总纲、前文记忆和上一章结尾，写作以它们为准；资料里没有的可以自己定，但不能和已有设定冲突。
-人物按各自的性格说话和做选择：每个人有想要的东西，也有拿不到的时候；情绪用这个人会说的话和会做的事写出来。
-每个人物的说话方式、在意的东西、处理情绪的办法都不一样，一句台词遮住名字也能认出是谁说的。
-事务和感情一起写：人物关系跟着本章事件自然变化，有靠近，也可以有误解或停顿。
-只有和已有设定打架、或会改掉后面很多章走向的事，才在输出末尾用「【给作者】」一次问完。本章怎么写、词怎么用，自己定，不要问。`;
+export const chapterAgentSystemPrompt = `你是这本书的作者。阅读作者提供的作品资料、前后章节和本章要求，自由写出这一章。资料用于保持人物、事实和时间连续；写法、节奏、情绪和人物反应由你根据上下文判断。不要解释，不要评价，不要把资料复述成提纲，直接写正文。`;
 
 /** 【给作者】行的识别：模型按系统提示词把疑问写在末尾，逐行剥出来单独交给界面 */
 const authorNoteLine = /^\s*[【\[]\s*给作者\s*[】\]]\s*[：:]?\s*(.*)$/u;
@@ -270,6 +266,9 @@ export const ChapterState = Annotation.Root({
   outline: Annotation<string | undefined>,
   projectTitle: Annotation<string | undefined>,
   previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string; ending?: string }> | undefined>,
+  /** 重写历史章时的后文参考，只用于让模型知道本章不能把后面已经承担的戏提前写完 */
+  followingChapters: Annotation<Array<{ id?: string | number; title: string; content: string }> | undefined>,
+  referenceChapters: Annotation<Array<{ id?: string | number; number: number; title: string; content: string }> | undefined>,
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
@@ -333,6 +332,7 @@ interface ChapterGraphConfig {
   apiKey: string;
   baseURL?: string;
   model?: string;
+  reviewModel?: string;
   apiMode?: ApiWireMode | "responses";
   reasoningMode?: string;
   contextWindowKTokens?: number;
@@ -371,19 +371,14 @@ function chapterMaterialPacket(state: ChapterStateType): string {
     ? `\n## 前文记忆\n${state.retrievedContext.join("\n\n")}\n`
     : "";
   const outlineSection = state.outline ? `\n## 本章章纲\n${state.outline}\n` : "";
-  const graphSection = state.knowledgeGraph ? `\n## 知识图谱\n${state.knowledgeGraph}\n` : "";
   const cardsSection = state.cards?.length
-    ? `\n## ${state.chapterPlan ? "本章出场人物与设定卡" : "人物与设定卡（资料；谁出场由本章构思定，常驻的人也可以整章不出现）"}\n${state.cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}\n`
+    ? `\n## 本章相关人物与设定\n${state.cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}\n`
     : "";
-  // 只带作者亲手勾的技能：自动按关键词塞三条截断到七百字节的技能，等于往提示词里加一堆残缺的规矩
+  // 保留默认、作者指定和最相关的少量技能；不要把整套技能目录变成正文规则
   const skillsSection = state.selectedSkills.length
-    ? `\n## 作者指定的写作技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 4).map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, 2400)}`).join("\n\n")}\n`
+    ? `\n## 写作参考\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 3).map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, 1600)}`).join("\n\n")}\n`
     : "";
   const continuitySection = state.continuityContext ? `\n## 上一章结尾\n${state.continuityContext}\n` : "";
-  // 让模型自己看见前面几章怎么开头怎么收尾：比写一条"不得以灯收尾"的禁令管用，也不用往提示词里加规矩
-  const echoSection = state.recentOpenings.length || state.recentEndings.length
-    ? `\n## 前面几章的开头与结尾（本章换个开法和收法）\n${state.recentOpenings.map((line, index) => `开头${index + 1}：${line}`).join("\n")}\n${state.recentEndings.map((line, index) => `结尾${index + 1}：${line}`).join("\n")}\n`
-    : "";
   const promiseSection = state.previousPromise ? `\n## 上一章留给本章的事\n${state.previousPromise}\n` : "";
   const directionSection = storyDirectionPacket(state);
   // 重写历史章：卡片正文和设定文档里难免写着后面章的事（"第 204 章体检""第 194 章改称阿妄"），这些在本章时点还没发生
@@ -392,7 +387,13 @@ function chapterMaterialPacket(state: ChapterStateType): string {
   const historyNote = historical
     ? `\n## 本章的时点\n本章是第 ${number} 章，正在重写。资料里凡是标着第 ${number} 章及以后章号的事（卡片里的"第 194 章起改称""第 204 章体检"、设定文档里的后续进展）在本章时点都还没发生，不能写进来、不能让人物知道；人物关系与状态以第 ${number - 1} 章之前的记忆为准。\n`
     : "";
-  return [skillsSection, historyNote, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, graphSection, continuitySection, promiseSection, echoSection, contextSection].filter(Boolean).join("");
+  const followingSection = state.followingChapters?.length
+    ? `\n## 后续章节参考\n${state.followingChapters.map(chapter => `### ${chapter.title}\n${compactText(chapter.content, 2200)}`).join("\n\n")}\n`
+    : "";
+  const referenceSection = state.referenceChapters?.length
+    ? `\n## 人物参考章节\n第111章及其前后章节是本书人物和情绪的主要参考：\n${state.referenceChapters.map(chapter => `### 第${chapter.number}章｜${chapter.title}\n${compactText(chapter.content, chapter.number === 111 ? 9000 : 3500)}`).join("\n\n")}\n`
+    : "";
+  return [skillsSection, historyNote, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, continuitySection, promiseSection, contextSection, followingSection, referenceSection].filter(Boolean).join("");
 }
 
 /** 修订类调用（验证门定向修订、事实矛盾定点修订）返回的整章正文：剥围栏、标题行与【给作者】，和首稿走同一套拆法 */
@@ -416,20 +417,17 @@ function chapterDraftPrompts(state: ChapterStateType, contextWindowKTokens?: num
   maxTokens: number;
 } {
   const stablePacket = stableProjectPacket(state);
-  const session = splitSessionContext(state.sessionContext);
-  // 正文阶段只带一段与构思基调相同的对标锚点和一张模块：整份聚合塞进来模型会照着抄结构；卡片只带构思里出场的
-  const dynamicPacket = chapterMaterialPacket({ ...state, cards: castCards(state.cards, state.chapterPlan) }) + benchmarkDraftSection(state.benchmark, state.chapterPlan).section;
-  // 字数读项目设置，写死两三千字会让作者设的目标形同虚设
+  const dynamicPacket = chapterMaterialPacket({ ...state, cards: state.cards });
   const targetWords = state.targetWords && state.targetWords > 0 ? Math.round(state.targetWords) : 3000;
-  const planSection = state.chapterPlan ? `\n\n## 这一章的想法\n${state.chapterPlan}` : "";
-  const taskPrompt = `## 作者的要求\n${state.instruction}${planSection}\n\n写${chapterLabel(state)}正文，约 ${targetWords} 字，不超过 ${Math.round(targetWords * 1.2)} 字。第一行只写章名（不带"第几章"），空一行后是正文；只输出正文，不要解释或复述资料。`;
+  const taskPrompt = `## 作者的要求
+${state.instruction}
+
+写${chapterLabel(state)}正文，约 ${targetWords} 字。第一行写章名（不带"第几章"），空一行后开始正文；只输出章节内容。`;
   return {
     messages: [
       { role: "system", content: chapterAgentSystemPrompt },
       { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
-      ...(session.summary ? [{ role: "user" as const, content: session.summary }] : []),
       { role: "user", content: `## 本章资料\n${dynamicPacket || "（暂无本章资料）"}` },
-      ...(session.recent ? [{ role: "user" as const, content: session.recent }] : []),
       { role: "user", content: taskPrompt },
     ],
     dynamicPacket,
@@ -454,6 +452,17 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     apiKey: config.apiKey,
     baseURL: config.baseURL,
     defaultModel: config.model,
+    apiMode: config.apiMode,
+    reasoningMode: config.reasoningMode,
+    contextWindowKTokens: config.contextWindowKTokens,
+    proxyEnabled: config.proxyEnabled,
+    proxyURL: config.proxyURL,
+    proxyBypassLocal: config.proxyBypassLocal,
+  });
+  const reviewClient = new ModelApiClient({
+    apiKey: config.apiKey,
+    baseURL: config.baseURL,
+    defaultModel: config.reviewModel || config.model,
     apiMode: config.apiMode,
     reasoningMode: config.reasoningMode,
     contextWindowKTokens: config.contextWindowKTokens,
@@ -558,36 +567,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.context("retrieve", "锁定上一章结尾作为承接锚点", { source: previous.title, status: "selected", bytes: byteLength(tail), items: 1 });
       return { continuityContext };
     })
-    // 想：一段自由格式的想法，不是表格也不是 JSON；它只是正文前的一次构思，正文照着它写
+    // 已有章纲就是写作骨架，不再额外调用模型生成一遍“想法”
     .addNode("plan", async (state: ChapterStateType) => {
-      emitter?.progress("plan", 30, "正在构思这一章");
-      emitter?.context("plan", "装载本章资料", { source: "ChapterPlanner", status: "loaded", bytes: byteLength(state.outline || "") });
-      const stablePacket = stableProjectPacket(state);
-      const session = splitSessionContext(state.sessionContext);
-      // 构思阶段多看一份对标资料：情绪模块与节奏表，让模型挑这一章的情绪链
-      const material = chapterMaterialPacket(state) + benchmarkPlanSection(state.benchmark);
-      const planInstruction = `## 作者的要求\n${state.instruction}\n\n先想一想${chapterLabel(state)}：按总纲、章纲和前文确定本章的新事件、人物动机与结尾落点。按事件需要安排场景，不凑情节点；只记需要承接的事实或作者需要决定的问题。不要写正文。`;
-      const fallbackPlan = "按总纲和章纲写这一章该发生的事，承接上一章结尾后推进；人物按各自性格行动，结尾停在能继续发展的地方。";
-      let response: Awaited<ReturnType<ModelApiClient["chat"]>>;
-      try {
-        response = await client.chat([
-          { role: "system", content: chapterAgentSystemPrompt },
-          { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
-          ...(session.summary ? [{ role: "user" as const, content: session.summary }] : []),
-          { role: "user", content: `## 本章资料\n${material || "（暂无本章资料）"}` },
-          ...(session.recent ? [{ role: "user" as const, content: session.recent }] : []),
-          { role: "user", content: planInstruction },
-        ], { temperature: 0.7, max_tokens: 2500, retryAttempts: 2 });
-      } catch (error) {
-        // 构思只是正文的脚手架：推理模型把输出上限吃光时，改用默认想法继续写，不让整章白跑
-        const message = error instanceof Error ? error.message : String(error);
-        emitter?.progress("plan", 42, `构思阶段失败，直接写正文：${message}`);
-        return { chapterPlan: fallbackPlan, errors: [`计划阶段失败：${message}`] };
-      }
-      const notes = splitAuthorNotes(unwrapChapterDraft(response.content) || response.content.trim());
-      const chapterPlan = notes.content || fallbackPlan;
-      emitter?.progress("plan", 42, `构思完成（${chapterPlan.length.toLocaleString()} 字）`);
-      return { chapterPlan, authorNotes: [...state.authorNotes, ...notes.authorNotes], upstreamUsage: addUsage(state.upstreamUsage, response.usage) };
+      const chapterPlan = state.outline?.trim() || "";
+      emitter?.progress("plan", 42, chapterPlan ? "已装载本章章纲" : "本章没有额外章纲，直接依据上下文创作");
+      return { chapterPlan };
     })
     .addNode("draft", async (state: ChapterStateType) => {
       emitter?.progress("draft", 44, "正在组织本章资料");
@@ -655,7 +639,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       if (!state.draftContent) {
         return { reviewResult: { ...reviewUnavailable(state.reviewMode, "没有生成章节内容"), consistent: false, issues: ["没有生成章节内容"] } };
       }
-      const { result, inputBytes, usages, failures } = await runChapterReview(client, state.reviewMode, {
+      const { result, inputBytes, usages, failures } = await runChapterReview(reviewClient, state.reviewMode, {
         agentSystemPrompt: chapterAgentSystemPrompt,
         projectProfile: projectProfileSection(state.projectProfile),
         worldSetting: state.worldSetting,
@@ -693,6 +677,10 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       if (!state.draftContent || !state.reviewResult) return { autoRepairRounds: 1, autoRepairSucceeded: false };
       const target = state.targetWords && state.targetWords > 0 ? Math.round(state.targetWords) : 0;
       const issues = draftAcceptanceIssues(state.draftContent, target, state.reviewResult);
+      // 所有视角都失败时没有任何事实依据，不能让正文模型盲修；部分视角失败仍可修已知的字数/事实问题，之后必须复审
+      if (!state.reviewResult.perspectives.length) {
+        return { autoRepairRounds: 1, autoRepairSucceeded: false, errors: ["审查未完成，未自动修正正文"] };
+      }
       const repeated = state.reviewResult.advances === false || state.reviewResult.repeatedEvents.length > 0;
       emitter?.progress("draft", 95, `草稿未过关，自动修正一次：${issues.join("；")}`);
       try {
@@ -744,8 +732,10 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       if (state.autoRepairRounds || !state.draftContent || !state.reviewResult) return "done";
       const target = state.targetWords && state.targetWords > 0 ? Math.round(state.targetWords) : 0;
       const issues = draftAcceptanceIssues(state.draftContent, target, state.reviewResult);
-      // 某个审查视角失败不应挡住已知的字数或事实问题；修正版仍须重新审查
-      return issues.some(item => !item.startsWith("审查未完成")) ? "autoRepair" : "done";
+      // 所有视角都失败时不能自动修；部分视角失败只有同时存在已知字数/事实问题时才修，最终仍不能伪造通过
+      if (!state.reviewResult.perspectives.length) return "done";
+      const repairableIssues = issues.filter(item => !item.startsWith("审查未完成"));
+      return repairableIssues.length ? "autoRepair" : "done";
     }, { autoRepair: "autoRepair", done: "__end__" })
     .addConditionalEdges("autoRepair", (state: ChapterStateType) => state.autoRepairSucceeded ? "gate" : "done", { gate: "gate", done: "__end__" });
 

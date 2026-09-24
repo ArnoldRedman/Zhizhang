@@ -80,13 +80,10 @@ describe("chapter continuity context", () => {
     const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
     const result = await graph.invoke({ projectId: "plain-project", chapterId: "204", chapterNumber: 204, instruction: "写下一章", targetWords: 2200 });
 
-    expect(result.draftContent || "").toBe("");
-    expect(result.authorNotes).toEqual([
-      "姜冷月是否知道体检结果，资料里没写，我按不知道处理。",
-    ]);
-    // 构思阶段问了作者，正文还没写
+    expect(result.draftContent).toContain("沈妄把案角那摞信札码齐");
+    expect(result.authorNotes).toContain("越洋信的寄信人资料里没有，我留成待揭示。");
     const draftRequest = requests.find(body => JSON.stringify(body.messages || "").includes("写第 204 章正文"));
-    expect(draftRequest).toBeFalsy();
+    expect(draftRequest).toBeTruthy();
     store.close();
   });
 
@@ -273,7 +270,7 @@ describe("chapter continuity context", () => {
     store.close();
   });
 
-  it("审查档位决定跑几个视角：full 四个、solo 一个；对标资料构思阶段带情绪模块，正文只带同基调锚点", async () => {
+  it("审查档位决定跑几个视角；对标资料只进入构思，不进入正文", async () => {
     const requests: Array<Record<string, unknown>> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       requests.push(JSON.parse(String(init?.body || "{}")) as Record<string, unknown>);
@@ -292,11 +289,8 @@ describe("chapter continuity context", () => {
     const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
     await graph.invoke({ projectId: "mode-project", chapterId: "5", chapterNumber: 5, instruction: "继续写本章", reviewMode: "full", benchmark });
     expect(requests.filter(body => JSON.stringify(body.messages || "").includes("待审查章节"))).toHaveLength(4);
-    const planRequest = requests.find(body => JSON.stringify(body.messages || "").includes("先想一想"));
-    expect(JSON.stringify(planRequest?.messages)).toContain("对标作品的情绪模块");
-    expect(JSON.stringify(planRequest?.messages)).toContain("被低估者翻盘");
     const draftRequest = requests.find(body => JSON.stringify(body.messages || "").includes("写第 5 章正文"));
-    expect(JSON.stringify(draftRequest?.messages)).toContain("原文热血段落");
+    expect(JSON.stringify(draftRequest?.messages)).not.toContain("原文热血段落");
     expect(JSON.stringify(draftRequest?.messages)).not.toContain("原文悲伤段落");
 
     requests.length = 0;
@@ -313,7 +307,7 @@ describe("chapter continuity context", () => {
       requests.push(body);
       const messages = JSON.stringify(body.messages || "");
       if (messages.includes("待审查章节")) return ok(passReview);
-      if (messages.includes("先想一想")) return ok("主角先确认门外来人身份，再寻找脱身线索；结尾门锁被人从外面轻轻拧动。");
+      if (messages.includes("很短的写作骨架")) return ok("- 起点：门外有人敲门\n- 核心冲突：确认来人并寻找脱身线索\n- 必要事实：旧电台在手\n- 结尾状态：门锁被拧动\n- 后文边界：不揭示来人身份");
       return ok("敲门\n\n他握紧旧电台，门外又传来三声敲门。");
     });
 
@@ -348,8 +342,8 @@ describe("chapter continuity context", () => {
     expect(result.selectedSkills).toEqual(["chapter-continuity"]);
     expect(JSON.stringify(requests[1]?.messages)).toContain("先检查上一章结尾");
     expect(JSON.stringify(requests[1]?.messages)).not.toContain("保持长篇节奏");
-    expect(result.chapterPlan).toContain("门锁");
-    expect(JSON.stringify(requests[1]?.messages)).toContain("这一章的想法");
+    expect(result.chapterPlan).toBe("");
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain("这一章的想法");
     store.close();
   });
 
@@ -399,8 +393,8 @@ describe("chapter graph degrades instead of failing the whole chapter", () => {
       previousChapters: [{ id: "4", title: "第 4 章", content: "门外三声敲门。" }],
     });
     expect(result.draftContent).toBe("林砚推开门。");
-    expect(result.chapterPlan).toContain("按总纲");
-    expect(result.errors.some(item => item.includes("计划阶段失败"))).toBe(true);
+    expect(result.chapterPlan).toBe("");
+    expect(result.errors).toEqual([]);
     store.close();
   });
 
@@ -470,16 +464,14 @@ describe("skills and cast in the writing graph", () => {
       cards: [{ type: "角色卡", title: "沈妄", content: "沈妄卡" }, { type: "角色卡", title: "周伯", content: "周伯卡" }],
     });
     expect(result.selectedSkills).toEqual(["story-long-write", "fight-scene"]);
-    const planRequest = requests.find(body => JSON.stringify(body.messages || "").includes("先想一想"));
     const draftRequest = requests.find(body => JSON.stringify(body.messages || "").includes("写第 7 章正文"));
-    const planText = JSON.stringify(planRequest?.messages);
     const draftText = JSON.stringify(draftRequest?.messages);
-    expect(planText).toContain("沈妄卡");
-    expect(planText).toContain("周伯卡");
-    expect(planText).toContain("谁出场由本章构思定");
+    expect(draftText).toContain("沈妄卡");
     expect(draftText).toContain("周伯卡");
-    expect(draftText).not.toContain("沈妄卡");
-    expect(draftText).toContain("本章出场人物与设定卡");
+    expect(draftText).toContain("本章相关人物与设定");
+    expect(draftText).toContain("周伯卡");
+    expect(draftText).toContain("沈妄卡");
+    expect(draftText).toContain("本章相关人物与设定");
     expect(draftText).toContain("长篇写法");
     expect(draftText).toContain("打斗写法");
     expect(draftText).not.toContain("审查规矩");

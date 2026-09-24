@@ -236,6 +236,7 @@ interface AgentReviewResult {
   verdict?: 'APPROVE' | 'CONCERNS' | 'REJECT';
   findings?: AgentReviewFinding[];
   perspectives?: Array<{ perspective: string; verdict: string; count: number }>;
+  reviewFailures?: string[];
   nextChapterRisks?: string[];
   rubric?: Record<string, 'PASS' | 'FAIL'>;
 }
@@ -1359,6 +1360,19 @@ function App() {
   const [agentDisplayContent, setAgentDisplayContent] = useState('');
   /** 草稿的章节标题：接受前可改，标题不能只靠模型写得对 */
   const [agentDraftTitle, setAgentDraftTitle] = useState('');
+  const [agentAuthorFeedback, setAgentAuthorFeedback] = useState('');
+  // 切换项目或章节时，旧草稿不能继续覆盖新目标
+  const agentDraftTargetRef = useRef<{ projectId: number; chapterId: number } | null>(null);
+  useEffect(() => {
+    if (!agentDraft) return;
+    const target = agentDraftTargetRef.current;
+    if (target && (target.projectId !== editingProject?.id || target.chapterId !== activeChapter?.id)) {
+      setAgentDraft(null);
+      setAgentDisplayContent('');
+      setAgentDraftTitle('');
+      setPendingDraftAcceptance(null);
+    }
+  }, [editingProject?.id, activeChapter?.id, agentDraft]);
   const [outlineChatMessages, setOutlineChatMessages] = useState<AgentChatMessage[]>([]);
   const [cardChatMessages, setCardChatMessages] = useState<AgentChatMessage[]>([]);
   const [showProjectAgent, setShowProjectAgent] = useState(false);
@@ -5307,6 +5321,7 @@ function App() {
         apiKey: agentConfig.apiKey.trim(),
         baseURL: agentConfig.baseURL.trim(),
         model: agentConfig.model.trim() || 'gpt-4o-mini',
+        reviewModel: agentConfig.reviewModel.trim(),
         apiMode: agentConfig.apiMode,
         reasoningMode: agentConfig.reasoningMode,
         contextWindow: agentConfig.contextWindow,
@@ -5373,6 +5388,7 @@ function App() {
         await finishAgentRun(`先有 ${result.authorNotes.length} 个问题，答完再点「答完，写一次」`);
         return;
       }
+      agentDraftTargetRef.current = { projectId: editingProject.id, chapterId: activeChapter.id };
       setAgentDraft(result);
       setAgentDisplayContent(result.draftContent || '');
       // 标题当场算好并展示：作者接受前能看见、能改，不用写入后才发现标题栏还是占位章号
@@ -5491,6 +5507,7 @@ function App() {
       apiKey: agentConfig.apiKey.trim(),
       baseURL: agentConfig.baseURL.trim(),
       model: agentConfig.model.trim() || fallbackModels[0],
+      reviewModel: agentConfig.reviewModel.trim(),
       apiMode: agentConfig.apiMode,
       reasoningMode: agentConfig.reasoningMode,
       contextWindow: agentConfig.contextWindow,
@@ -5735,6 +5752,7 @@ function App() {
         if (issues.length) {
           project = drafted.project;
           await applyProjectChange(project);
+          agentDraftTargetRef.current = { projectId: project.id, chapterId: inserted.chapter.id };
           setAgentDraft(drafted.result);
           setAgentDisplayContent(drafted.result.draftContent);
           setAgentDraftTitle(applyDraftChapterTitle(inserted.chapter.title, drafted.result.chapterTitle || ''));
@@ -5868,6 +5886,7 @@ function App() {
         if (issues.length) {
           project = keepAnswers(drafted.project);
           await applyProjectChange(project);
+          agentDraftTargetRef.current = { projectId: project.id, chapterId: chapter.id };
           setAgentDraft(drafted.result);
           setAgentDisplayContent(drafted.result.draftContent);
           setAgentDraftTitle(applyDraftChapterTitle(chapter.title, drafted.result.chapterTitle || '', { overwrite: rewriteMode === 'redo' }));
@@ -5905,12 +5924,58 @@ function App() {
     setNotice({ title: '重写旧章结束', content: `已重写 ${done}/${total} 章${stopReason ? `；${stopReason}` : ''}。每章旧稿都在章节历史里，可逐章回退。` });
   };
 
+  const reviseAgentDraftWithFeedback = async () => {
+    if (!agentDraft?.draftContent || !editingProject || !activeChapter) return;
+    const feedback = agentAuthorFeedback.trim();
+    const review = agentDraft.reviewResult;
+    const reviewText = review ? [
+      ...(review.issues || []),
+      ...(review.suggestions || []).filter(item => !item.startsWith('S4')),
+      ...(review.repeatedEvents || []).map(item => `重复前文：${item}`),
+    ].join('\n') : '';
+    if (!feedback && !reviewText) {
+      setNotice({ title: '没有修改意见', content: '请填写作者意见，或等待有效审查结果后再修改。' });
+      return;
+    }
+    setAgentProgressMessage('正在按审查意见和作者意见修改草稿');
+    try {
+      const result = await agentRpc<{ content?: string }>('text.transform', {
+        mode: 'revise',
+        content: agentDraft.draftContent,
+        instruction: `这是当前章节的审查意见：\n${reviewText || '无有效审查意见'}\n\n这是作者补充意见：\n${feedback || '请只处理上面的审查意见'}\n\n只修改确实需要修改的地方，保留已经成立的人物、事件和文风；不要把意见复述进正文，不要另写一篇无关的正文。修改完成后只返回完整章节正文。`,
+        projectTitle: editingProject.title,
+        chapterTitle: activeChapter.title,
+        apiKey: agentConfig.apiKey.trim(),
+        baseURL: agentConfig.baseURL.trim(),
+        model: agentConfig.model.trim() || fallbackModels[0],
+        apiMode: agentConfig.apiMode,
+        reasoningMode: agentConfig.reasoningMode,
+        contextWindow: agentConfig.contextWindow,
+        ...agentNetworkParams(agentConfig),
+      });
+      const content = result.content?.trim() || '';
+      if (!content) throw new Error('修改模型没有返回正文');
+      setAgentDraft(current => current ? { ...current, draftContent: content, reviewResult: undefined } : current);
+      setAgentDisplayContent(content);
+      setAgentAuthorFeedback('');
+      setNotice({ title: '草稿已按意见修改', content: '请重新运行审查；原章仍未写入。' });
+    } catch (error) {
+      setNotice({ title: '草稿修改失败', content: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
   const acceptAgentDraft = (force = false) => {
     if (!agentDraft?.draftContent) return;
     if (editingProject && activeChapter) {
+      const draftTarget = agentDraftTargetRef.current;
+      if (draftTarget && (draftTarget.projectId !== editingProject.id || draftTarget.chapterId !== activeChapter.id)) {
+        setPendingDraftAcceptance(null);
+        setNotice({ title: '草稿目标已变化', content: '为避免把旧草稿写进当前章节，已取消本次写入。' });
+        return;
+      }
       const draft = splitChapterTitleHeading(agentDraft.draftContent);
-      const target = Math.round(Number(editingProject.chapterTargetWords) || 3000);
-      const issues = draftAcceptanceIssues(draft.content, target, agentDraft.reviewResult);
+      const targetWords = Math.round(Number(editingProject.chapterTargetWords) || 3000);
+      const issues = draftAcceptanceIssues(draft.content, targetWords, agentDraft.reviewResult);
       if (issues.length && (!force || pendingDraftAcceptance?.projectId !== editingProject.id || pendingDraftAcceptance.chapterId !== activeChapter.id || pendingDraftAcceptance.content !== draft.content)) {
         setPendingDraftAcceptance({ projectId: editingProject.id, chapterId: activeChapter.id, content: draft.content, issues });
         return;
@@ -8152,8 +8217,8 @@ function App() {
                     {(agentDraft.recognizedIntent || agentDraft.selectedSkills?.length) && <div className="agent-intent-result"><span>识别意图：{agentDraft.recognizedIntent || '章节创作与续写'}</span>{agentDraft.selectedSkills?.map(skill => <b key={skill}>{skills.find(item => item.name === skill)?.displayName || skill}</b>)}</div>}
                     {agentDraft.prewriteCheck && <div className={`agent-prewrite-check ${agentDraft.prewriteCheck.blockers.length ? 'warning' : 'passed'}`}><strong>{agentDraft.prewriteCheck.summary}</strong>{agentDraft.prewriteCheck.blockers.map(item => <span key={`block-${item}`}>阻断：{item}</span>)}{agentDraft.prewriteCheck.warnings.map(item => <span key={`warn-${item}`}>提醒：{item}</span>)}</div>}
                     {agentDraft.chapterPlan && <details className="agent-chapter-plan" open>
-                      <summary>这一章的想法</summary>
-                      <div className="agent-plan-meta">正文照着它写；接受草稿前可先看走向对不对。</div>
+                      <summary>本章章纲</summary>
+                      <div className="agent-plan-meta">这里显示项目已有章纲；正文不会再额外生成一份“想法”。</div>
                       <div className="agent-plan-content">{readableChapterPlan(agentDraft.chapterPlan).split(/\n{2,}/u).map((section, index) => <p key={`${index}-${section.slice(0, 24)}`}>{section}</p>)}</div>
                     </details>}
                     {agentDraft.contextReport && <div className="agent-context-report">
@@ -8176,12 +8241,13 @@ function App() {
                     <textarea className="agent-draft-preview" value={agentDisplayContent || agentDraft.draftContent} onChange={(event) => { setAgentDisplayContent(event.target.value); setAgentDraft({ ...agentDraft, draftContent: event.target.value }); }} />
                     {agentDraft.summary && <p className="agent-summary">{agentDraft.summary}</p>}
                     {agentDraft.reviewResult && (
-                      <div className={`agent-review ${agentDraft.reviewResult.verdict === 'APPROVE' || (!agentDraft.reviewResult.verdict && agentDraft.reviewResult.consistent && agentDraft.reviewResult.advances !== false) ? 'passed' : 'warning'}`}>
-                        <strong>{agentDraft.reviewResult.verdict ? `审查 ${agentDraft.reviewResult.verdict}（${agentDraft.reviewResult.mode || 'lean'}）` : agentDraft.reviewResult.consistent ? '一致性审查通过' : '发现一致性问题'}{agentDraft.reviewResult.advances === false ? ' · 本章没有推进主线' : ''}{agentDraft.reviewResult.revised ? ' · 已按审查意见修订' : ''}</strong>
+                      <div className={`agent-review ${!agentDraft.reviewResult.reviewFailures?.length && (agentDraft.reviewResult.verdict === 'APPROVE' || (!agentDraft.reviewResult.verdict && agentDraft.reviewResult.consistent && agentDraft.reviewResult.advances !== false)) ? 'passed' : 'warning'}`}>
+                        <strong>{agentDraft.reviewResult.reviewFailures?.length ? '审查未完成' : agentDraft.reviewResult.verdict ? `审查 ${agentDraft.reviewResult.verdict}（${agentDraft.reviewResult.mode || 'lean'}）` : agentDraft.reviewResult.consistent ? '一致性审查通过' : '发现一致性问题'}{agentDraft.reviewResult.advances === false ? ' · 本章没有推进主线' : ''}{agentDraft.reviewResult.revised ? ' · 已按审查意见修订' : ''}</strong>
                         {agentDraft.reviewResult.perspectives?.length ? <p>{agentDraft.reviewResult.perspectives.map(item => `${reviewPerspectiveLabel(item.perspective)} ${item.verdict}（${item.count}）`).join(' · ')}</p> : null}
+                        {agentDraft.reviewResult.reviewFailures?.length ? <p className="agent-review-error">审查未完成：{agentDraft.reviewResult.reviewFailures.join('；')}</p> : null}
                         {agentDraft.reviewResult.rubric && <p>逐项检查：{Object.entries(agentDraft.reviewResult.rubric).map(([key, value]) => `${key} ${value === 'FAIL' ? '✗' : '✓'}`).join('，')}</p>}
                         {agentDraft.reviewResult.progress && <p>推进：{agentDraft.reviewResult.progress}</p>}
-                        {agentDraft.reviewResult.relationshipProgress !== undefined && <p>感情线：{agentDraft.reviewResult.relationshipProgress || '本章没有推进'}</p>}
+                        {agentDraft.reviewResult.relationshipProgress !== undefined && !agentDraft.reviewResult.reviewFailures?.length && <p>感情线：{agentDraft.reviewResult.relationshipProgress || '本章没有推进'}</p>}
                         {(agentDraft.reviewResult.repeatedEvents || []).map(event => <p key={`repeat-${event}`}>重复前文：{event}</p>)}
                         {agentDraft.reviewResult.issues.map(issue => <p key={issue}>{issue}</p>)}
                         {agentDraft.reviewResult.suggestions.map(suggestion => <p key={suggestion}>建议：{suggestion}</p>)}
@@ -8215,6 +8281,11 @@ function App() {
                         <p>答复会进之后每章的提示词。想让这一章就按答复改，接受后在创作指令里写"按我的答复修订本章"再运行一次。</p>
                       </div>
                     ) : null}
+                    <div className="agent-author-feedback">
+                      <label htmlFor="agent-author-feedback"><strong>作者补充意见</strong><small>审查意见会自动带入；你可以补充哪些地方必须改、哪些建议不要采纳。</small></label>
+                      <textarea id="agent-author-feedback" className="input" rows={4} value={agentAuthorFeedback} placeholder="例如：庭审胜利后幼薇要明显哭出来；沈妄不要只用动作回应；本章停在法院，不要提前写夜里翻笔记本。" onChange={(event) => setAgentAuthorFeedback(event.target.value)} />
+                      <button className="btn-secondary" onClick={reviseAgentDraftWithFeedback}>按审查和作者意见修改</button>
+                    </div>
                     <div className="agent-result-actions">
                       <button className="btn-secondary" onClick={() => { setAgentDraft(null); setAgentDraftTitle(''); }}>放弃</button>
                       <button className="btn-primary" onClick={() => acceptAgentDraft()}>接受并写入</button>
@@ -8539,6 +8610,11 @@ function App() {
                     <label>API 密钥</label>
                     <input className="input" type="password" value={settingsDraft.apiKey} placeholder="请输入 API Key" onChange={(event) => updatePrimaryApiKey(event.target.value)} />
                     <small className="settings-endpoint-hint">一个配置只对应一个 Key。需要多个供应商或多个分组时，在上方“+ 新增配置”建多个配置并随时切换。</small>
+                  </div>
+                  <div className="form-group">
+                    <label>审查模型 <small>可选，留空沿用当前模型</small></label>
+                    <input className="input" value={settingsDraft.reviewModel} placeholder="例如：接口返回的非推理模型 ID" onChange={(event) => setSettingsDraft({ ...settingsDraft, reviewModel: event.target.value })} />
+                    <small className="settings-endpoint-hint">不会自动替换或猜测模型名；请填写“拉取模型”里确认存在的模型。</small>
                   </div>
                   <div className="form-group model-management">
                     <label>模型标签 <small>可多选 · 当前模型：{settingsDraft.model || '未选择'}</small></label>

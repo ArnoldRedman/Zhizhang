@@ -11,6 +11,8 @@ export interface AgentConfig {
   /** 每个配置只有一个 Key；需要多个供应商就新建多个配置，在列表里切换 */
   apiKey: string;
   model: string;
+  /** 可选；留空则沿用创作模型 */
+  reviewModel: string;
   enabledModels: string[];
   contextWindow: number;
   reasoningMode: ReasoningMode;
@@ -91,6 +93,7 @@ export const normalizeAgentConfig = (value: unknown): AgentConfig => {
     baseURL: normalizeBaseURL(typeof parsed.baseURL === 'string' ? parsed.baseURL : defaultBaseURLFor(apiMode), apiMode) || defaultBaseURLFor(apiMode),
     apiKey,
     model,
+    reviewModel: typeof parsed.reviewModel === 'string' ? parsed.reviewModel.trim() : '',
     enabledModels,
     contextWindow: clampContextWindow(storedWindow > maxContextWindowKTokens * 2 ? storedWindow / 1024 : storedWindow),
     // `custom` disappeared with the English effort scale; it behaved as medium.

@@ -86,7 +86,7 @@ const openAIReasoningHeadroom: Readonly<Record<string, number>> = Object.freeze(
  */
 function openAIReasoningTokens(reasoningMode: string | undefined, model: string, learned: boolean): number {
   if (!reasoningMode || reasoningMode === "off") return 0;
-  const wantsThinking = supportsOpenAIReasoning(model) || learned || reasoningMode !== "auto";
+  const wantsThinking = supportsOpenAIReasoning(model) || isLikelyReasoningModel(model) || learned || reasoningMode !== "auto";
   if (!wantsThinking) return 0;
   return openAIReasoningHeadroom[openAIReasoningEffort[reasoningMode] ?? "high"] ?? 0;
 }
@@ -115,6 +115,12 @@ function supportsOpenAIJsonMode(model: string): boolean {
 
 function supportsOpenAIReasoning(model: string): boolean {
   return /^(?:gpt-|o\d|chatgpt-)/iu.test(model.trim());
+}
+
+/** 一些 OpenAI 兼容中转不接受 reasoning_effort，但模型本身仍会推理
+ * 这里只用于给 max_tokens 留思考空间，不代表要把该字段发给上游 */
+function isLikelyReasoningModel(model: string): boolean {
+  return /(?:deepseek|qwq|thinking)/iu.test(model.trim());
 }
 
 const MAX_ERROR_BODY_CHARS = 800;
@@ -321,6 +327,8 @@ export interface ChatOptions {
   max_tokens?: number;
   response_format?: { type: "json_object" | "text" };
   retryAttempts?: number;
+  /** 不向 OpenAI 兼容中转发送 max_tokens，由模型/服务端决定推理与正文总预算 */
+  unbounded?: boolean;
   reasoningMode?: "off" | "auto" | "minimal" | "low" | "medium" | "high" | "max";
 }
 
@@ -480,6 +488,13 @@ function emptyAnthropicError(data: Record<string, unknown>, maxTokens: number): 
     return new ApiRequestError(`Anthropic 接口只返回了 ${kinds.join("/")} 块，没有正文；请降低思考强度或提高输出上限`, 200);
   }
   return new ApiRequestError(`Anthropic 接口返回内容为空（stop_reason：${stopReason || "无"}；响应字段：${Object.keys(data).slice(0, 12).join(",") || "无"}）`, 200);
+}
+
+/** 仅允许一次无推理降级：推理模型把额度吃光时，重试一次比无限重试可观察且可控 */
+function canRetryWithoutReasoning(error: unknown, reasoningMode: string | undefined): boolean {
+  if (reasoningMode === "off") return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /模型只返回了推理内容|模型输出被截断.*推理长度=[1-9]\d*/u.test(message);
 }
 
 const proxyAgents = new Map<string, ProxyAgent>();
@@ -787,9 +802,11 @@ export class ModelApiClient {
     // OpenAI 兼容接口的思考 token 和正文共用 max_tokens，所以给思考额外留额度；
     // 没开推理时不能凭空加（会改掉调用方明确指定的 max_tokens）
     const openAIReasoning = mode === "anthropic" ? 0 : openAIReasoningTokens(reasoningMode, model, this.reasoningModels.has(model));
-    const maxTokens = this.outputBudget(Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0), openAIReasoning);
+    const maxTokens = options.unbounded && mode !== "anthropic"
+      ? undefined
+      : this.outputBudget(Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0), openAIReasoning);
     const apiKey = this.requestKey;
-    const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKey);
+    const contextMessages = await this.fitContextMessages(messages, maxTokens ?? 0, model, apiKey);
     const endpoint = this.endpoints().chat;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     let body: string;
@@ -811,7 +828,7 @@ export class ModelApiClient {
         model,
         messages: contextMessages,
         temperature: options.temperature ?? 0.7,
-        max_tokens: maxTokens,
+        ...(options.unbounded ? {} : { max_tokens: maxTokens }),
         // Gemini models use this same route but do not consistently implement
         // response_format. Prompt-level JSON rules remain in place.
         response_format: supportsOpenAIJsonMode(model) ? options.response_format : undefined,
@@ -836,7 +853,7 @@ export class ModelApiClient {
           const data = await response.json() as Record<string, unknown>;
           if (mode === "anthropic") {
             const content = anthropicText(data.content);
-            if (!content.trim()) throw emptyAnthropicError(data, maxTokens);
+            if (!content.trim()) throw emptyAnthropicError(data, maxTokens ?? 0);
             const anthropicUsage = parseUsage(data.usage);
             recordRuntimeUsage(anthropicUsage);
             return { content, model: typeof data.model === "string" ? data.model : model, usage: anthropicUsage };
@@ -845,7 +862,14 @@ export class ModelApiClient {
           const firstChoice = choices[0];
           const firstMessage = firstChoice?.message as Record<string, unknown> | undefined;
           const content = extractText(firstMessage?.content) || extractText(firstChoice?.text);
-          if (!content.trim()) throw emptyCompletionError(data, Number(JSON.parse(body).max_tokens), model);
+          if (!content.trim()) {
+            const emptyError = emptyCompletionError(data, maxTokens ?? 0, model);
+            if (canRetryWithoutReasoning(emptyError, reasoningMode) && ((reasoningMode && reasoningMode !== "auto") || isLikelyReasoningModel(model))) {
+              console.warn(`[model-api] 推理占满输出额度，降级重试一次：模型=${model}`);
+              return this.chat(messages, { ...options, reasoningMode: "off", retryAttempts: 1 });
+            }
+            throw emptyError;
+          }
           const usage = parseUsage(data.usage);
           recordRuntimeUsage(usage);
           this.noteReasoning(model, usage);

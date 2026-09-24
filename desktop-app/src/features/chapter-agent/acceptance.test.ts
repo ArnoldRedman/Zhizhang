@@ -12,6 +12,14 @@ test('合格草稿可自动采用，缺审查或不足字数不可采用', () =>
   assert.match(draftAcceptanceIssues(content, 2200, { ...reviewed, findings: [{ severity: 'S4', category: 'format', issue: '一致性审查未完成：超时' }] })[0], /一致性审查未完成/);
 });
 
+test('审查视角部分失败也不能伪装成通过', () => {
+  const issues = draftAcceptanceIssues(content, 2200, {
+    ...reviewed,
+    reviewFailures: ['consistency：模型输出被截断'],
+  });
+  assert.deepEqual(issues, ['审查未完成：consistency：模型输出被截断']);
+});
+
 test('即使字数合格，重复事件与已指出的跨章冲突也不能自动覆盖原章', () => {
   const issues = draftAcceptanceIssues(content, 2200, {
     ...reviewed,

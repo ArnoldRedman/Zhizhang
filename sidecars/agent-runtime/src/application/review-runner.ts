@@ -23,16 +23,20 @@ export async function runChapterReview(
     const request = chapterReviewRequest(input, perspective);
     inputBytes += request.inputBytes;
     try {
-      const response = await client.chat(request.messages, { response_format: { type: "json_object" }, max_tokens: 4000, temperature: 0.2, retryAttempts: 2 });
+      const response = await client.chat(request.messages, { response_format: { type: "json_object" }, temperature: 0.2, reasoningMode: "off", unbounded: true, retryAttempts: 1 });
       if (response.usage) usages.push(response.usage);
-      results.push(normalizePerspectiveResult(response.content, perspective));
+      const normalized = normalizePerspectiveResult(response.content, perspective);
+      results.push(normalized);
+      if (normalized.findings.some(item => item.category === "format" && item.issue === "无法解析审查结果")) {
+        failures.push(`${perspective}：模型返回的审查结果不是可解析的 JSON`);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       failures.push(`${perspective}：${message}`);
       results.push({ perspective, verdict: "APPROVE", findings: [{ severity: "S4", category: "format", location: "", evidence: "", issue: `${perspectiveLabel(perspective)}未完成：${message}`, fix: "", source: perspective }] });
     }
   }
-  return { result: mergeReviewResults(mode, results, lintFindings), inputBytes, usages, failures };
+  return { result: mergeReviewResults(mode, results, lintFindings, failures), inputBytes, usages, failures };
 }
 
 export const perspectiveLabel = (perspective: string): string => ({
