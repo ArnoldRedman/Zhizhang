@@ -49,12 +49,12 @@ describe("RPC registry", () => {
     expect(() => ProjectAgentChangeSchema.parse({ type: "chapter.delete", summary: "缺少目标" })).toThrow();
     expect(() => ProjectAgentChangeSchema.parse({ type: "chapter.update", summary: "缺少目标", content: "正文" })).toThrow();
     expect(ProjectAgentChangeSchema.parse({ type: "chapter.delete", summary: "删除空稿", targetId: 9 }).type).toBe("chapter.delete");
+    expect(ProjectAgentChangeSchema.parse({ type: "outline.delete", summary: "删除重复章纲", targetId: 12, title: "章纲｜第 208 章" }).type).toBe("outline.delete");
     expect(ProjectAgentChangeSchema.parse({ type: "chapter.update", summary: "修订第 8 章", targetId: 8, content: "新正文" }).type).toBe("chapter.update");
   });
 
-  it("lets the planner ask for a revise but never hand-write chapter content", () => {
+  it("allows both delegated revision and direct chapter edits", () => {
     expect(ProjectAgentPlannerChangeSchema.parse({ type: "chapter.revise", summary: "去 AI 味", targetId: 8, instruction: "保留情节" }).type).toBe("chapter.revise");
-    // 规划阶段不接受 chapter.update：正文只能由专用智能体产出
-    expect(() => ProjectAgentPlannerChangeSchema.parse({ type: "chapter.update", summary: "直接写正文", targetId: 8, content: "模型自己写的正文" })).toThrow();
+    expect(ProjectAgentPlannerChangeSchema.parse({ type: "chapter.update", summary: "直接写正文", targetId: 8, content: "模型自己写的正文" }).type).toBe("chapter.update");
   });
 });

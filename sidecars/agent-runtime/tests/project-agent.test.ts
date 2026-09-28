@@ -125,7 +125,7 @@ describe("project agent", () => {
     expect(result.toolEvents.some(event => event.tool === "card.write" && event.status === "complete")).toBe(true);
   });
 
-  it("keeps the agent from authoring outline or card content itself", async () => {
+  it("allows the agent to author card content directly", async () => {
     const client = clientWith(JSON.stringify({
       message: "我直接写好了卡片正文。",
       changes: [{
@@ -144,8 +144,8 @@ describe("project agent", () => {
       project,
     }, client, delegates());
 
-    expect(result.changes).toEqual([]);
-    expect(result.toolEvents.filter(event => event.tool === "change.reject")).toHaveLength(1);
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0]).toMatchObject({ type: "card.upsert", targetId: 21, content: "我自己编的卡片正文。" });
   });
 
   it("rejects actions outside the allowlist", () => {
@@ -185,7 +185,7 @@ describe("project agent", () => {
     const chat = vi.fn().mockImplementation((messages: Array<{ content: string }>) => {
       const bytes = messages.reduce((sum, message) => sum + Buffer.byteLength(message.content, "utf8"), 0);
       // 40 KB 上限叠上最后一轮的截断余量，留一些余地
-      expect(bytes).toBeLessThan(48_000);
+      expect(bytes).toBeLessThan(16 * 1024 * 3);
       return Promise.resolve({ content: JSON.stringify({ action: "open", kind: "章节", id: "1" }), model: "test" });
     });
 
@@ -193,6 +193,7 @@ describe("project agent", () => {
       mode: "discuss",
       instruction: "把旧仓库相关的章节全看一遍",
       project: bulky,
+      contextWindowKTokens: 16,
       maxSteps: 8,
     }, { chat } as unknown as ModelApiClient, delegates());
 
@@ -218,7 +219,7 @@ describe("project agent", () => {
 
     expect(chat).toHaveBeenCalledTimes(3);
     expect(result.changes).toEqual([]);
-    expect(result.message).toContain("没有收敛");
+    expect(result.message).toContain("尚未完成");
   });
 
   it("recovers when the model puts a change type in the action field", async () => {
@@ -281,7 +282,7 @@ describe("project agent", () => {
     expect(result.changes).toEqual([{ type: "chapter.update", summary: "去 AI 味", targetId: 2, content: "夜雨敲在窗框上。" }]);
   });
 
-  it("caps revises per turn so one request cannot rewrite the whole book", async () => {
+  it("执行全部有效修订而不是在第十章静默停下", async () => {
     const chat = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "开始批量修订。", changes: Array.from({ length: 13 }, (_, index) => ({
         type: "chapter.revise", summary: `修订 ${index + 1}`, targetId: index + 1, instruction: "润色",
@@ -293,13 +294,12 @@ describe("project agent", () => {
     }));
 
     const result = await runProjectAgent({
-      mode: "execute", instruction: "把全书都润色一遍", project,
+      mode: "execute", instruction: "把全书都润色一遍", project: { ...project, chapters: Array.from({ length: 13 }, (_, index) => ({ id: index + 1, title: `第${index + 1}章`, content: '旧稿' })) },
     }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
-    // 前 10 章真的执行，剩下的如实报错而不静默丢弃
-    expect(chapterRevise).toHaveBeenCalledTimes(10);
-    expect(result.changes).toHaveLength(10);
-    expect(result.toolEvents.filter(event => event.tool === "chapter.revise" && event.status === "error")).toHaveLength(3);
+    expect(chapterRevise).toHaveBeenCalledTimes(13);
+    expect(result.changes).toHaveLength(13);
+    expect(result.toolEvents.filter(event => event.tool === "chapter.revise" && event.status === "error")).toHaveLength(0);
   });
 
   it("整轮委派超预算后停手，剩余变更如实报出", async () => {
@@ -318,11 +318,11 @@ describe("project agent", () => {
       mode: "execute", instruction: "一口气把后面几章都写了", project, delegateBudgetMs: 5,
     }, { chat } as unknown as ModelApiClient, { ...delegates(), chapter });
 
-    // 并发三路：开头三项在预算内同时开跑，跑完就超时，后面三项不再发请求
-    expect(chapter).toHaveBeenCalledTimes(3);
-    expect(result.changes).toHaveLength(3);
+    // 关联生成顺序执行，第一项完成时已超时，其余逐项报告
+    expect(chapter).toHaveBeenCalledTimes(1);
+    expect(result.changes).toHaveLength(1);
     const skipped = result.toolEvents.filter(event => event.tool === "chapter.draft_next" && event.status === "error");
-    expect(skipped).toHaveLength(3);
+    expect(skipped).toHaveLength(5);
     expect(skipped[0].message).toContain("未处理");
   });
 
@@ -358,7 +358,7 @@ describe("project agent", () => {
         new Promise(resolve => setTimeout(() => resolve({ type: "chapter.update", summary: request.summary, targetId: request.targetId, content: "修订后正文。" }), 6 * 60_000)));
 
       const pending = runProjectAgent({
-        mode: "execute", instruction: "把第 150 到 159 章的结尾都改掉", project,
+        mode: "execute", instruction: "把第 150 到 159 章的结尾都改掉", project: { ...project, chapters: Array.from({ length: 10 }, (_, index) => ({ id: index + 1, title: `第${index + 150}章`, content: '旧稿' })) },
       }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
       await vi.advanceTimersByTimeAsync(61 * 60_000);
 
@@ -504,7 +504,7 @@ describe("project agent", () => {
     expect(chapterSplit).toHaveBeenCalledWith(expect.objectContaining({ targetParts: 6, targetWords: 2000 }));
     expect(result.changes[0].type).toBe("chapter.parts");
   });
-  it("委派并发执行但产出顺序不变，一项失败不拖垮其余", async () => {
+  it("关联委派顺序执行，一项失败如实报告", async () => {
     const chat = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "批量润色。", changes: Array.from({ length: 6 }, (_, index) => ({
         type: "chapter.revise", summary: `润色 ${index + 1}`, targetId: index + 1, instruction: "只改文字", mode: "polish",
@@ -524,10 +524,10 @@ describe("project agent", () => {
     });
 
     const result = await runProjectAgent({
-      mode: "execute", instruction: "把这几章都润一遍", project,
+      mode: "execute", instruction: "把这几章都润一遍", project: { ...project, chapters: Array.from({ length: 6 }, (_, index) => ({ id: index + 1, title: `第${index + 1}章`, content: '旧稿' })) },
     }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
-    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBe(1);
     expect(chapterRevise).toHaveBeenCalledTimes(6);
     // 一项失败只掉这一项，其余五项仍按模型给的顺序排列
     expect(result.changes.map(change => "targetId" in change ? change.targetId : 0)).toEqual([1, 2, 4, 5, 6]);
@@ -746,9 +746,22 @@ describe("project agent context regressions", () => {
     for (const messages of requests) {
       expect(messages.some(message => message.content.includes("本轮唯一问题：192后面194是否缺剧情"))).toBe(true);
       expect(messages[0].content).not.toContain("chapter.delete");
-      expect(Buffer.byteLength(messages.map(message => message.content).join(""))).toBeLessThanOrEqual(40_000);
+      expect(Buffer.byteLength(messages.map(message => message.content).join(""))).toBeLessThanOrEqual(180_000);
     }
     expect(requests[1].at(-1)?.content).toContain("</正文>");
+  });
+
+  it("1M 窗口也不会把整本书塞进一轮请求", async () => {
+    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+      expect(Buffer.byteLength(messages.map(message => message.content).join(""), "utf8")).toBeLessThanOrEqual(180_000);
+      return { model: "test", content: JSON.stringify({ action: "finish", message: "先读到这里。", changes: [] }) };
+    });
+    await runProjectAgent({
+      mode: "discuss",
+      contextWindowKTokens: 1024,
+      instruction: "通读全书并规划后面的章纲",
+      project: { chapters: Array.from({ length: 207 }, (_, index) => ({ id: index + 1, title: `第${index + 1}章`, content: "人物继续做事。".repeat(800) })) },
+    }, { chat } as unknown as ModelApiClient, delegates());
   });
 
   it("连续分段读取保留长章的中间内容及 Unicode 字符", async () => {
@@ -763,7 +776,7 @@ describe("project agent context regressions", () => {
         ? { action: "finish", message: "正文已读完。", changes: [] }
         : { action: "open", id: 1 }) };
     });
-    await runProjectAgent({ mode: "discuss", instruction: "检查全文是否有缺失", project: { ...project, chapters: [{ id: 1, title: "第192章", content }] } }, { chat } as unknown as ModelApiClient, delegates());
+    await runProjectAgent({ mode: "discuss", contextWindowKTokens: 16, instruction: "检查全文是否有缺失", project: { ...project, chapters: [{ id: 1, title: "第192章", content }] } }, { chat } as unknown as ModelApiClient, delegates());
     expect(pages.length).toBeGreaterThan(2);
     expect(pages.join("")).toBe(content);
   });

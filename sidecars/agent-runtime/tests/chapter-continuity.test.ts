@@ -432,6 +432,7 @@ describe("正文文本拆分", () => {
   it("splitDraftTitleLine 认第一行短标题，带章号前缀与书名号的也认；第一行是叙述句时整段都是正文", () => {
     expect(splitDraftTitleLine("越过书房门槛\n\n清晨。")).toEqual({ title: "越过书房门槛", content: "清晨。" });
     expect(splitDraftTitleLine("第 204 章 《越过书房门槛》\n清晨。")).toEqual({ title: "越过书房门槛", content: "清晨。" });
+    expect(splitDraftTitleLine("# 第 205 章\n\n沈妄推开门。")).toEqual({ title: "", content: "沈妄推开门。" });
     expect(splitDraftTitleLine("清晨，梧桐路601。\n\n沈妄把信札码齐。")).toEqual({ title: "", content: "清晨，梧桐路601。\n\n沈妄把信札码齐。" });
     expect(splitDraftTitleLine("“走吧。”她说。\n他没动。")).toEqual({ title: "", content: "“走吧。”她说。\n他没动。" });
   });
@@ -493,7 +494,7 @@ describe("重写历史章的时点提醒", () => {
     store.createProject({ id: "history-note", title: "时点测试" });
     const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
     await graph.invoke({ projectId: "history-note", chapterId: "130", chapterNumber: 130, totalChapters: 204, instruction: "重写第 130 章", previousChapters: [{ id: "129", title: "第 129 章", content: "门外传来三声敲门。" }] });
-    expect(seen.some(messages => messages.includes("本章是第 130 章，正在重写") && messages.includes("第 129 章之前的记忆为准"))).toBe(true);
+    expect(seen.some(messages => messages.includes("本章是第 130 章，正在重写") && messages.includes("人物在本章的认知以此前经历为准"))).toBe(true);
     seen.length = 0;
     await graph.invoke({ projectId: "history-note", chapterId: "204", chapterNumber: 204, totalChapters: 204, instruction: "继续写", previousChapters: [{ id: "203", title: "第 203 章", content: "门外传来三声敲门。" }] });
     expect(seen.some(messages => messages.includes("本章的时点"))).toBe(false);

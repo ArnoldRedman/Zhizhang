@@ -163,6 +163,8 @@ describe("generateChapterTitle", () => {
     });
 
     expect(title).toBe("夜雨敲窗");
+    const onlyNumber = clientReturning([JSON.stringify({ title: "第 205 章" })]);
+    expect(await generateChapterTitle(onlyNumber.client, "沈妄推开门。")).toBe("");
     const [messages] = chat.mock.calls[0] as [Array<{ role: string; content: string }>];
     expect(messages[1].content).toContain("城南夜雨");
     expect(messages[1].content).toContain("承接上一章的对峙");

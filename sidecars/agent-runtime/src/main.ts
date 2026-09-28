@@ -3,15 +3,16 @@ import { authorAnswersSection, createChapterGraph, chapterAgentSystemPrompt, pro
 import { StoryStore } from "./storage/story-store.js";
 import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
-import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, masterOutlineBytes, prepareChapterInput, stableHash, stageBeatLines, storyLedgerBytes, tailText, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
+import { buildStoryLedger, byteLength, compactKnowledgeGraph, compactMasterOutline, compactText, contextBudgetBytes, masterOutlineBudget, prepareChapterInput, stableHash, stageBeatLines, storyLedgerBudget, tailText, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, shouldUseChapterSession, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, stageBeatSheetProtocol, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
+import { buildProjectRevisionContext } from "./application/project-revision-context.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { outlineWriteTargetContext, stageBeatContentFor } from "./application/outline-target.js";
 import { normalizeReviewMode } from "./application/chapter-review.js";
 import { runChapterReview } from "./application/review-runner.js";
 import { normalizeBenchmark } from "./application/benchmark.js";
-import { detectQuoteStyle, lintProse, type QuoteStyle } from "@zhizhang/contracts";
+import { detectQuoteStyle, isPlaceholderOutline, lintProse, type QuoteStyle } from "@zhizhang/contracts";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
 import { applyDraftChapterTitle, detectChapterNumberStyle, generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
 import { planChapterSplits } from "./application/chapter-split.js";
@@ -24,7 +25,7 @@ import type { RpcResponse } from "@zhizhang/contracts";
 
 /** 资料组装规则版本：改了预算或裁剪策略就加一
  * 准备结果的缓存 key 只由入参算出，代码变了 key 不变，旧缓存会一直命中、优化完全看不出效果 */
-const contextPipelineVersion = 8;
+const contextPipelineVersion = 9;
 
 /** 阶段节拍表里本章那一行压成一段：本章行是硬目标，前后行只划边界 */
 /** 项目设置里的引号风格；没设或值不认识就返回 undefined，让运行时按已有正文侦测 */
@@ -100,6 +101,7 @@ async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse>
         2400,
       );
       const memoryCacheKey = stableHash({
+        memoryVersion: 2,
         projectTitle: String(projectTitle || ""), chapterTitle: String(chapterTitle), content: String(content),
         cards: relevantCards.map(card => ({ id: card.id, title: card.title, state: card.currentState, updatedAt: card.updatedAt })),
         graphSummary, model: String(model || "gpt-5.5"), apiMode: String(apiMode || "openai"),
@@ -138,17 +140,17 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
 {
   "summary": "180 字以内的事件、人物状态和未解决线索",
   "keywords": ["最多 8 个关键词"],
-  "relationshipState": ["人物关系与情绪：谁对谁现在是什么态度、这一章两人之间发生了什么变化、各自的情绪落在哪里；一条一人或一对。主角两人同时出场的章必须有一条，哪怕只是一个小动作或一句话带来的变化，也要写出来；只有事务没有关系变化时写'主角关系：本章无变化'"],
+  "relationshipState": ["正文明确表现的人物态度、情绪与关系变化，没有则为空数组"],
   "readerKnown": ["本章读者新知道的事，一条一句"],
-  "authorTruth": ["本章埋下但读者还不知道的真相，没有就空数组"],
-  "nextChapterPromise": "本章结尾对下一章的承诺，一到两句：下一章必须接住什么。每章都要写，结尾没有明显悬念时写'本章结尾停在哪个场面、人物下一步大概率做什么'，不要空着",
+  "authorTruth": ["作者资料明确确认且与本章有关的隐藏事实，不推测，没有则为空数组"],
+  "nextChapterPromise": "人物在正文中明确约定但尚未完成的下一步，没有则为空字符串，不替作者安排后续剧情",
   "newlyIntroduced": ["本章第一次出现、之后大概率还会再出现的具名人物、地点、势力、关键物件（信物、文件、作品、遗物），一条一个；食物、日用品、交通工具、一次露面的路人和工作人员不写"],
   "characterStateChanges": ["角色名：持续状态变化"],
   "knowledgeChanges": ["角色名：得知或隐瞒的信息"],
   "foreshadowingChanges": ["伏笔进展"],
   "foreshadowingItems": [{"text":"只记跨越多章的长线伏笔（身世、旧案、远期承诺、埋下的物证）；没拆的信、没抽的单子、空着的表格这类几章内就会处理的场景待办不算，宁可留空","status":"active|progressing|resolved|overdue","priority":"high|normal|low","plantedChapter":1,"targetChapter":5}],
   "timelineEvents": ["可排序事件"],
-  "canonFacts": ["后续必须遵守的事实"],
+  "canonFacts": ["正文明确确立的世界设定和客观事实，不记录写法建议、创作禁令或审查意见"],
   "conflicts": ["冲突和结果"],
   "endingHook": "章末未解决事项",
   "entities": [{"name":"实体","type":"人物|物品|地点|势力|设定"}],
@@ -182,7 +184,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
       if (!apiKey || !instruction || !project || typeof project !== "object") {
         return { id: req.id, error: { code: -32602, message: "缺少项目 Agent 所需的小说、指令或模型配置" } };
       }
-      const projectRecord = project as Record<string, unknown>;
+      const projectRecord = structuredClone(project) as Record<string, unknown>;
       const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
       const emitProjectEvent = (event: Record<string, unknown>) => {
         if (runId) process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event: { ...event, timestamp: Date.now() } }) + "\n");
@@ -228,8 +230,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         const recentMemories = projectList("memories")
           .map(memory => ({ ...memory, chapterNumber: memoryOrdinal(memory) }))
           .filter(memory => memory.chapterNumber > 0)
-          .sort((left, right) => left.chapterNumber - right.chapterNumber)
-          .slice(-6);
+          .sort((left, right) => left.chapterNumber - right.chapterNumber);
         // 章纲写的是哪一章、从哪接、按谁的格式：从标题里的章号算，和界面路径同一套
         const targetContext = outlineWriteTargetContext(request.title, chapters, outlines);
         const result = await delegateResult("outline", "outline.write", {
@@ -299,11 +300,9 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
           : [];
         const nextNumber = chapters.length + 1;
         const title = request.title?.trim() || `第 ${nextNumber} 章`;
-        const targetOutline = request.outlineId
-          ? outlines.find(item => Number(item.id) === request.outlineId)
-          : outlines.find(item => String(item.kind || "") === "章纲" && !chapters.some(chapter => String(chapter.id) === String(item.chapterId)))
-            || [...outlines].reverse().find(item => String(item.kind || "") === "章纲");
-        const previousChapter = chapters.at(-1);
+        const targetOutline = outlines.find(item => item.kind === "章纲" && !isPlaceholderOutline(item.content)
+          && (request.outlineId ? Number(item.id) === request.outlineId : outlineWriteTargetContext(String(item.title || ""), chapters, outlines).targetChapter?.number === nextNumber));
+
         // 最近几章的记忆按章序排好一起交给章节图，只给上一章一条会让账本退化成"只看上一章"
         const chapterOrdinal = (memory: Record<string, unknown>) => {
           const explicit = Number(memory.sourceChapterNumber);
@@ -314,8 +313,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         const recentMemories = memories
           .map(memory => ({ ...memory, chapterNumber: chapterOrdinal(memory) }))
           .filter(memory => memory.chapterNumber > 0)
-          .sort((left, right) => left.chapterNumber - right.chapterNumber)
-          .slice(-6);
+          .sort((left, right) => left.chapterNumber - right.chapterNumber);
         const delegated = await rpcRegistry.dispatch({
           id: `${String(req.id)}:chapter`,
           method: "chapter.write",
@@ -330,12 +328,16 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
             chapterNumber: nextNumber,
             totalChapters: chapters.length,
             targetWords: Number(projectRecord.chapterTargetWords) || undefined,
+            projectProfile: { genre: projectRecord.genre, subgenre: projectRecord.subgenre, synopsis: projectRecord.synopsis, protagonists: [projectRecord.protagonist1, projectRecord.protagonist2].filter(Boolean) },
+            referenceChapters: chapters.filter(chapter => Array.isArray(projectRecord.referenceChapterIds) && projectRecord.referenceChapterIds.includes(chapter.id)),
+            defaultSkillNames: projectRecord.defaultSkillNames,
+            reviewMode: projectRecord.reviewMode,
             instruction: request.instruction,
             outline: String(targetOutline?.content || ""),
             outlines,
             activeOutlineId: targetOutline?.id,
             cards: Array.isArray(projectRecord.cards) ? projectRecord.cards : [],
-            previousChapters: previousChapter ? [previousChapter] : [],
+            previousChapters: chapters,
             memories: recentMemories,
             memoryDocuments: Array.isArray(projectRecord.memoryDocuments) ? projectRecord.memoryDocuments : [],
             knowledgeGraph: {
@@ -379,6 +381,8 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
           content: original,
           projectTitle: String(projectRecord.title || "未命名小说"),
           chapterTitle: String(target.title || "当前章节"),
+          // 本轮共享临时项目，后续章节能看到此前修订后的原文
+          projectContext: buildProjectRevisionContext(projectRecord, request.targetId, Number(contextWindow) || undefined),
         });
         const content = String(result.content || "").trim();
         if (!content) throw new Error(`${label}智能体没有返回可用正文`);
@@ -483,6 +487,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         mode: mode === "execute" ? "execute" : "discuss",
         instruction: String(instruction),
         project: projectRecord,
+        onStage: working => Object.assign(projectRecord, working),
         history: Array.isArray(history) ? history as Array<{ role?: unknown; content?: unknown }> : [],
         activeChapterId,
         contextWindowKTokens: contextWindow,
@@ -664,8 +669,8 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
       const ledgerPosition = { number: isBeatSheet ? Math.max(beatFrom, beatWrittenThrough + 1) : targetChapterNumber || (chapterTotal !== undefined ? chapterTotal + 1 : undefined), total: chapterTotal };
       const memoryList = Array.isArray(recentMemories) ? recentMemories.filter(item => item && typeof item === "object") as Array<Record<string, unknown>> : [];
       const directionQuery = [String(instruction || ""), sourceHandoff, String(existingContent || ""), ...memoryList.map(item => String(item.summary || ""))].join("\n").toLowerCase();
-      const masterOutlineSection = kind === "章纲" ? compactMasterOutline(masterOutline, directionQuery, masterOutlineBytes, Number(ledgerPosition.number) || undefined) : "";
-      const ledgerSection = kind === "章纲" ? buildStoryLedger(memoryList, ledgerPosition, storyLedgerBytes) : "";
+      const masterOutlineSection = kind === "章纲" ? compactMasterOutline(masterOutline, directionQuery, masterOutlineBudget(Number(contextWindow) || undefined), Number(ledgerPosition.number) || undefined) : "";
+      const ledgerSection = kind === "章纲" ? buildStoryLedger(memoryList, ledgerPosition, storyLedgerBudget(Number(contextWindow) || undefined)) : "";
       const directionSection = masterOutlineSection || ledgerSection
         ? `## 总纲与故事账本\n${[
           masterOutlineSection ? `### 总纲（含本章位置与本章条目）\n${masterOutlineSection}` : "",
@@ -824,7 +829,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
       const cachedPreparation = chapterPreparationCache.get(preparationKey)
         || await readPersistentContext<PreparedChapterInput>(`chapter-prep-${preparationKey}`);
       const prepared = cachedPreparation || prepareChapterInput({
-        instruction: String(instruction), outline, outlines, activeOutlineId, cards, previousChapters,
+        instruction: String(instruction), outline, outlines, activeOutlineId, cards, previousChapters, followingChapters, referenceChapters,
         memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills,
         contextWindowKTokens: Number(contextWindow) || undefined,
         chapterPosition,
@@ -952,8 +957,8 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
           writingStyle: writingStyle && typeof writingStyle === "object" ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) } : undefined,
           outline: prepared.outline,
           previousChapters: prepared.previousChapters,
-          followingChapters: Array.isArray(followingChapters) ? followingChapters : [],
-          referenceChapters: Array.isArray(referenceChapters) ? referenceChapters : [],
+          followingChapters: prepared.followingChapters,
+          referenceChapters: prepared.referenceChapters,
           knowledgeGraph: prepared.knowledgeGraph,
           cards: prepared.cards,
           skillCatalog: prepared.skills,
@@ -974,7 +979,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         const resultRecord = result as Record<string, unknown>;
         // 标题兵底：信封里没给 title、正文开头也没写标题行时，这一章会停在“第 N 章”占位。
         // 写完整章才发现没名字太晚，补一次几十 token 的命名请求；失败也不影响正文
-        if (!String(resultRecord.chapterTitle || "").trim() && String(resultRecord.draftContent || "").trim()) {
+        if (isPlaceholderChapterTitle(String(resultRecord.chapterTitle || "")) && String(resultRecord.draftContent || "").trim()) {
           streamEmitter.progress("review", 97, "正文已完成，正在为本章起标题");
           // 命名失败绝不能拖垮已经写好的整章正文：建客户端和请求都吐在这里
           try {
@@ -983,12 +988,12 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
               String(resultRecord.draftContent),
               { projectTitle: String(projectTitle || ""), instruction: String(instruction) },
             );
-            if (named) resultRecord.chapterTitle = named;
+            if (named && !isPlaceholderChapterTitle(named)) resultRecord.chapterTitle = named;
           } catch {
             // 标题缺失时作者仍可在接受草稿前自己填，不报错中断本次写作
           }
           // 兜底也失败就不要再默默无声：否则章节只能叫“第 N 章”，作者很难发现
-          if (!String(resultRecord.chapterTitle || "").trim()) streamEmitter.progress("review", 98, "本章标题没生成出来：接受草稿前请手动填写标题");
+          if (isPlaceholderChapterTitle(String(resultRecord.chapterTitle || ""))) streamEmitter.progress("review", 98, "本章标题没生成出来：接受草稿前请手动填写标题");
         }
         // 会话只记"这一章写成了什么 + 审查还指出什么问题"，不把构思全文当结论：
         // 构思是一次性产物，下一章会重新想，把它当"已确认结论"回喂只会把模型拉回上一章的写法。

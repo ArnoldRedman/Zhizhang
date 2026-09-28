@@ -1,20 +1,19 @@
 import type { Chapter, KnowledgeCard, OutlineDocument, Project } from '../../domain/project';
 import type { Skill } from '../../domain/skill';
 import type { DismantleAggregate, WritingStyle } from '../../domain/library';
-import { firstSentence, isWorkLogDocumentTitle, lastSentence, writingGuideFacts } from '@zhizhang/contracts';
+import { firstSentence, isPlaceholderOutline, isWorkLogDocumentTitle, lastSentence, writingGuideFacts } from '@zhizhang/contracts';
 import { buildMemoryDocuments, recentChapterMemories } from '../../domain/memory.ts';
 import { answeredAuthorQuestions } from '../../domain/outline.ts';
-import { cardSearchTermGroups } from '../../domain/cards.ts';
 import { chapterBoundToOutline } from '../outline/model.ts';
 
 /**
  * 章节智能体的入参组装
  * 从 App.tsx 的 runChapterAgent 里搬出来的纯函数：只看项目数据和作者的选择，不碰界面状态、会话 id 和模型配置。
  * 章节智能体到底能看到哪些资料，全部在这一处决定：
- * - 世界观与总纲固定带入，总纲由运行时压成骨架加当前阶段段落
- * - 当前章的章纲按绑定关系自动带入，作者勾选的其他章纲只做参考
- * - 卡片作者没勾时按章纲与上一章里出现的卡自动挑
- * - 前文只传紧邻上一章正文；更早的章节通过最近章节记忆和聚合文档进入
+ * - 世界观、总纲与全书前文摘要固定带入，由运行时按窗口分配空间
+ * - 当前章绑定有效章纲，作者勾选的其他章纲只做参考
+ * - 卡片未指定时全部提供，近期正文优先整章保留
+ * - 文风参考由作者指定，不依赖任何一本书的固定章号
  */
 
 /** 进入运行时检索库的聚合文档：角色认知/冲突/章节快照靠逐章记忆覆盖，任务书只带这四份 */
@@ -63,29 +62,14 @@ export const stageBeatsFor = (project: Project, chapterNumber: number): OutlineD
 });
 
 /**
- * 作者没勾卡片时自动挑：金手指卡固定带入，其余按在章纲、上一章正文和指令里出现的次数排
- * 只用主词（卡名/别名/能力名），次词会把“中心”“法庭”这类到处都有的词当成命中
- */
-const autoSelectCards = (project: Project, haystack: string, limit = 8): KnowledgeCard[] => project.cards
-  .filter(card => !card.pinned)
-  .map(card => ({
-    card,
-    score: (card.type === '金手指卡' ? 100 : 0) + cardSearchTermGroups(card).primary.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0),
-  }))
-  .filter(entry => entry.score > 0)
-  .sort((left, right) => right.score - left.score)
-  .slice(0, limit)
-  .map(entry => entry.card);
-
-/**
  * 本次入场卡片：常驻卡每章必带；其余勾了就用勾的，没勾自己挑——懒人化就是这一条，不选也不会缺人物素材
  * 章纲生成与正文写作共用同一套规矩，免得一边自动一边空手
  */
-export const effectiveCards = (project: Project, selectedCardIds: number[], haystack: string): KnowledgeCard[] => {
+export const effectiveCards = (project: Project, selectedCardIds: number[], _haystack: string): KnowledgeCard[] => {
   const pinned = project.cards.filter(card => card.pinned);
   const rest = selectedCardIds.length
     ? project.cards.filter(card => selectedCardIds.includes(card.id) && !card.pinned)
-    : autoSelectCards(project, haystack);
+    : project.cards.filter(card => !card.pinned);
   return [...pinned, ...rest];
 };
 
@@ -112,8 +96,8 @@ export interface ChapterWriteContext {
 }
 
 /** 当前章的章纲：先认 chapterId，再认标题或章纲开头里的章号 */
-export const boundChapterOutlineFor = (project: Project, chapter: Chapter): OutlineDocument | undefined =>
-  project.outlines.find(outline => outline.kind === '章纲'
+export const boundChapterOutlineFor = (project: Project, chapter: Chapter, includePlaceholder = false): OutlineDocument | undefined =>
+  project.outlines.find(outline => outline.kind === '章纲' && (includePlaceholder || !isPlaceholderOutline(outline.content))
     && (String(outline.chapterId ?? '') === String(chapter.id) || chapterBoundToOutline(project, outline)?.id === chapter.id));
 
 /**
@@ -175,13 +159,14 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
       knowledgeGraph: { nodes: project.graphNodes, edges: project.graphEdges },
       stageBeats: stageBeatsFor(project, chapterNumber)?.content,
       skills,
+      writingStyle: input.writingStyle ? { name: input.writingStyle.name, content: input.writingStyle.content } : undefined,
       preferredSkillNames: input.preferredSkillNames.filter(name => input.skills.some(skill => skill.name === name)),
       defaultSkillNames: (project.defaultSkillNames || []).filter(name => input.skills.some(skill => skill.name === name)),
-      previousChapters: previousChapter ? [{ id: previousChapter.id, title: previousChapter.title, content: previousChapter.content }] : [],
-      followingChapters: project.chapters.slice(chapterIndex + 1, chapterIndex + 4).filter(item => item.content.trim()).map(item => ({ id: item.id, title: item.title, content: item.content })),
+      previousChapters: project.chapters.slice(0, Math.max(0, chapterIndex)).filter(item => item.content.trim()).map(item => ({ id: item.id, title: item.title, content: item.content })),
+      followingChapters: project.chapters.slice(chapterIndex + 1).filter(item => item.content.trim()).map(item => ({ id: item.id, title: item.title, content: item.content })),
       referenceChapters: project.chapters
         .map((item, index) => ({ item, number: index + 1 }))
-        .filter(entry => entry.number !== chapterNumber && entry.number >= 109 && entry.number <= 113 && entry.item.content.trim())
+        .filter(entry => entry.number !== chapterNumber && project.referenceChapterIds?.includes(entry.item.id) && entry.item.content.trim())
         .map(entry => ({ id: entry.item.id, number: entry.number, title: entry.item.title, content: entry.item.content })),
       memories: priorMemories.map(memory => ({
         id: memory.id,

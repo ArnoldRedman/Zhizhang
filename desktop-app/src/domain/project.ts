@@ -219,6 +219,8 @@ export interface Project {
   aiDetection?: AIDetectionReport;
   chapterTargetWords?: number;
   styleProfileId?: string;
+  /** 作者选定的原文参考章节，不默认绑定任何章号 */
+  referenceChapterIds?: number[];
   sourceDismantleBookId?: string;
   authorPreferences?: string[];
   /** 审查档位：full 四视角、lean 两视角、solo 一次合并审查；缺省 lean */

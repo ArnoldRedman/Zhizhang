@@ -390,7 +390,9 @@ export async function generateChapterTitle(
     const cleaned = response.content.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "").trim();
     const parsed = JSON.parse(cleaned) as Record<string, unknown>;
     const name = [parsed.title, parsed.chapterTitle, parsed["标题"]].find(value => typeof value === "string" && value.trim());
-    return typeof name === "string" ? cleanChapterTitleName(name) : "";
+    if (typeof name !== "string") return "";
+    const titleName = cleanChapterTitleName(name).replace(chapterNumberPrefix, "").trim();
+    return titleName && !isPlaceholderChapterTitle(titleName) ? titleName : "";
   } catch {
     return "";
   }

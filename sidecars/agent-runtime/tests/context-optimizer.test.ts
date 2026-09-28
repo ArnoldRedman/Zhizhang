@@ -83,7 +83,7 @@ describe("story-level context", () => {
     expect(byteLength(result)).toBeLessThanOrEqual(120);
   });
 
-  it("compactMasterOutline 给出全部标题骨架，正文只取主线段与相关段，结局段只留标题", () => {
+  it("compactMasterOutline 全文放得下时保留全书规划，包含结局依据", () => {
     const outline = [
       "# 总纲",
       "## 主线目标",
@@ -100,7 +100,7 @@ describe("story-level context", () => {
     expect(result).toContain("## 结局方向");
     expect(result).toContain("主线目标");
     expect(result).toContain("阁楼发现旧电台");
-    expect(result).not.toContain("母亲仍然活着");
+    expect(result).toBe(outline);
   });
 
   // 症状：连续写十几章都在写同一件事。旧的相关度排序只按词面重合挑段落，
@@ -122,11 +122,11 @@ describe("story-level context", () => {
     ].join("\n");
     const result = compactMasterOutline(outline, "沈砚在阁楼守着旧电台等敲门的人", 3000);
     // 第二卷用的是“进城、追查、结盟”，与已写正文零重合，旧做法会把它整个丢掉
-    expect(result).toContain("推进路线");
+    expect(result).toContain("分卷规划");
     expect(result).toContain("沈砚进城追查电台来源");
-    expect(result).toContain("接下来要推进到");
+    expect(result).toContain("下一步节点");
     expect(result).toContain("三天内找到灯塔守夜人");
-    expect(result).not.toContain("母亲仍然活着");
+    expect(result).toContain("母亲仍然活着");
   });
 
   // 症状：长篇小说的卷标题里写着章号区间（第156～205章），却被当成普通段落按词面打分挑，
@@ -150,10 +150,10 @@ describe("story-level context", () => {
       "把个人治愈推向国家文化保护层面。",
     ].join("\n");
     const result = compactMasterOutline(outline, "沈妄在温室里试制桑皮纸", 5600, 176);
-    expect(result).toContain("【当前卷】");
+    expect(result).toContain("正在写第 176 章");
     expect(result).toContain("第五卷：栖迟文脉");
     expect(result).toContain("第178～185章：研究沉淀与生活回落");
-    expect(result).toContain("【下一卷】");
+    expect(result).toContain(outline);
     expect(result).toContain("第六卷：大美敦煌");
   });
 
@@ -182,14 +182,14 @@ describe("story-level context", () => {
       "- 核心：敦煌莫高窟特邀抢救。",
     ].join("\n");
     const current = compactMasterOutline(outline, "沈妄在纸行对案", 5600, 179);
-    expect(current).toContain("【当前卷】\n### 第四卷：书肆二期与大婚盛典");
+    expect(current).toContain("### 第四卷：书肆二期与大婚盛典");
     expect(current).toContain("关键节点：专著问世；大婚华服试样与仪式；国风盛典");
     expect(current).toContain("埋伏：敦煌特邀函");
     // "须在第174～177章完成"是正文里的一句话，不是阶段标题：以前被当成阶段，本章位置就标成了"第 2/4 章"这种假位置
     expect(current).not.toContain("本章位于阶段");
     expect(current).toContain("桑皮纸试制阶段收尾须在第174～177章完成");
     // 卖点段落既不能变成"当前节点"，也不能变成"接下来要推进到"
-    expect(current).not.toContain("| 穿越后依靠系统逆袭");
+    expect(current).toContain(outline);
     expect(current).not.toContain("接下来要推进到");
     // 已完成的第三卷只留标题，但卷内阶段标在第四章上时仍能定位
     const inside = compactMasterOutline(outline, "沈妄在纸行对案", 5600, 175);
@@ -221,19 +221,18 @@ describe("story-level context", () => {
       "| 深蓝色笔记本 | 主动生活完成最终反转 |",
     ].join("\n");
     const last = compactMasterOutline(outline, "沈妄在教室里讲桑皮纸", 5600, 177);
-    expect(last).toContain("本章位置：第五卷：栖迟文脉（第156～205章）；本章位于阶段「第171～177章」：第 7/7 章，是本阶段最后一章");
-    expect(last).toContain("下一阶段「第178～185章：研究沉淀与生活回落」");
-    expect(last).toContain("【当前阶段：本章是本阶段第 7/7 章，也是最后一章】");
-    expect(last).toContain("【下一阶段：本章还没到这里】\n- **第178～185章：研究沉淀与生活回落**");
+    expect(last).toContain("正在写第 177 章");
+    expect(last).toContain("第171～177章");
+    expect(last).toContain("第178～185章：研究沉淀与生活回落");
     // 其他阶段只留标题行；伏笔矩阵不再被当成“当前节点”
     expect(last).toContain("- **第186～195章：专著影响扩展**");
-    expect(last).not.toContain("《古籍微痕通论》逐渐形成社会影响");
+    expect(last).toContain("《古籍微痕通论》逐渐形成社会影响");
     expect(last).not.toContain("当前节点");
-    expect(last).not.toContain("深蓝色笔记本");
+    expect(last).toContain("深蓝色笔记本");
     // 卷中只给下一卷的标题，细节留给卷末
-    expect(last).toContain("【下一卷】\n## 第六卷：大美敦煌（第206～250章）");
+    expect(last).toContain("## 第六卷：大美敦煌（第206～250章）");
     const middle = compactMasterOutline(outline, "沈妄整理记录", 5600, 180);
-    expect(middle).toContain("本章位于阶段「第178～185章：研究沉淀与生活回落」：第 3/8 章，本阶段还剩 5 章，本章走其中一步");
+    expect(middle).toContain("正在写第 180 章");
   });
 
   it("leadText 只取开头并在句末收口，不留裁剪标记", () => {
@@ -311,7 +310,7 @@ describe("story-level context", () => {
     const budget = contextBudgetBytes(128);
     expect(budget).toBeGreaterThan(48 * 1024);
     expect(budget).toBeLessThan(100 * 1024);
-    expect(contextBudgetBytes(1024)).toBe(256 * 1024);
+    expect(contextBudgetBytes(1024)).toBeGreaterThan(700 * 1024);
     // 调用方显式给小预算时仍然听它的（记忆提炼、图书路径靠这个控制成本）
     expect(contextBudgetBytes(128, 20, 8)).toBe(20 * 1024);
   });
@@ -341,9 +340,9 @@ describe("story-level context", () => {
       chapterPosition: { number: 3, total: 2 },
       contextWindowKTokens: 32,
     });
-    expect(prepared.masterOutline).toContain("结构骨架");
+    expect(prepared.masterOutline).toContain("总纲全文");
     expect(prepared.masterOutline).toContain("找到电台真相");
-    expect(prepared.masterOutline).not.toContain("母亲活着");
+    expect(prepared.masterOutline).toContain("母亲活着");
     expect(prepared.outline).toContain("守夜人");
     expect(prepared.outline).not.toContain("结局方向");
     expect(prepared.previousChapters[0]?.ending).toContain("门外三声敲门");

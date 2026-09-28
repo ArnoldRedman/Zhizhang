@@ -3,14 +3,14 @@ import type { BaseMessage } from "@langchain/core/messages";
 import { StoryStore } from "../storage/story-store.js";
 import { ModelApiClient, type ApiUsage, type ApiWireMode, type ChatMessage } from "../models/model-api.js";
 import type { StreamEmitter } from "../streaming/stream-handler.js";
-import { byteLength, compactText, formatContextReport, masterOutlineBytes, storyLedgerBytes, tailText, type ContextReport } from "../context/context-optimizer.js";
+import { byteLength, compactText, formatContextReport, tailText, type ContextReport } from "../context/context-optimizer.js";
 import { draftAcceptanceIssues, lintProse, normalizePauses, normalizeQuotes, type LintFinding, type QuoteStyle } from "@zhizhang/contracts";
 import { reviewUnavailable, type ChapterReviewResult, type ReviewMode } from "../application/chapter-review.js";
 import { perspectiveLabel, runChapterReview } from "../application/review-runner.js";
 import { chapterRevisePrompt, wholeChapterTokenBudget } from "../application/text-prompts.js";
 import type { ChapterBenchmark } from "../application/benchmark.js";
 // 标题拆分与补全是纯文本处理，批量补标题也要用同一套判定，统一放在 application 层
-import { cleanChapterTitleName, splitChapterTitleHeading } from "../application/chapter-titles.js";
+import { cleanChapterTitleName, isPlaceholderChapterTitle, splitChapterTitleHeading } from "../application/chapter-titles.js";
 
 export interface SkillDefinition {
   name: string;
@@ -103,7 +103,12 @@ function stripPreambleAffirmation(text: string): string {
  */
 export function splitDraftTitleLine(text: string): { title: string; content: string } {
   const headed = splitChapterTitleHeading(text);
-  if (headed.title) return { title: cleanChapterTitleName(headed.title), content: headed.content };
+  if (headed.title) {
+    const title = cleanChapterTitleName(headed.title);
+    // 只有章号不算章名，留给写完后的命名请求
+    if (!title || isPlaceholderChapterTitle(title)) return { title: "", content: headed.content };
+    return { title, content: headed.content };
+  }
   const lines = text.trim().split("\n");
   const first = lines[0]?.trim() || "";
   const rest = lines.slice(1).join("\n").trim();
@@ -175,8 +180,8 @@ export interface ProjectProfile {
 function storyDirectionPacket(state: ChapterStateType): string {
   return [
     state.chapterBeat ? `## 本章节拍（阶段节拍表给本章定的事件）\n${compactText(state.chapterBeat, 1200)}` : "",
-    state.masterOutline ? `## 总纲（含本章位置与本章条目）\n${compactText(state.masterOutline, masterOutlineBytes)}` : "",
-    state.storyLedger ? `## 故事账本（前文已发生的事与长线伏笔）\n${compactText(state.storyLedger, storyLedgerBytes)}` : "",
+    state.masterOutline ? `## 总纲（含本章位置与本章条目）\n${state.masterOutline}` : "",
+    state.storyLedger ? `## 故事账本（前文已发生的事与长线伏笔）\n${state.storyLedger}` : "",
   ].filter(Boolean).join("\n\n");
 }
 
@@ -268,7 +273,7 @@ export const ChapterState = Annotation.Root({
   previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string; ending?: string }> | undefined>,
   /** 重写历史章时的后文参考，只用于让模型知道本章不能把后面已经承担的戏提前写完 */
   followingChapters: Annotation<Array<{ id?: string | number; title: string; content: string }> | undefined>,
-  referenceChapters: Annotation<Array<{ id?: string | number; number: number; title: string; content: string }> | undefined>,
+  referenceChapters: Annotation<Array<{ id?: string | number; title: string; content: string }> | undefined>,
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
@@ -378,20 +383,22 @@ function chapterMaterialPacket(state: ChapterStateType): string {
   const skillsSection = state.selectedSkills.length
     ? `\n## 写作参考\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 3).map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, 1600)}`).join("\n\n")}\n`
     : "";
-  const continuitySection = state.continuityContext ? `\n## 上一章结尾\n${state.continuityContext}\n` : "";
+  const continuitySection = state.previousChapters?.length
+    ? `\n## 前文章节（按时间顺序；有裁剪标记的为摘录）\n${state.previousChapters.map(chapter => `### ${chapter.title}\n${chapter.content}`).join("\n\n")}\n`
+    : state.continuityContext ? `\n## 上一章结尾\n${state.continuityContext}\n` : "";
   const promiseSection = state.previousPromise ? `\n## 上一章留给本章的事\n${state.previousPromise}\n` : "";
   const directionSection = storyDirectionPacket(state);
   // 重写历史章：卡片正文和设定文档里难免写着后面章的事（"第 204 章体检""第 194 章改称阿妄"），这些在本章时点还没发生
   const number = typeof state.chapterNumber === "number" ? state.chapterNumber : 0;
   const historical = number > 0 && typeof state.totalChapters === "number" && number < state.totalChapters;
   const historyNote = historical
-    ? `\n## 本章的时点\n本章是第 ${number} 章，正在重写。资料里凡是标着第 ${number} 章及以后章号的事（卡片里的"第 194 章起改称""第 204 章体检"、设定文档里的后续进展）在本章时点都还没发生，不能写进来、不能让人物知道；人物关系与状态以第 ${number - 1} 章之前的记忆为准。\n`
+    ? `\n## 本章的时点\n本章是第 ${number} 章，正在重写。人物在本章的认知以此前经历为准；后续章节用于核对衔接，不代表人物已经经历了未来事件。\n`
     : "";
   const followingSection = state.followingChapters?.length
-    ? `\n## 后续章节参考\n${state.followingChapters.map(chapter => `### ${chapter.title}\n${compactText(chapter.content, 2200)}`).join("\n\n")}\n`
+    ? `\n## 后续章节参考\n${state.followingChapters.map(chapter => `### ${chapter.title}\n${chapter.content}`).join("\n\n")}\n`
     : "";
   const referenceSection = state.referenceChapters?.length
-    ? `\n## 人物参考章节\n第111章及其前后章节是本书人物和情绪的主要参考：\n${state.referenceChapters.map(chapter => `### 第${chapter.number}章｜${chapter.title}\n${compactText(chapter.content, chapter.number === 111 ? 9000 : 3500)}`).join("\n\n")}\n`
+    ? `\n## 作者选定的文风参考\n参考表达和人物表现，事件时点以正在写的章节为准：\n${state.referenceChapters.map(chapter => `### ${chapter.title}\n${chapter.content}`).join("\n\n")}\n`
     : "";
   return [skillsSection, historyNote, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, continuitySection, promiseSection, contextSection, followingSection, referenceSection].filter(Boolean).join("");
 }
@@ -702,7 +709,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         if (!revised.content) return { autoRepairRounds: 1, autoRepairSucceeded: false, errors: ["自动修正没有返回正文，保留首稿"] };
         return {
           draftContent: revised.content,
-          chapterTitle: revised.title || state.chapterTitle,
+          chapterTitle: revised.title && !isPlaceholderChapterTitle(revised.title) ? revised.title : state.chapterTitle,
           authorNotes: [...state.authorNotes, ...revised.authorNotes],
           lintRounds: 0,
           autoRepairRounds: 1,

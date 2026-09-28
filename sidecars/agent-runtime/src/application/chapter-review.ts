@@ -1,4 +1,4 @@
-import { compactText, masterOutlineBytes, storyLedgerBytes } from "../context/context-optimizer.js";
+import { compactText } from "../context/context-optimizer.js";
 
 /**
  * 章节审查：三档四视角
@@ -189,10 +189,10 @@ export function chapterReviewRequest(input: ChapterReviewInput, perspective: Rev
   const wantsCards = perspective !== "prose";
   const wantsGraph = perspective === "consistency" || perspective === "solo";
   const directionSection = wantsDirection ? [
-    input.previousChapter?.content ? `## 紧邻上一章原文（核对已经发生的结果）\n${compactText(input.previousChapter.content, 7500)}` : "",
+    input.previousChapter?.content ? `## 紧邻上一章原文（核对已经发生的结果）\n${input.previousChapter.content}` : "",
     input.chapterBeat ? `## 本章节拍（阶段节拍表给本章定的事件）\n${compactText(input.chapterBeat, 1200)}` : "",
-    input.masterOutline ? `## 总纲（含本章位置与本章条目）\n${compactText(input.masterOutline, masterOutlineBytes)}` : "",
-    input.storyLedger ? `## 故事账本（前文已发生的事与长线伏笔）\n${compactText(input.storyLedger, storyLedgerBytes)}` : "",
+    input.masterOutline ? `## 总纲（含本章位置与本章条目）\n${input.masterOutline}` : "",
+    input.storyLedger ? `## 故事账本（前文已发生的事与长线伏笔）\n${input.storyLedger}` : "",
     input.chapterPlan && perspective !== "consistency" ? `## 本章构思\n${compactText(input.chapterPlan, 2400)}` : "",
     input.previousPromise && (perspective === "consistency" || perspective === "solo") ? `## 上一章的下一章承诺\n${compactText(input.previousPromise, 600)}` : "",
     input.instruction && (perspective === "architect" || perspective === "solo") ? `## 作者对本章的要求\n${compactText(input.instruction, 800)}` : "",
@@ -203,7 +203,7 @@ export function chapterReviewRequest(input: ChapterReviewInput, perspective: Rev
   const graphSection = wantsGraph && input.knowledgeGraph ? `\n## 知识图谱约束\n${input.knowledgeGraph}\n` : "";
   const contextSection = wantsGraph && input.retrievedContext?.length ? `\n## 已知背景信息\n${input.retrievedContext.join("\n\n")}\n` : "";
   const constraints = `${cardsSection}${graphSection}${directionSection ? `\n${directionSection}\n` : ""}${contextSection}`;
-  const reviewPrompt = [historyNote, `## 约束摘要\n${constraints || "（暂无额外约束）"}\n\n## 待审查章节\n${compactText(input.draftContent, 10000)}`].filter(Boolean).join("\n\n");
+  const reviewPrompt = [historyNote, `## 约束摘要\n${constraints || "（暂无额外约束）"}\n\n## 待审查章节\n${input.draftContent}`].filter(Boolean).join("\n\n");
   const session = splitSessionContext(input.sessionContext);
   const messages: ChapterReviewMessage[] = [
     { role: "system", content: input.agentSystemPrompt },

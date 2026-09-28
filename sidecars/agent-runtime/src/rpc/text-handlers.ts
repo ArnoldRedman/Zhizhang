@@ -48,9 +48,12 @@ export const registerTextHandlers = (registry: RpcRegistry): RpcRegistry => regi
     // 整章改写走流式：六千字的章节要生成一两分钟，非流式时网关全程收不到任何字节，
     // 会在模型写完之前先切断连接并回 524；而重试发出去的是同一个同样慢的请求，重几次都还是 524。
     // 流式下字节持续流动，网关不会认为源站卡死；中途真断了也能带着已生成的半章接着写完。
+    const style = params.writingStyle && typeof params.writingStyle === "object" ? params.writingStyle as Record<string, unknown> : undefined;
+    const context = [typeof params.projectContext === "string" ? params.projectContext : "", style?.content ? `## 作者绑定的文风\n${String(style.content)}` : ""].filter(Boolean).join("\n\n");
+    const messages = [...(context ? [{ role: "user" as const, content: context }] : []), { role: "user" as const, content: prompt }];
     const response = mode === "continue"
-      ? await client.chat([{ role: "user", content: prompt }], options)
-      : await client.chatStream([{ role: "user", content: prompt }], options);
+      ? await client.chat(messages, options)
+      : await client.chatStream(messages, options);
     let result = response.content.trim().replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim();
     if (mode === "continue" && numericLimit > 0 && Array.from(result.replace(/\s/gu, "")).length > numericLimit) {
       const limited = Array.from(result).slice(0, numericLimit).join("");

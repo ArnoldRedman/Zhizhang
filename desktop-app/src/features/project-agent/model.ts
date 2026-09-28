@@ -18,6 +18,12 @@ export interface ProjectAgentSession {
 }
 export interface ProjectAgentResponse { message: string; changes?: unknown[]; toolEvents?: ProjectAgentToolEvent[] }
 
+/** 第208章算单章；第206～215章这种区间不算 */
+export const chapterOutlineNumber = (title: unknown, content?: unknown) => {
+  const match = /第\s*(\d{1,4})\s*章(?!\s*[～~\-—–至到])/u.exec(`${String(title ?? '')}\n${String(content ?? '').slice(0, 400)}`);
+  return match ? Number(match[1]) : undefined;
+};
+
 export const projectAgentSessionId = () => `project-agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const projectAgentRecord = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const projectAgentString = (value: unknown, max: number) => typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : '';
@@ -149,6 +155,27 @@ export const normalizeProjectAgentChange = (value: unknown, project: Project, in
     if (!targetId || !target) return null;
     return { type, id, status, summary, targetId, title: target.title };
   }
+  if (type === 'outline.delete') {
+    const targetId = projectAgentNumber(value.targetId);
+    const target = targetId ? project.outlines.find(item => item.id === targetId && item.kind === '章纲') : undefined;
+    if (!targetId || !target) return null;
+    return { type, id, status, summary, targetId, title: target.title };
+  }
+  if (type === 'text.replace') {
+    const targetId = projectAgentNumber(value.targetId);
+    const targetKind = value.target === 'chapter' || value.target === 'outline' ? value.target : undefined;
+    const exists = targetKind === 'chapter'
+      ? project.chapters.some(item => item.id === targetId)
+      : targetKind === 'outline' ? project.outlines.some(item => item.id === targetId) : false;
+    const replacements = Array.isArray(value.replacements) ? value.replacements.flatMap(item => {
+      if (!projectAgentRecord(item)) return [];
+      const find = projectAgentString(item.find, 2000);
+      const replace = projectAgentString(item.replace, 8000);
+      return find ? [{ find, replace }] : [];
+    }).slice(0, 12) : [];
+    if (!targetId || !targetKind || !exists || !replacements.length) return null;
+    return { type, id, status, summary, target: targetKind, targetId, replacements };
+  }
   return null;
 };
 
@@ -170,7 +197,7 @@ export const normalizeProjectAgentSession = (value: unknown, project: Project, s
       error: item.error === true,
     }];
   }) : [];
-  const changes = Array.isArray(value.changes) ? value.changes.slice(-80).map((item, index) => normalizeProjectAgentChange(item, project, index)).filter((item): item is ProjectAgentChange => Boolean(item)) : [];
+  const changes = Array.isArray(value.changes) ? value.changes.filter((item, index, items) => (projectAgentRecord(item) && item.status === 'pending') || index >= items.length - 80).map((item, index) => normalizeProjectAgentChange(item, project, index)).filter((item): item is ProjectAgentChange => Boolean(item)) : [];
   return {
     version: 1,
     projectId: project.id,

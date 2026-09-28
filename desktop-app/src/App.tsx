@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ChangeEvent
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
-import { detectQuoteStyle, isWorkLogDocumentTitle, isWritingGuideDocumentTitle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, writingGuideFacts, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
+import { applyTextReplacements, detectQuoteStyle, isWorkLogDocumentTitle, isWritingGuideDocumentTitle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, writingGuideFacts, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
@@ -25,7 +25,7 @@ import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOp
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
 import type { DismantleChapter, DismantleBook, DismantleAggregate, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
-import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
+import { projectAgentSessionId, chapterOutlineNumber, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
 import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
 import { readerFonts, themes, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
 import { usePaneSizes } from './features/editor/use-pane-sizes';
@@ -748,6 +748,7 @@ const normalizeStoredProject = (value: unknown): Project => {
 const projectAgentChangeTargetKey = (change: ProjectAgentChange) => {
   if (change.type === 'project.update') return 'project';
   if (change.type === 'outline.upsert') return `outline:${change.targetId ?? `new:${change.kind}:${change.title}`}`;
+  if (change.type === 'text.replace') return `text:${change.target}:${change.targetId}`;
   if (change.type === 'card.upsert') return `card:${change.targetId ?? `new:${change.cardType}:${change.title}`}`;
   if (change.type === 'memory.document.upsert') return `memory:${change.kind}`;
   if (change.type === 'graph.node.upsert') return `graph-node:${change.targetId}`;
@@ -765,12 +766,13 @@ const projectAgentRebase = (change: ProjectAgentChange, project: Project): Proje
     const source = project as unknown as Record<string, unknown>;
     return { ...change, baseFields: Object.fromEntries(Object.keys(change.patch).map(key => [key, source[key]])) };
   }
-  if (change.type === 'outline.upsert') return { ...change, baseUpdatedAt: project.outlines.find(item => item.id === change.targetId)?.updatedAt };
+  if (change.type === 'outline.upsert' || change.type === 'outline.delete') return { ...change, baseUpdatedAt: project.outlines.find(item => item.id === change.targetId)?.updatedAt };
   if (change.type === 'card.upsert') return { ...change, baseUpdatedAt: project.cards.find(item => item.id === change.targetId)?.updatedAt };
   if (change.type === 'memory.document.upsert') return { ...change, baseUpdatedAt: project.memoryDocuments.find(item => item.kind === change.kind)?.updatedAt };
   if (change.type === 'graph.node.upsert') return { ...change, baseUpdatedAt: project.graphNodes.find(item => item.id === change.targetId)?.updatedAt };
   if (change.type === 'graph.edge.upsert') return { ...change, baseUpdatedAt: project.graphEdges.find(item => item.id === change.targetId)?.updatedAt };
   if (change.type === 'chapter.update') return { ...change, baseUpdatedAt: project.chapters.find(item => item.id === change.targetId)?.updatedAt };
+  if (change.type === 'text.replace') return { ...change, baseUpdatedAt: (change.target === 'chapter' ? project.chapters : project.outlines).find(item => item.id === change.targetId)?.updatedAt };
   return change;
 };
 
@@ -778,6 +780,8 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
   const order: Record<ProjectAgentRawChange['type'], number> = {
     'project.update': 0,
     'outline.upsert': 1,
+    'outline.delete': 11,
+    'text.replace': 12,
     'card.upsert': 2,
     'memory.document.upsert': 3,
     'graph.node.upsert': 4,
@@ -803,9 +807,10 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       const conflicts = Object.keys(change.baseFields).filter(key => JSON.stringify(source[key]) !== JSON.stringify(change.baseFields?.[key]));
       if (conflicts.length) throw new Error(`小说资料的 ${conflicts.join('、')} 已在提案生成后被修改，请重新让项目 Agent 处理`);
     }
-    if (change.type === 'outline.upsert') {
+    if (change.type === 'outline.upsert' || change.type === 'outline.delete') {
       const target = change.targetId ? project.outlines.find(item => item.id === change.targetId) : undefined;
       if (change.targetId && !target) throw new Error(`找不到待更新大纲 ID ${change.targetId}`);
+      if (change.type === 'outline.delete' && target && target.kind !== '章纲') throw new Error(`《${target.title}》不是章纲，不能删除`);
       if (target) stale(change.baseUpdatedAt, target.updatedAt, `大纲《${target.title}》`);
     }
     if (change.type === 'card.upsert') {
@@ -828,6 +833,12 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
     if (change.type === 'chapter.create') {
       if (project.chapters.some(item => item.title.trim() === change.title.trim())) throw new Error(`章节《${change.title}》已经存在`);
     }
+    if (change.type === 'text.replace') {
+      const list = change.target === 'chapter' ? project.chapters : project.outlines;
+      const target = list.find(item => item.id === change.targetId);
+      if (!target) throw new Error(`找不到要局部修改的${change.target === 'chapter' ? '章节' : '大纲'} ${change.targetId}`);
+      stale(change.baseUpdatedAt, target.updatedAt, `${change.target === 'chapter' ? '章节' : '大纲'}《${target.title}》`);
+    }
     if (change.type === 'chapter.update' || change.type === 'chapter.delete') {
       const target = project.chapters.find(item => item.id === change.targetId);
       if (!target) throw new Error(`找不到章节 ID ${change.targetId}`);
@@ -845,13 +856,16 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       continue;
     }
     if (change.type === 'outline.upsert') {
-      const previous = change.targetId ? next.outlines.find(item => item.id === change.targetId) : undefined;
+      const number = change.kind === '章纲' ? chapterOutlineNumber(change.title, change.content) : undefined;
+      const matched = !change.targetId && number ? next.outlines.find(item => item.kind === '章纲' && chapterOutlineNumber(item.title, item.content) === number) : undefined;
+      const targetId = change.targetId ?? matched?.id;
+      const previous = targetId ? next.outlines.find(item => item.id === targetId) : undefined;
       // 项目 Agent 改总纲、世界观同样先留历史版本，改坏了能回退
       const kept = previous ? pushOutlineSnapshot(previous, '项目 Agent 更新') : undefined;
       const outline: OutlineDocument = {
-        id: change.targetId ?? ++serial,
+        id: targetId ?? ++serial,
         kind: change.kind,
-        chapterId: change.chapterId,
+        chapterId: change.chapterId ?? previous?.chapterId,
         title: change.title,
         content: change.content,
         createdAt: previous?.createdAt || now,
@@ -860,11 +874,42 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       };
       next = {
         ...next,
-        outlines: change.targetId ? next.outlines.map(item => item.id === change.targetId ? outline : item) : [...next.outlines, outline],
+        outlines: targetId ? next.outlines.map(item => item.id === targetId ? outline : item) : [...next.outlines, outline],
         graphNodes: next.graphNodes.some(node => node.id === `outline:${outline.id}`)
           ? next.graphNodes.map(node => node.id === `outline:${outline.id}` ? { ...node, label: outline.title, category: outline.kind, updatedAt: now } : node)
           : [...next.graphNodes, { id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: outline.kind, content: createGraphNodeProfile('outline', outline.kind), updatedAt: now }],
       };
+      continue;
+    }
+    if (change.type === 'outline.delete') {
+      const nodeId = `outline:${change.targetId}`;
+      next = {
+        ...next,
+        outlines: next.outlines.filter(item => item.id !== change.targetId),
+        graphNodes: next.graphNodes.filter(node => node.id !== nodeId),
+        graphEdges: next.graphEdges.filter(edge => edge.source !== nodeId && edge.target !== nodeId),
+      };
+      continue;
+    }
+    if (change.type === 'text.replace') {
+      if (change.target === 'chapter') {
+        const target = next.chapters.find(item => item.id === change.targetId);
+        if (!target) throw new Error(`找不到章节 ID ${change.targetId}`);
+        const content = applyTextReplacements(target.content, change.replacements);
+        const updated: Chapter = { ...pushChapterSnapshot(target, 'Agent 局部修改'), content, wordCount: countNovelCharacters(content), updatedAt: now };
+        next = {
+          ...next,
+          chapters: next.chapters.map(item => item.id === updated.id ? updated : item),
+          memories: next.memories.filter(memory => memory.chapterId !== updated.id),
+          memoryDocuments: buildMemoryDocuments(next.memories.filter(memory => memory.chapterId !== updated.id)),
+        };
+      } else {
+        const target = next.outlines.find(item => item.id === change.targetId);
+        if (!target) throw new Error(`找不到大纲 ID ${change.targetId}`);
+        const kept = pushOutlineSnapshot(target, 'Agent 局部修改');
+        const outline = { ...kept, content: applyTextReplacements(target.content, change.replacements), updatedAt: now };
+        next = { ...next, outlines: next.outlines.map(item => item.id === outline.id ? outline : item) };
+      }
       continue;
     }
     if (change.type === 'card.upsert') {
@@ -948,7 +993,9 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       next = {
         ...next,
         chapters: next.chapters.map(item => item.id === updated.id ? updated : item),
-        // 图谱节点标题跟随章节标题；正文变了但章节记忆仍是旧的，由作者重新保存时刷新
+        // 修订后旧摘要失效，移除旧记忆，保存后重新提炼
+        memories: next.memories.filter(memory => memory.chapterId !== updated.id),
+        memoryDocuments: buildMemoryDocuments(next.memories.filter(memory => memory.chapterId !== updated.id)),
         graphNodes: next.graphNodes.map(node => node.id === `chapter:${updated.id}` ? { ...node, label: updated.title, updatedAt: now } : node),
       };
       continue;
@@ -1168,6 +1215,8 @@ function App() {
               aiDetection: project.aiDetection,
               styleProfileId: typeof project.styleProfileId === 'string' ? project.styleProfileId : undefined,
               sourceDismantleBookId: typeof project.sourceDismantleBookId === 'string' ? project.sourceDismantleBookId : undefined,
+              referenceChapterIds: project.referenceChapterIds,
+              defaultSkillNames: project.defaultSkillNames,
               createdAt: project.createdAt ?? project.updatedAt ?? new Date().toISOString(),
               updatedAt: project.updatedAt ?? new Date().toISOString(),
             };
@@ -2132,6 +2181,8 @@ function App() {
               aiDetection: project.aiDetection,
               styleProfileId: typeof project.styleProfileId === 'string' ? project.styleProfileId : undefined,
               sourceDismantleBookId: typeof project.sourceDismantleBookId === 'string' ? project.sourceDismantleBookId : undefined,
+              referenceChapterIds: project.referenceChapterIds,
+              defaultSkillNames: project.defaultSkillNames,
               memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
               wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
               createdAt: project.createdAt ?? project.updatedAt ?? new Date().toISOString(),
@@ -4681,7 +4732,7 @@ function App() {
       const latestProject = editingProjectRef.current;
       if (!latestProject || latestProject.id !== project.id) throw new Error('当前小说已切换，已丢弃旧项目 Agent 回复');
       const proposed = Array.isArray(result.changes)
-        ? result.changes.map((change, index) => normalizeProjectAgentChange(change, latestProject, index)).filter((change): change is ProjectAgentChange => Boolean(change))
+        ? result.changes.map((change, index) => normalizeProjectAgentChange(change, project, index)).filter((change): change is ProjectAgentChange => Boolean(change))
         : [];
       const assistantMessage: ProjectAgentMessage = {
         id: `message-${Date.now()}-assistant`,
@@ -4694,7 +4745,7 @@ function App() {
       setProjectAgentSession(current => current ? {
         ...current,
         messages: [...current.messages, assistantMessage].slice(-200),
-        changes: [...current.changes, ...proposed].slice(-80),
+        changes: [...current.changes.filter(change => change.status !== 'pending').slice(-80), ...current.changes.filter(change => change.status === 'pending'), ...proposed],
         updatedAt: new Date().toISOString(),
       } : current);
       setProjectAgentProgress(100);
@@ -4743,6 +4794,11 @@ function App() {
         }),
         updatedAt: new Date().toISOString(),
       } : current);
+      for (const change of pending) {
+        if (change.type !== 'chapter.update') continue;
+        const chapter = result.project.chapters.find(item => item.id === change.targetId);
+        if (chapter) refineChapterMemoryInBackground(result.project, chapter);
+      }
       setNotice({ title: '项目 Agent 变更已应用', content: `已写入 ${pending.length} 项变更${result.deletedChapterIds.length ? `，其中删除 ${result.deletedChapterIds.length} 个章节` : ''}。` });
     } catch (error) {
       setNotice({ title: '无法应用项目 Agent 变更', content: String(error) });
@@ -5052,7 +5108,7 @@ function App() {
    * 只删绑定到本章的那份，阶段节拍表不动（它是按总纲规划的一段，不是原稿的产物）；图谱里对应的节点与边一起清
    */
   const discardChapterOutline = (project: Project, chapter: Chapter): Project => {
-    const stale = boundChapterOutlineFor(project, chapter);
+    const stale = boundChapterOutlineFor(project, chapter, true);
     if (!stale) return project;
     const updated: Project = {
       ...project,
@@ -5086,11 +5142,14 @@ function App() {
       formatMode: index > 0 ? '默认参考上一章章纲格式' : undefined,
     });
     if (!content.trim()) throw new Error('大纲智能体没有返回章纲内容，无法自动补齐本章章纲');
-    const outline: OutlineDocument = { ...draft, content, updatedAt: new Date().toISOString() };
+    const existing = boundChapterOutlineFor(project, chapter, true);
+    const outline: OutlineDocument = existing
+      ? { ...existing, snapshots: [{ content: existing.content, reason: '自动替换占位章纲', savedAt: now }, ...(existing.snapshots || [])].slice(0, outlineSnapshotLimit), chapterId: chapter.id, content, updatedAt: new Date().toISOString() }
+      : { ...draft, content, updatedAt: new Date().toISOString() };
     const attach = (current: Project): Project => ({
       ...current,
-      outlines: [...current.outlines, outline],
-      graphNodes: [...current.graphNodes, { id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: '章纲' }],
+      outlines: existing ? current.outlines.map(item => item.id === existing.id ? outline : item) : [...current.outlines, outline],
+      graphNodes: existing ? current.graphNodes : [...current.graphNodes, { id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: '章纲' }],
       updatedAt: outline.updatedAt,
     });
     // 等模型这段时间作者可能改了别处，按最新状态追加而不是拿旧快照覆盖
@@ -7077,6 +7136,8 @@ function App() {
     switch (change.type) {
       case 'project.update': return '更新小说资料';
       case 'outline.upsert': return change.targetId ? '更新大纲' : '新建大纲';
+      case 'outline.delete': return '删除章纲';
+      case 'text.replace': return change.target === 'chapter' ? '局部修改章节' : '局部修改大纲';
       case 'card.upsert': return change.targetId ? '更新卡片' : '新建卡片';
       case 'memory.document.upsert': return '整理记忆文档';
       case 'graph.node.upsert': return '更新图谱节点';
@@ -7091,6 +7152,8 @@ function App() {
   const projectAgentChangeDetail = (change: ProjectAgentChange) => {
     if (change.type === 'project.update') return Object.keys(change.patch).join('、');
     if (change.type === 'outline.upsert') return `${change.kind} · ${change.title}`;
+    if (change.type === 'outline.delete') return `${change.title || `章纲 ${change.targetId}`} · 删除后保存时会去掉对应文件`;
+    if (change.type === 'text.replace') return `${change.replacements.length} 处替换 · 其余原文保持不变`;
     if (change.type === 'card.upsert') return `${change.cardType} · ${change.title}`;
     if (change.type === 'memory.document.upsert') return `${change.kind} · ${change.title}`;
     if (change.type === 'graph.node.upsert') return `${change.nodeType} · ${change.label}`;
@@ -7590,6 +7653,11 @@ function App() {
                     : editingProject.styleProfileId ? <p className="empty-hint compact">绑定的文风已不在文风库里，写作时不带任何文风。重新选一份，或先去文风页新建。</p>
                     : <p className="empty-hint compact">未绑定文风：章节创作按作品资料和作者指令写作。</p>}
                   <button className="btn-secondary project-style-manage-button" onClick={() => { setActiveTab('styles'); setStyleDraft(activeWritingStyle || writingStyles[0] || null); setEditingProject(null); }}>管理全局文风</button>
+                  <div className="panel-section-title">原文参考章节</div>
+                  <p className="empty-hint compact">选择你认可的人物表现与文风样本，写作时作为参考。</p>
+                  <select className="select" aria-label="原文参考章节" multiple value={(editingProject.referenceChapterIds || []).map(String)} onChange={event => updateEditorProject(project => ({ ...project, referenceChapterIds: Array.from(event.target.selectedOptions, option => Number(option.value)), updatedAt: new Date().toISOString() }))}>
+                    {editingProject.chapters.filter(chapter => chapter.content.trim()).map(chapter => <option key={chapter.id} value={chapter.id}>{chapter.title}</option>)}
+                  </select>
                   <div className="panel-section-title">作品默认技能 <span>{editingProject.defaultSkillNames?.length ? `${editingProject.defaultSkillNames.length} 项` : '未设置'}</span></div>
                   <p className="project-style-hint">写正文时每章必带，奠定全书写法；章纲、节拍或指令里出现技能标签时再自动追加对应技能，日常过渡章就只带这几项。只列写作与润色类技能。</p>
                   <div className="agent-skill-options">{skills.filter(skill => skill.category === 'write' || skill.category === 'polish').map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={(editingProject.defaultSkillNames || []).includes(skill.name)} onChange={() => updateEditorProject(project => { const current = project.defaultSkillNames || []; return { ...project, defaultSkillNames: current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 4), updatedAt: new Date().toISOString() }; })} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div>
@@ -8170,6 +8238,7 @@ function App() {
                     <div className="agent-card-picker-title">前文记忆 <small>自动加载最近六章与伏笔状态</small></div>
                     {(() => { const previous = activeChapter ? editingProject.chapters[editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id) - 1] : undefined; const memory = previous ? editingProject.memories.find(item => item.chapterId === previous.id) : undefined; return memory ? <div className="agent-context-fixed-item"><strong>{memory.sourceChapterNumber ? `第 ${memory.sourceChapterNumber} 章` : memory.chapterTitle}</strong><small>{memory.summary || '已自动加载上一章结构化记忆'}</small></div> : <p className="empty-hint compact">上一章暂无结构化记忆。</p>; })()}
                   </div>
+                  <button className="btn-secondary" disabled={projectAgentRunning || !activeChapter} onClick={() => { setShowProjectAgent(true); setProjectAgentSession(current => current ? { ...current, mode: 'execute' } : current); setProjectAgentInput(`请修订《${activeChapter?.title || '当前章'}》，并检查和联动修改受影响的前后章节、总纲与人物资料。先阅读相关原文，修改后核对衔接。\n具体要求：${agentInstruction.trim()}`); }}>关联修订前后章节</button>
                   <button className={`agent-run-button ${agentRunning(agentStage) ? 'running' : ''}`} aria-busy={agentRunning(agentStage)} onClick={runChapterAgent}>
                     {agentRunning(agentStage) ? `智能体执行中 · ${agentProgressPercent}%` : '运行章节智能体'}
                   </button>

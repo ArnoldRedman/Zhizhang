@@ -71,6 +71,12 @@ export const agentRpcMethods: readonly AgentRpcMethod[] = Object.freeze([...mode
 export const isAgentRpcMethod = (value: string): value is AgentRpcMethod => methodSet.has(value);
 export const isModelRpcMethod = (value: string): value is ModelRpcMethod => modelMethodSet.has(value);
 
+/** 归档说明不是章纲；只识别明确的占位行，短而有效的事件安排仍然可用 */
+export function isPlaceholderOutline(content: unknown): boolean {
+  const lines = String(content ?? '').split(/\r?\n/u).map(line => line.trim()).filter(line => line && !/^#{1,6}\s/u.test(line));
+  return lines.length === 0 || lines.every(line => /^(?:[-*]\s*)?(?:旧版计划\/提问已归档|待生成|待补充|暂无章纲|尚未规划|本章章纲待)/u.test(line));
+}
+
 const optionalId = z.preprocess(
   value => value === 0 || value === '0' || value === '' || value === null ? undefined : value,
   z.coerce.number().int().positive().optional(),
@@ -141,9 +147,34 @@ export const chapterPartsSchema = z.object({
 export const chapterUpdateSchema = z.object({ type: z.literal('chapter.update'), summary: z.string().min(1).max(200), targetId: requiredId, title: z.string().min(1).max(160).optional(), content: z.string().min(1).max(120_000) });
 // 删除不需要模型产出，规划和落地用同一个形状；title 只用于确认时显示
 export const chapterDeleteSchema = z.object({ type: z.literal('chapter.delete'), summary: z.string().min(1).max(200), targetId: requiredId, title: z.string().max(160).optional() });
+export const outlineDeleteSchema = z.object({ type: z.literal('outline.delete'), summary: z.string().min(1).max(200), targetId: requiredId, title: z.string().max(160).optional() });
+export const textReplaceSchema = z.object({
+  type: z.literal('text.replace'),
+  summary: z.string().min(1).max(200),
+  target: z.enum(['chapter', 'outline']),
+  targetId: requiredId,
+  replacements: z.array(z.object({
+    find: z.string().min(1).max(2000),
+    replace: z.string().max(8000),
+  })).min(1).max(12),
+});
 
-export const ProjectAgentChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineUpsertSchema, cardUpsertSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterCreateSchema, chapterUpdateSchema, chapterTitlesSchema, chapterPartsSchema, chapterDeleteSchema]);
-export const ProjectAgentPlannerChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineWriteSchema, cardWriteSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterDraftNextSchema, chapterReviseSchema, chapterRetitleSchema, chapterSplitSchema, chapterDeleteSchema]);
+/** 只替换唯一匹配的原文片段。找不到或出现多次都失败，避免改错位置或把全文重写一遍 */
+export function applyTextReplacements(content: string, replacements: Array<{ find: string; replace: string }>): string {
+  let next = content;
+  for (const item of replacements) {
+    const found = next.split(item.find).length - 1;
+    if (found !== 1) {
+      const preview = item.find.slice(0, 40);
+      throw new Error(found === 0 ? `找不到要替换的原文：${preview}` : `这段原文出现了 ${found} 次，请带上前后句再替换：${preview}`);
+    }
+    next = next.replace(item.find, item.replace);
+  }
+  return next;
+}
+
+export const ProjectAgentChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineUpsertSchema, outlineDeleteSchema, textReplaceSchema, cardUpsertSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterCreateSchema, chapterUpdateSchema, chapterTitlesSchema, chapterPartsSchema, chapterDeleteSchema]);
+export const ProjectAgentPlannerChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineWriteSchema, outlineUpsertSchema, outlineDeleteSchema, textReplaceSchema, cardWriteSchema, cardUpsertSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterDraftNextSchema, chapterCreateSchema, chapterUpdateSchema, chapterReviseSchema, chapterRetitleSchema, chapterSplitSchema, chapterDeleteSchema]);
 export const ProjectAgentPlanSchema = z.object({ message: z.string().min(1).max(5000), changes: z.array(ProjectAgentPlannerChangeSchema).max(16).default([]) });
 
 export type ProjectAgentChange = z.infer<typeof ProjectAgentChangeSchema>;

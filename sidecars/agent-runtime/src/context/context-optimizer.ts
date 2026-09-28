@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isWorkLogDocumentTitle, writingGuideFacts } from "@zhizhang/contracts";
+import { isPlaceholderOutline, isWorkLogDocumentTitle, writingGuideFacts } from "@zhizhang/contracts";
 
 export interface ContextReport {
   cache: "hit" | "miss";
@@ -81,8 +81,10 @@ export interface PreparedChapterInput {
   storyLedger?: string;
   outline?: string;
   cards: Array<{ type: string; title: string; content: string }>;
-  /** content 是头尾摘录；ending 是真正的章尾，承接锚点只能用它 */
+  /** 优先整章保留；预算不足时明确标注摘录，ending 是真正的章尾 */
   previousChapters: Array<{ id?: string | number; title: string; content: string; ending?: string }>;
+  followingChapters: Array<{ id?: string | number; title: string; content: string }>;
+  referenceChapters: Array<{ id?: string | number; title: string; content: string }>;
   memories: Array<Record<string, unknown>>;
   memoryDocuments: Array<Record<string, unknown>>;
   knowledgeGraph?: string;
@@ -258,15 +260,22 @@ export function stripProgressSnapshots(content: string): string {
     .replace(/\n{3,}/gu, "\n\n");
 }
 
+/** 按窗口折算字节：1 token 约 3 字节汉字，share 是这份资料能占窗口的比例 */
+const windowShareBytes = (contextWindowKTokens: number | undefined, share: number): number =>
+  Math.floor(Math.max(16, Number(contextWindowKTokens) || 128) * 1024 * 3 * share);
+
+/** 世界观每份文档的上限：1M 窗口下一份设定文档一个字都不该裁，小窗口仍保底 8KB */
 export function worldSettingDocumentBytes(contextWindowKTokens?: number): number {
-  const window = Math.max(16, Number(contextWindowKTokens) || 128);
-  return Math.max(8000, Math.min(24000, Math.floor(window * 1024 * 3 * 0.07)));
+  return Math.max(8000, Math.min(160_000, windowShareBytes(contextWindowKTokens, 0.07)));
 }
 
 /** 总纲和故事账本不占各资料区的加权预算：它们是全书级资料，不该被上一章正文挤掉
- * 章节图与章纲两条路径都按这两个数截，别再各自写一个更小的数二次裁剪 */
+ * 以前写死 9000 / 4400 字节，1M 窗口下总纲只剩六分之一、第 196～205 章的阶段规划被裁得只剩标题，模型写新章没有任何方向
+ * 现在跟着窗口放大；已经按这个数压过的文本，下游直接用，不要再截第二遍 */
 export const masterOutlineBytes = 9000;
 export const storyLedgerBytes = 4400;
+export const masterOutlineBudget = (contextWindowKTokens?: number): number => Math.max(masterOutlineBytes, Math.min(200_000, windowShareBytes(contextWindowKTokens, 0.06)));
+export const storyLedgerBudget = (contextWindowKTokens?: number): number => Math.max(storyLedgerBytes, Math.min(300_000, windowShareBytes(contextWindowKTokens, 0.08)));
 
 /**
  * 阶段节拍表里本章那一行，连同前一行与后一行
@@ -286,8 +295,8 @@ export function stageBeatLines(content: unknown, chapterNumber: number | undefin
 /** 资料区预算占比：按 1 token ≈ 3 字节的汉字估算，给各资料区留窗口的 24%
  * 世界观、总纲、账本另算；实测 128K 窗口整包只用了三成，资料裁得太狠比窗口不够更常见 */
 const contextBudgetShare = 0.24;
-/** 绝对上限：窗口再大也不把整部书塞进去，否则单次请求又慢又贵 */
-const contextBudgetCeilingKB = 256;
+/** 绝对上限：256KB 时 1M 窗口也只能带两章正文，模型只能看最近几段写新章；放到 1MB，最近十几章原文能整章带进去 */
+const contextBudgetCeilingKB = 1024;
 
 export function contextBudgetBytes(contextWindowKTokens?: number, capKB?: number, minimumKB = 6): number {
   // 这里只分配各资料区的预打包空间；最终硬上限由模型 tokenizer 执行
@@ -370,9 +379,6 @@ function compactOutlines(outlines: ContextOutline[], activeOutlineId: unknown, t
  */
 const heuristicCardState = /出现“[^”]*”：|当前全文未检索到可定位/u;
 
-/** 单张卡的正文上限：角色卡写到性格、目标、关系一般八九 KB，再往上就是流水账了 */
-const cardContentBytes = 10000;
-
 /** 卡片里对写作没用的小节：项目职责、能力边界、各种"当前……状态"快照（状态另有 currentState 字段，正文里那份是某一章的旧快照） */
 const cardSkippableHeading = /(项目职责|能力边界|专业能力|职责|当前[^\n]{0,6}状态|状态历史|initial_state|inventory|状态快照)/u;
 /** 卡片里必须整段保留的小节：写出来的人有没有性格全看这几段 */
@@ -427,7 +433,8 @@ function compactCards(cards: ContextCard[], text: string, maxBytes: number): Arr
     .sort((left, right) => right.score - left.score || left.card.title.localeCompare(right.card.title));
   let remaining = maxBytes;
   const packed: Array<{ type: string; title: string; content: string }> = [];
-  for (const { card } of ranked.slice(0, 8)) {
+  // 不再写死最多 8 张：全书十几张卡加起来也就几千字，按相关度排好、装到预算满为止
+  for (const { card } of ranked) {
     if (remaining < 160) break;
     const history = (card.stateHistory || [])
       .filter(item => !heuristicCardState.test(String(item.changes || "")))
@@ -440,7 +447,7 @@ function compactCards(cards: ContextCard[], text: string, maxBytes: number): Arr
     const label = `[${compactText(card.type || "知识卡", 40)}] ${compactText(card.title, 100)}`;
     const fixed = [label, state && `当前状态：${state}`, history && `近期变化：${history}`].filter(Boolean).join("\n");
     // 出场人物的卡尽量整张带入：性格、目标、恐惧、相处方式都在正文中后段，截成几百字节只剩 id 和别名
-    const knowledge = compactCardContent(String(card.content || ""), Math.max(120, Math.min(cardContentBytes, remaining - byteLength(fixed) - 20)));
+    const knowledge = compactCardContent(String(card.content || ""), Math.max(120, remaining - byteLength(fixed) - 20));
     const content = [fixed, knowledge && `知识：${knowledge}`].filter(Boolean).join("\n");
     packed.push({ type: compactText(card.type || "知识卡", 40), title: compactText(card.title, 100), content });
     remaining -= byteLength(content) + 2;
@@ -544,21 +551,28 @@ function compactMemories(memories: unknown, maxBytes: number): Array<Record<stri
   return packed.reverse();
 }
 
-/** 承接锚点的章尾长度：约四五百个汉字，够看清最后一个场景怎么收的；
- * 再长就不是“承接”而是“上一章正文”，模型会顺着它把上一章最后一场戏再写一遍 */
+/** 承接锚点的章尾长度：约四五百个汉字，够看清最后一个场景怎么收的 */
 const previousChapterEndingBytes = 1400;
 
+/**
+ * 前文章节原文：从紧邻上一章往前，能整章放下的都整章放
+ * 以前只取最后两章、每章头尾截成 5400 字节，正文提示词里再只用章尾几段，写第 205 章时模型只见过第 204 章的 534 个字；
+ * 前文原文是防止跑偏最直接的资料，预算够就一个字不裁。紧邻上一章放不下时才压成头尾摘录，更早的放不下就停
+ */
 function compactPreviousChapters(chapters: unknown, maxBytes: number): PreparedChapterInput["previousChapters"] {
   const source = Array.isArray(chapters) ? chapters.filter(item => item && typeof item === "object") : [];
   let remaining = maxBytes;
   const packed: PreparedChapterInput["previousChapters"] = [];
-  for (const item of source.slice(-2).reverse()) {
+  for (const item of [...source].reverse()) {
     if (remaining < 180) break;
     const chapter = item as Record<string, unknown>;
     const title = compactText(chapter.title || "上一章", 100);
-    const content = compactText(chapter.content || "", Math.max(160, Math.min(5400, remaining - byteLength(title) - 30)));
-    if (!content) continue;
-    // 章尾单独从原文截取：content 已经是头尾拼接，从它里面再截"结尾"只会截到开头
+    const full = normalizePromptWhitespace(chapter.content || "");
+    if (!full) continue;
+    const fits = byteLength(full) + byteLength(title) + 30 <= remaining;
+    if (!fits && packed.length) break;
+    const content = fits ? full : compactText(full, Math.max(160, remaining - byteLength(title) - 30));
+    // 章尾单独从原文截取：content 可能是头尾拼接，从它里面再截"结尾"只会截到开头
     const ending = tailText(chapter.content || "", previousChapterEndingBytes);
     packed.push({ id: typeof chapter.id === "string" || typeof chapter.id === "number" ? chapter.id : undefined, title, content, ending });
     remaining -= byteLength(title) + byteLength(content) + 30;
@@ -751,6 +765,9 @@ function compactVolumeByStage(volumeText: string, chapterNumber: number | undefi
 export function compactMasterOutline(content: unknown, text: string, maxBytes: number, chapterNumber?: number): string {
   const normalized = normalizePromptWhitespace(content);
   if (!normalized || maxBytes <= 0) return "";
+  // 全文放得下就整份给：骨架加挑段是为小窗口准备的，大窗口下挑段只会把后续阶段规划裁成一个标题
+  const fullNote = chapterNumber ? `（以下是总纲全文；正在写第 ${chapterNumber} 章，按总纲里覆盖本章的卷与阶段推进）\n` : "";
+  if (byteLength(fullNote) + byteLength(normalized) <= maxBytes) return `${fullNote}${normalized}`;
   const sections = splitOutlineSections(normalized);
   // 没有标题结构的总纲无法按段挑选，只能整体截断
   if (sections.filter(section => section.heading).length < 2) return compactText(normalized, maxBytes);
@@ -910,12 +927,14 @@ export function buildStoryLedger(memories: unknown, position: ChapterPosition | 
   const remaining = maxBytes - byteLength(header) - byteLength(gapNote) - byteLength(foreshadowingBlock) - 120;
   // 近期章节带摘要，更早的只列标题：以前装不下的章直接消失，模型以为前文就只有最近六章
   const summaryBudget = Math.floor(remaining * 0.7);
+  // 预算宽裕时摘要整条带（记忆摘要约一百来字），紧张时才压到一句
+  const summaryBytes = maxBytes >= 60_000 ? maxBytes : 200;
   const events: string[] = [];
   let used = 0;
   let index = ordered.length - 1;
   for (; index >= 0; index -= 1) {
     const memory = ordered[index];
-    const summary = leadText(memory.summary || "", 200);
+    const summary = leadText(memory.summary || "", summaryBytes);
     if (!summary) continue;
     const hook = leadText(memory.endingHook || "", 80);
     // 关系与情绪整条带：以前截 160 字节，一条"沈妄→姜冷月：她协助核对并提议集…[裁剪]…情绪克制"读起来是碎片
@@ -1015,6 +1034,8 @@ export function prepareChapterInput(input: {
   activeOutlineId?: unknown;
   cards?: unknown;
   previousChapters?: unknown;
+  followingChapters?: unknown;
+  referenceChapters?: unknown;
   memories?: unknown;
   memoryDocuments?: unknown;
   knowledgeGraph?: unknown;
@@ -1043,12 +1064,14 @@ export function prepareChapterInput(input: {
     .sort((left, right) => String(left.id ?? left.title ?? "").localeCompare(String(right.id ?? right.title ?? ""), "zh-CN"))
     .map(item => String(item.content))
     .join("\n\n");
-  const outlines = allOutlines.filter(item => item.kind !== "世界观与作品设定" && item.kind !== "总纲");
+  const outlines = allOutlines.filter(item => item.kind !== "世界观与作品设定" && item.kind !== "总纲" && !isPlaceholderOutline(item.content));
   const cards = Array.isArray(input.cards) ? input.cards.filter(item => item && typeof item === "object") as ContextCard[] : [];
   const raw = {
     outline: allOutlines,
     cards,
     previousChapters: input.previousChapters,
+    followingChapters: input.followingChapters,
+    referenceChapters: input.referenceChapters,
     memories: input.memories,
     memoryDocuments: input.memoryDocuments,
     knowledgeGraph: input.knowledgeGraph,
@@ -1056,12 +1079,21 @@ export function prepareChapterInput(input: {
   };
   const sourceBytes = byteLength(JSON.stringify(raw));
   const text = queryText(input.instruction, outlines, Array.isArray(input.memories) ? input.memories as Array<Record<string, unknown>> : [], cards);
-  const masterOutline = compactMasterOutline(masterOutlineSource, text, masterOutlineBytes, input.chapterPosition?.number);
-  const storyLedger = buildStoryLedger(input.memories, input.chapterPosition, storyLedgerBytes);
+  const masterOutline = compactMasterOutline(masterOutlineSource, text, masterOutlineBudget(input.contextWindowKTokens), input.chapterPosition?.number);
+  const storyLedger = buildStoryLedger(input.memories, input.chapterPosition, storyLedgerBudget(input.contextWindowKTokens));
   const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * weights.outline));
   const packedCards = compactCards(cards, text, Math.floor(budgetBytes * weights.cards));
   const memories = compactMemories(input.memories, Math.floor(budgetBytes * weights.memories));
-  const previousChapters = compactPreviousChapters(input.previousChapters, Math.floor(budgetBytes * weights.previousChapters));
+  // 资料区没用完的空间优先留给原文，避免卡片很少却空占三成窗口
+  const otherBytes = byteLength(outline) + byteLength(JSON.stringify(packedCards)) + byteLength(JSON.stringify(memories));
+  const proseBudget = Math.max(Math.floor(budgetBytes * weights.previousChapters), budgetBytes - otherBytes - Math.floor(budgetBytes * 0.18));
+  const hasFollowing = Array.isArray(input.followingChapters) && input.followingChapters.length > 0;
+  const hasReferences = Array.isArray(input.referenceChapters) && input.referenceChapters.length > 0;
+  const followingBudget = hasFollowing ? Math.floor(proseBudget * 0.3) : 0;
+  const referenceBudget = hasReferences ? Math.floor(proseBudget * 0.15) : 0;
+  const followingChapters = compactPreviousChapters(hasFollowing ? [...input.followingChapters as unknown[]].reverse() : [], followingBudget).reverse();
+  const referenceChapters = compactPreviousChapters(input.referenceChapters, referenceBudget);
+  const previousChapters = compactPreviousChapters(input.previousChapters, proseBudget - followingBudget - referenceBudget);
   const knowledgeGraph = compactKnowledgeGraph(input.knowledgeGraph, text, Math.floor(budgetBytes * weights.knowledgeGraph));
   const skills = compactSkills(input.skills, input.instruction, Math.floor(budgetBytes * weights.skills));
   // 记忆文档是逐章累计的（第 1 章在最前），所以留尾部而不是头尾都留：
@@ -1081,6 +1113,8 @@ export function prepareChapterInput(input: {
     cards: byteLength(JSON.stringify(packedCards)),
     memories: byteLength(JSON.stringify(memories)),
     previousChapters: byteLength(JSON.stringify(previousChapters)),
+    followingChapters: byteLength(JSON.stringify(followingChapters)),
+    referenceChapters: byteLength(JSON.stringify(referenceChapters)),
     knowledgeGraph: byteLength(knowledgeGraph),
     skills: byteLength(JSON.stringify(skills)),
     memoryDocuments: byteLength(JSON.stringify(memoryDocuments)),
@@ -1093,6 +1127,8 @@ export function prepareChapterInput(input: {
     outline: outline || undefined,
     cards: packedCards,
     previousChapters,
+    followingChapters,
+    referenceChapters,
     memories,
     memoryDocuments,
     knowledgeGraph: knowledgeGraph || undefined,

@@ -253,7 +253,7 @@ export const buildLocalStructuredMemory = (chapter: Chapter, project: Project) =
  * 故事账本靠它列出"已发生事件"；重写中间章时不能把后面章的记忆当前文
  * 带多少由运行时的上下文预算决定，这里只给一个足够长的候选串
  */
-export const recentChapterMemories = (project: Project, beforeChapterNumber: number, limit = 24) => {
+export const recentChapterMemories = (project: Project, beforeChapterNumber: number, limit = project.memories.length) => {
   const ordinal = (memory: ChapterMemory) => {
     const index = project.chapters.findIndex(chapter => chapter.id === memory.chapterId);
     return index >= 0 ? index + 1 : (memory.sourceChapterNumber ?? 0);

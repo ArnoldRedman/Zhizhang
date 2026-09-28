@@ -35,16 +35,16 @@ test('boundChapterOutlineFor 先按 chapterId，再按标题里的章号绑定�
   assert.equal(boundChapterOutlineFor(current, chapters[0]), undefined);
 });
 
-test('没勾卡片时按上一章正文与章纲里出现的卡名自动带入，金手指卡固定带入', () => {
+test('没勾卡片时全部提供，由运行时按窗口分配预算', () => {
   const current = project({
     cards: [...project().cards, { id: 3, type: '金手指卡', title: '修复之眼', content: '', createdAt: now, updatedAt: now }],
     chapters: [chapter(1), chapter(2, '沈砚推开门。'), chapter(3), chapter(4)],
   });
   const context = buildChapterWriteContext({ project: current, chapter: current.chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
-  assert.deepEqual((context.params.cards as Array<{ id: number }>).map(item => item.id), [3, 1]);
+  assert.deepEqual((context.params.cards as Array<{ id: number }>).map(item => item.id), [1, 2, 3]);
 });
 
-test('effectiveCards 没勾卡片时自动挑（金手指卡固定带入），勾了只用勾的', () => {
+test('effectiveCards 未指定时带全书卡片，指定时尊重作者选择', () => {
   const current = project({
     chapters: [chapter(1, '沈砚在温室里试制桑皮纸。'), chapter(2)],
     cards: [...project().cards, { id: 3, type: '金手指卡', title: '修复之眼', content: '', createdAt: now, updatedAt: now }],
@@ -52,7 +52,7 @@ test('effectiveCards 没勾卡片时自动挑（金手指卡固定带入），�
   const auto = effectiveCards(current, [], '沈砚把纸样压在窗台上').map(card => card.title);
   assert.ok(auto.includes('沈砚'));
   assert.ok(auto.includes('修复之眼'));
-  assert.ok(!auto.includes('灯塔'));
+  assert.ok(auto.includes('灯塔'));
   assert.deepEqual(effectiveCards(current, [2], '沈砚把纸样压在窗台上').map(card => card.title), ['灯塔']);
 });
 
@@ -75,6 +75,24 @@ test('阶段节拍表按标题区间匹配本章，进 stageBeats 而不进普�
   assert.equal(context.params.stageBeats, '| 第 3 章 | 出城 |');
   assert.ok(!(context.params.outlines as Array<{ id: number }>).some(item => item.id === 99));
   assert.equal(boundChapterOutlineFor(current, chapters[0]), undefined);
+});
+
+test('占位章纲不当成有效规划，参考章由作者选择', () => {
+  const placeholder = { ...outline(14, '章纲', '章纲｜第 3 章'), content: '# 章纲\n旧版计划/提问已归档。' };
+  const current = project({ outlines: [placeholder], referenceChapterIds: [1] });
+  const context = buildChapterWriteContext({ project: current, chapter: current.chapters[2], instruction: '', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal(context.boundOutline, undefined);
+  assert.deepEqual((context.params.referenceChapters as Array<{ id: number }>).map(chapter => chapter.id), [1]);
+  assert.deepEqual(buildChapterWriteContext({ project: project(), chapter: chapters[2], instruction: '', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] }).params.referenceChapters, []);
+  assert.equal(boundChapterOutlineFor(current, current.chapters[2], true)?.id, placeholder.id);
+});
+
+test('全书摘要不再固定只取24章', () => {
+  const chapters = Array.from({ length: 40 }, (_, index) => chapter(index + 1, '正文'));
+  const current = project({ chapters, memories: chapters.map(item => memory(item.id)) });
+  const context = buildChapterWriteContext({ project: current, chapter: chapters[39], instruction: '', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  assert.equal((context.params.memories as unknown[]).length, 39);
+  assert.equal((context.params.previousChapters as unknown[]).length, 39);
 });
 
 test('章纲、总纲、世界观自动带入，其他章纲只在作者勾选时进入', () => {
@@ -103,9 +121,9 @@ test('写法指南不作为世界观硬规则带进章节，事实设定照常�
   assert.ok(!included[1].content.includes('严禁直接写情绪'));
 });
 
-test('前文只传紧邻上一章，记忆只取本章之前的章并带章号，文档带进度基准与四份聚合文档', () => {
+test('提供全部前文候选与摘要，历史章不混入未来记忆', () => {
   const context = buildChapterWriteContext({ project: project(), chapter: chapters[2], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
-  assert.deepEqual((context.params.previousChapters as Array<{ id: number }>).map(item => item.id), [2]);
+  assert.deepEqual((context.params.previousChapters as Array<{ id: number }>).map(item => item.id), [1, 2]);
   assert.deepEqual((context.params.memories as Array<{ chapterNumber: number }>).map(item => item.chapterNumber), [1, 2]);
   assert.deepEqual((context.params.memories as Array<{ foreshadowingItems: unknown[] }>)[0].foreshadowingItems.length, 1);
   // 章节快照是作者手写的“进度基准”，逐章记忆缺失时它是唯一能说明全书走到哪儿的东西
@@ -124,6 +142,7 @@ test('绑定文风只走稳定资料，不再重复塞进技能和指令', () =>
   assert.equal(context.params.instruction, '继续写');
   assert.deepEqual(context.params.preferredSkillNames, ['story-long-write']);
   assert.equal(context.params.targetWords, 3000);
+  assert.deepEqual(context.params.writingStyle, { name: style.name, content: style.content });
 });
 
 test('验证门与审查的输入：档位、引号风格、允许句式来自项目设置，上一章承诺来自记忆，最近几章开头结尾来自正文', () => {
@@ -169,8 +188,8 @@ test('常驻卡片每章必带：自动挑时排最前且不占名额，作者�
     chapters: [chapter(1, '什么都没提到。'), chapter(2)],
     cards: [...project().cards, { id: 3, type: '势力卡', title: '书肆', content: '', pinned: true, createdAt: now, updatedAt: now }],
   });
-  assert.deepEqual(effectiveCards(current, [], '无关的正文').map(card => card.title), ['书肆']);
-  assert.deepEqual(effectiveCards(current, [], '沈砚推门').map(card => card.title), ['书肆', '沈砚']);
+  assert.deepEqual(effectiveCards(current, [], '无关的正文').map(card => card.title), ['书肆', '沈砚', '灯塔']);
+  assert.deepEqual(effectiveCards(current, [], '沈砚推门').map(card => card.title), ['书肆', '沈砚', '灯塔']);
   assert.deepEqual(effectiveCards(current, [2], '沈砚推门').map(card => card.title), ['书肆', '灯塔']);
   // 勾选里包含常驻卡时不重复
   assert.deepEqual(effectiveCards(current, [2, 3], '沈砚推门').map(card => card.title), ['书肆', '灯塔']);

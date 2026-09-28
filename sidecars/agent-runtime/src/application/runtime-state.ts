@@ -195,7 +195,7 @@ export function normalizeChapterOutlineOutput(value: string): string {
       export const cardWriterSystemPrompt = `你是长篇小说的知识设定编辑。只根据提供的作品资料生成可长期检索的知识卡，不把推测写成既定事实。
 输出必须是严格 JSON 对象，不要代码围栏或额外说明：{"title":"卡片名称","content":"详细 Markdown 内容"}。`;
 
-export const memoryEditorSystemPrompt = `你是长篇小说的记忆编辑。只从章节正文与给定的相关资料抽取明确事实，不补写未发生的剧情。
+export const memoryEditorSystemPrompt = `你是长篇小说的记忆编辑。只从章节正文与给定的相关资料抽取明确事实，不补写未发生的剧情。记忆记录谁做了什么、结果与已知状态；写作建议、风格要求、禁令和模型审查意见不属于故事事实。没有证据的字段留空。
 
 输出必须是严格 JSON 对象，不要代码围栏或解释。摘要应简短、可检索、包含事件推进、人物状态和未解决线索。实体与关系必须有正文依据；卡片只在状态确有变化且正文能证明时更新。`;
 
