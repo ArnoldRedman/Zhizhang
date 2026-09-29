@@ -527,6 +527,7 @@ const executePrompt = `执行模式可提出待作者确认的变更，不能声
 修改范围由作者任务和实际影响决定，不限当前章；后文是待核对的旧稿，出现矛盾时可以联动修订。
 委派生成按提案顺序进行，后一步可以看到前一步的新稿；在 instruction 里写清关联改动和预期结果。
 
+追加修订日志时，先 open 原日志末段，用 text.replace：find 是唯一的末段原文，replace 是该末段原文加新增条目。不要新建同名日志，不要把追加件交给 outline.write 或 outline.upsert；整篇写入不支持自动追加。
 作者只要求改某一段、某几句或大纲里的一处节奏时，用 text.replace，不要整篇重写。find 必须是 open 读到的连续原文，且在目标里只出现一次；replace 只写改后的这一段。其余文字由应用原样保留。整章重写、整份章纲重写仍用 chapter.revise 或 outline.upsert。
 
 新建章纲时 title 必须写成“章纲｜第 N 章”（要规划第 189 章就写“章纲｜第 189 章”）：应用只从标题里的章号得到目标章、
@@ -729,6 +730,17 @@ export async function runProjectAgent(
       default: return ProjectAgentChangeSchema.parse(change);
     }
   };
+  // 同一轮 edit 和 finish 共享执行记录，收尾重述已完成指令时不再次调用模型
+  // summary 只是展示文案；指令或内容改变仍视为新的修订，失败的任务允许重试
+  const completedChanges = new Set<string>();
+  const executeChange = async (change: z.infer<typeof plannerChangeSchema>): Promise<ProjectAgentChange | null> => {
+    const key = JSON.stringify(Object.entries(change).filter(([name]) => name !== "summary").sort(([left], [right]) => left.localeCompare(right)));
+    if (completedChanges.has(key)) return null;
+    const produced = ProjectAgentChangeSchema.parse(await produce(change));
+    stage(produced);
+    completedChanges.add(key);
+    return produced;
+  };
   const history = (input.history || []).slice(-10).flatMap(message => {
     const role: "user" | "assistant" | null = message.role === "assistant" ? "assistant" : message.role === "user" ? "user" : null;
     const content = compactText(message.content || "", 4000);
@@ -764,7 +776,15 @@ ${input.instruction}` };
 ${context.packet}`, history, messages, requestLimit), { role: "user" as const, content: "检索预算已用尽，请直接返回 finish 动作。" }]
       : boundedMessages(system, request, `## 项目索引与资料摘录
 ${context.packet}`, history, messages, requestLimit);
-    const response = await client.chat(turnMessages, { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 12_000, retryAttempts: 2 });
+    // 大项目的规划轮也可能长时间生成，使用流式避免网关等待完整响应超时
+    let response: { content: string };
+    try {
+      response = await client.chatStream(turnMessages, { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 12_000, retryAttempts: 2 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      toolEvents.push({ tool: "project.request", status: "error", message });
+      return { message: `项目 Agent 本轮请求中断：${message}\n${staged.length ? `已保留 ${staged.length} 项完成的临时稿供确认，其余任务尚未完成。` : "尚未生成可确认变更，项目原文未修改。"}`, changes: staged, toolEvents };
+    }
 
     let turn: ProjectAgentTurn;
     try {
@@ -776,7 +796,7 @@ ${context.packet}`, history, messages, requestLimit);
       } else {
         // 唯一的格式恢复轮保留原任务与已读资料，不把残缺指令当作分析结论
         try {
-          const repaired = await client.chat([
+          const repaired = await client.chatStream([
             ...turnMessages,
             { role: "user", content: `上一轮未返回有效动作。请依据本轮请求和已读资料返回一个合法 JSON 动作；资料不足可继续检索。待修复输出：
 ${compactText(rawProse, 2000) || "（空）"}` },
@@ -809,10 +829,9 @@ ${compactText(rawProse, 2000) || "（空）"}` },
         try {
           if (["chapter.delete", "outline.delete", "chapter.parts", "chapter.titles"].includes(change.type)) throw new Error("此变更请放在 finish 中交给作者确认");
           input.onDelegate?.({ done: 0, total: turn.changes.length, label: change.summary, status: "start" });
-          const produced = ProjectAgentChangeSchema.parse(await produce(change));
-          stage(produced);
+          const executed = await executeChange(change);
           input.onDelegate?.({ done: 1, total: turn.changes.length, label: change.summary, status: "complete" });
-          results.push(`已更新临时稿：${change.summary}`);
+          results.push(`${executed ? "已更新临时稿" : "此指令已完成，沿用临时稿"}：${change.summary}`);
           toolEvents.push({ tool: "project.edit", status: "complete", message: change.summary });
         } catch (error) {
           results.push(`修改失败：${error instanceof Error ? error.message : String(error)}`);
@@ -857,11 +876,10 @@ ${compactText(rawProse, 2000) || "（空）"}` },
     try {
       if (delegateFor && Date.now() >= deadline) throw new Error("本轮委派预算已用尽，此项尚未处理");
       if (delegateFor) input.onDelegate?.({ done: finished, total: plan.changes.length, label, status: "start" });
-      const produced = ProjectAgentChangeSchema.parse(await produce(change));
-      stage(produced);
+      const executed = await executeChange(change);
       finished += 1;
       if (delegateFor) input.onDelegate?.({ done: finished, total: plan.changes.length, label, status: "complete" });
-      toolEvents.push({ tool: change.type, status: "complete", message: `${label}已生成《${describeProduced(produced)}》临时稿` });
+      toolEvents.push({ tool: change.type, status: "complete", message: executed ? `${label}已生成《${describeProduced(executed)}》临时稿` : `${label}已完成，沿用已有临时稿，未重复执行` });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       finished += 1;

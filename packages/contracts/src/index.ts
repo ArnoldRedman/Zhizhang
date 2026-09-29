@@ -103,6 +103,13 @@ export const projectUpdateSchema = z.object({
     authorPreferences: z.array(z.string().min(1).max(300)).max(20).optional(),
   }).strict(),
 });
+// 项目 Agent 的整篇写入不支持靠正文声明追加，追加必须使用有原文锚点的局部替换
+export function assertWholeOutlineContent(content: string): void {
+  if (/追加件|追加部分|补充件|续写部分/u.test(content.split('\n').find(line => line.trim()) || '')) {
+    throw new Error('这份内容是追加件，不能按新建或整篇替换应用。请读取原资料末段，使用 text.replace 保留末段原文并追加新内容');
+  }
+}
+
 export const outlineUpsertSchema = z.object({ type: z.literal('outline.upsert'), summary: z.string().min(1).max(200), targetId: optionalId, kind: z.enum(outlineKinds), title: z.string().min(1).max(160), content: z.string().min(1).max(60_000), chapterId: optionalId });
 export const cardUpsertSchema = z.object({ type: z.literal('card.upsert'), summary: z.string().min(1).max(200), targetId: optionalId, cardType: z.enum(cardTypes), title: z.string().min(1).max(120), content: z.string().min(1).max(40_000), currentState: z.string().max(6000).optional() });
 export const memoryDocumentUpsertSchema = z.object({ type: z.literal('memory.document.upsert'), summary: z.string().min(1).max(200), kind: z.enum(memoryKinds), title: z.string().min(1).max(120), content: z.string().min(1).max(60_000) });

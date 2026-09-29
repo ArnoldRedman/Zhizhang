@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ChangeEvent
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
-import { applyTextReplacements, detectQuoteStyle, isWorkLogDocumentTitle, isWritingGuideDocumentTitle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, writingGuideFacts, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
+import { assertWholeOutlineContent, applyTextReplacements, detectQuoteStyle, isWorkLogDocumentTitle, isWritingGuideDocumentTitle, normalizePauses, normalizeQuotes, partsFromBreaks, splitParagraphs, writingGuideFacts, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionLabel, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
@@ -859,6 +859,7 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       continue;
     }
     if (change.type === 'outline.upsert') {
+      assertWholeOutlineContent(change.content);
       const number = change.kind === '章纲' ? chapterOutlineNumber(change.title, change.content) : undefined;
       const matched = !change.targetId && number ? next.outlines.find(item => item.kind === '章纲' && chapterOutlineNumber(item.title, item.content) === number) : undefined;
       const targetId = change.targetId ?? matched?.id;
@@ -1433,6 +1434,7 @@ function App() {
   /** 草稿的章节标题：接受前可改，标题不能只靠模型写得对 */
   const [agentDraftTitle, setAgentDraftTitle] = useState('');
   const [agentAuthorFeedback, setAgentAuthorFeedback] = useState('');
+  const [draftRevision, setDraftRevision] = useState<{ status: 'running' | 'done' | 'error'; startedAt: number; message: string } | null>(null);
   // 切换项目或章节时，旧草稿不能继续覆盖新目标
   const agentDraftTargetRef = useRef<{ projectId: number; chapterId: number } | null>(null);
   useEffect(() => {
@@ -1514,10 +1516,10 @@ function App() {
   // 修订中每秒推一下时钟：长任务不刷秒数，作者无法分辨“在跑”和“卡死”
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
-    if (!Object.values(reviseStates).some(state => state.status === 'running')) return;
+    if (draftRevision?.status !== 'running' && !Object.values(reviseStates).some(state => state.status === 'running')) return;
     const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [reviseStates]);
+  }, [reviseStates, draftRevision?.status]);
   const reviewItems = legacyReview.items.length ? legacyReview.items : savedReviewItems;
   // 当前审查区间与提示：把章名显示出来，光看两个数字对不上章
   const consoleChapters = editingProject?.chapters || [];
@@ -1753,18 +1755,20 @@ function App() {
    * 新建/插入/Alt 切章/项目 Agent 产出都会改 activeChapter，与其在每个入口补 scrollIntoView，不如统一在这里跟随；
    * 已在视野内的不再动它，免得点目录时列表抖动
    */
+  const activeDirectoryChapterId = activeChapter?.id;
   useLayoutEffect(() => {
-    if (!activeChapter || editorSidebarTab !== 'chapters') return;
+    if (activeDirectoryChapterId === undefined || bookView !== 'write' || editorSidebarTab !== 'chapters') return;
     const list = chaptersListRef.current;
-    const item = list?.querySelector<HTMLElement>(`[data-chapter-id="${activeChapter.id}"]`);
-    if (!list || !item) return;
+    const item = list?.querySelector<HTMLElement>(`[data-chapter-id="${activeDirectoryChapterId}"]`);
+    if (!list || !item || !list.clientHeight) return;
     const listRect = list.getBoundingClientRect();
     const itemRect = item.getBoundingClientRect();
-    // 留出列表内边距的余量，避免“刚好在边缘”时抖来抖去
+    // 用同一视口坐标计算距离，不依赖列表与条目是否共用 offsetParent
     if (itemRect.top < listRect.top + 8 || itemRect.bottom > listRect.bottom - 8) {
-      list.scrollTop = item.offsetTop - list.offsetTop - Math.max(0, (list.clientHeight - item.offsetHeight) / 2);
+      list.scrollTop += itemRect.top - listRect.top - Math.max(0, (list.clientHeight - itemRect.height) / 2);
     }
-  }, [activeChapter?.id, editorSidebarTab, editingProject?.chapters.length]);
+    // 切回写作会重建目录，展开窄屏目录和清除搜索也需要重新定位
+  }, [activeDirectoryChapterId, bookView, railOpen, chapterJumpQuery, editorSidebarTab, editingProject?.chapters.length]);
   const [settingsDraft, setSettingsDraft] = useState(agentConfig);
   const refreshGatewayUsageRef = useRef(refreshGatewayUsage);
   refreshGatewayUsageRef.current = refreshGatewayUsage;
@@ -5894,7 +5898,7 @@ function App() {
   };
 
   const reviseAgentDraftWithFeedback = async () => {
-    if (!agentDraft?.draftContent || !editingProject || !activeChapter) return;
+    if (!agentDraft?.draftContent || !editingProject || !activeChapter || draftRevision?.status === 'running' || agentRunning(agentStage)) return;
     const feedback = agentAuthorFeedback.trim();
     const review = agentDraft.reviewResult;
     const reviewText = review ? [
@@ -5906,7 +5910,10 @@ function App() {
       setNotice({ title: '没有修改意见', content: '请填写作者意见，或等待有效审查结果后再修改。' });
       return;
     }
-    setAgentProgressMessage('正在按审查意见和作者意见修改草稿');
+    // text.transform 只返回最终正文，在操作旁显示真实等待状态，不沿用上一轮的 100% 进度
+    const startedAt = Date.now();
+    setNowTick(startedAt);
+    setDraftRevision({ status: 'running', startedAt, message: '正在按审查和作者意见修订，等待模型返回完整草稿' });
     try {
       const result = await agentRpc<{ content?: string }>('text.transform', {
         mode: 'revise',
@@ -5927,9 +5934,12 @@ function App() {
       setAgentDraft(current => current ? { ...current, draftContent: content, reviewResult: undefined } : current);
       setAgentDisplayContent(content);
       setAgentAuthorFeedback('');
+      setDraftRevision({ status: 'done', startedAt, message: `修订完成，共 ${countNovelCharacters(content).toLocaleString()} 字，用时 ${Math.round((Date.now() - startedAt) / 1000)} 秒；尚未写入原章` });
       setNotice({ title: '草稿已按意见修改', content: '请重新运行审查；原章仍未写入。' });
     } catch (error) {
-      setNotice({ title: '草稿修改失败', content: error instanceof Error ? error.message : String(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      setDraftRevision({ status: 'error', startedAt, message: `修订失败：${message}。原草稿已保留，可重试` });
+      setNotice({ title: '草稿修改失败', content: message });
     }
   };
 
@@ -7045,7 +7055,7 @@ function App() {
   const projectAgentChangeLabel = (change: ProjectAgentChange) => {
     switch (change.type) {
       case 'project.update': return '更新小说资料';
-      case 'outline.upsert': return change.targetId ? '更新大纲' : '新建大纲';
+      case 'outline.upsert': return change.targetId ? '整篇替换资料' : '新建资料';
       case 'outline.delete': return '删除章纲';
       case 'text.replace': return change.target === 'chapter' ? '局部修改章节' : '局部修改大纲';
       case 'card.upsert': return change.targetId ? '更新卡片' : '新建卡片';
@@ -7061,7 +7071,10 @@ function App() {
   };
   const projectAgentChangeDetail = (change: ProjectAgentChange) => {
     if (change.type === 'project.update') return Object.keys(change.patch).join('、');
-    if (change.type === 'outline.upsert') return `${change.kind} · ${change.title}`;
+    if (change.type === 'outline.upsert') {
+      const previous = editingProject?.outlines.find(item => item.id === change.targetId);
+      return `${change.kind} · ${change.title} · ${previous ? `原文 ${previous.content.length} 字 → 新稿 ${change.content.length} 字（整篇替换，不会自动追加）` : `新建 ${change.content.length} 字（不会追加到已有资料）`}`;
+    }
     if (change.type === 'outline.delete') return `${change.title || `章纲 ${change.targetId}`} · 删除后保存时会去掉对应文件`;
     if (change.type === 'text.replace') return `${change.replacements.length} 处替换 · 其余原文保持不变`;
     if (change.type === 'card.upsert') return `${change.cardType} · ${change.title}`;
@@ -8514,11 +8527,12 @@ function App() {
                     <div className="agent-author-feedback">
                       <label htmlFor="agent-author-feedback"><strong>作者补充意见</strong><small>审查意见会自动带入；你可以补充哪些地方必须改、哪些建议不要采纳。</small></label>
                       <textarea id="agent-author-feedback" className="input" rows={4} value={agentAuthorFeedback} placeholder="例如：庭审胜利后幼薇要明显哭出来；沈妄不要只用动作回应；本章停在法院，不要提前写夜里翻笔记本。" onChange={(event) => setAgentAuthorFeedback(event.target.value)} />
-                      <button className="btn-secondary" onClick={reviseAgentDraftWithFeedback}>按审查和作者意见修改</button>
+                      <button className="btn-secondary" disabled={draftRevision?.status === 'running' || agentRunning(agentStage)} aria-busy={draftRevision?.status === 'running'} onClick={reviseAgentDraftWithFeedback}>{draftRevision?.status === 'running' ? `修订中 · 已用 ${Math.max(0, Math.floor((nowTick - draftRevision.startedAt) / 1000))} 秒` : '按审查和作者意见修改'}</button>
+                      {draftRevision && <p role="status" className={draftRevision.status === 'error' ? 'agent-review-error' : 'empty-hint compact'}>{draftRevision.message}</p>}
                     </div>
                     <div className="agent-result-actions">
-                      <button className="btn-secondary" onClick={() => { setAgentDraft(null); setAgentDraftTitle(''); }}>放弃</button>
-                      <button className="btn-primary" onClick={() => acceptAgentDraft()}>接受并写入</button>
+                      <button className="btn-secondary" disabled={draftRevision?.status === 'running'} onClick={() => { setAgentDraft(null); setAgentDraftTitle(''); setDraftRevision(null); }}>放弃</button>
+                      <button className="btn-primary" disabled={draftRevision?.status === 'running'} onClick={() => acceptAgentDraft()}>接受并写入</button>
                     </div>
                   </section>
                 )}

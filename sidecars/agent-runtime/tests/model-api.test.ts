@@ -311,6 +311,16 @@ describe("model client configuration", () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body)).response_format).toEqual({ type: "json_object" });
   });
 
+  it.each(["openai-compatible", "anthropic"] as const)("%s 输出上限截断时拒绝把半篇作为成功结果", async mode => {
+    const events = mode === "anthropic"
+      ? [{ type: "content_block_delta", delta: { type: "text_delta", text: "只有前半篇" } }, { type: "message_delta", delta: { stop_reason: "max_tokens" } }, { type: "message_stop" }]
+      : [{ choices: [{ delta: { content: "只有前半篇" }, finish_reason: "length" }] }];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "Content-Type": "text/event-stream" } }));
+    await expect(new ModelApiClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test", apiMode: mode })
+      .chatStream([{ role: "user", content: "更新完整大纲" }])).rejects.toThrow("内容不完整");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("finishes an SSE response on finish_reason even when the relay keeps the connection open", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
       new ReadableStream<Uint8Array>({

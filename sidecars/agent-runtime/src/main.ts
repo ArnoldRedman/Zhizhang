@@ -271,6 +271,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         const result = await delegateResult("outline", "outline.write", {
           ...delegateBase("outline"),
           outlineId: request.targetId,
+          projectAgentWrite: true,
           kind: request.kind,
           existingContent: String(target?.content || ""),
           instruction: request.instruction,
@@ -730,8 +731,8 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         : "";
       if (beatSection) emitter.context("retrieve", "已装载本章节拍", { source: "阶段节拍表", status: "loaded", bytes: byteLength(beatSection), items: 1 });
       const dynamicTask = isBeatSheet
-        ? `## 本次大纲任务\n类型：阶段节拍表（第 ${beatFrom}～${beatTo} 章${beatWrittenThrough >= beatFrom ? `，其中第 ${beatFrom}～${beatWrittenThrough} 章已写` : ""}）\n作者指令：${compactText(instruction || "按总纲把本阶段拆成逐章事件", 1800)}\n\n${directionSection}${stageBeatSheetProtocol}\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n只输出节拍表 Markdown。`
-        : `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${beatSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## ${kind === "章纲" ? "当前待完善文档（可被替换的旧草稿，不是事实来源）" : "当前文档（作者的长期资料，你的输出会整份替换它）"}\n${compactText(existingContent || "暂无", kind === "章纲" ? 5000 : 12000)}\n\n输出该类型的大纲 Markdown 正文${kind === "章纲" ? "；这一章要发生一件前文没发生过的事，总纲或节拍有安排就按它" : "。总纲写的是分卷规划：每卷写哪些内容、感情推进到哪、大约多少章、卷末落在哪，加上当前阶段的区间目标；不要逐章列条目，逐章的事交给节拍表和章纲。要么输出完整的新版（原有各部分照抄保留，只改需要改的），要么只输出补充内容并在第一行标题里写明「追加件」，应用会把它接在原文末尾；不要输出一份只有新内容却没标「追加件」的文档，那会把原文冲掉"}。不要输出分析过程或前言。`;
+        ? `## 本次大纲任务\n类型：阶段节拍表（第 ${beatFrom}～${beatTo} 章${beatWrittenThrough >= beatFrom ? `，其中第 ${beatFrom}～${beatWrittenThrough} 章已写` : ""}）\n作者指令：${compactText(instruction || "按总纲把本阶段拆成逐章事件", 1800)}\n\n${directionSection}${stageBeatSheetProtocol}\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${String(existingContent || "暂无")}\n\n只输出节拍表 Markdown。`
+        : `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${directionSection}${beatSection}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## ${kind === "章纲" ? "当前待完善文档（可被替换的旧草稿，不是事实来源）" : "当前文档（作者的长期资料，你的输出会整份替换它）"}\n${String(existingContent || "暂无")}\n\n输出该类型的大纲 Markdown 正文${kind === "章纲" ? "；这一章要发生一件前文没发生过的事，总纲或节拍有安排就按它" : `。总纲写的是分卷规划：每卷写哪些内容、感情推进到哪、大约多少章、卷末落在哪，加上当前阶段的区间目标；不要逐章列条目，逐章的事交给节拍表和章纲。${req.params?.projectAgentWrite ? "必须输出完整新版，保留未要求改动的原文。项目 Agent 不会自动追加，不能只输出追加件、摘要或省略后的部分文档" : "要么输出完整的新版（原有各部分照抄保留，只改需要改的），要么只输出补充内容并在第一行标题里写明「追加件」，应用会把它接在原文末尾；不要输出一份只有新内容却没标「追加件」的文档，那会把原文冲掉"}`}。不要输出分析过程或前言。`;
       emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
       emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
       emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
@@ -743,7 +744,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         // Keep the current target/source packet last so stale session turns
         // cannot override the chapter the author just selected.
         { role: "user", content: dynamicTask },
-      ], { max_tokens: isBeatSheet ? 6000 : kind === "章纲" ? 5000 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
+      ], { max_tokens: Math.min(32_000, Math.max(isBeatSheet ? 6000 : kind === "章纲" ? 5000 : 8000, Math.ceil(String(existingContent || "").length * 2))), temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
       emitter.progress("review", 92, "步骤 5/5：校验章节承接、格式与章末钩子");
       emitter.complete("大纲内容生成完成");
       const nextOutlineSession = appendAgentSession(outlineSession, String(instruction || "补全结构并强化可执行性"), response.content, contextWindow, byteLength(stableProjectPacket));

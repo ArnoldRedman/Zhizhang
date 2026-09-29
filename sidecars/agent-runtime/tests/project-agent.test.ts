@@ -31,10 +31,58 @@ const bigProject = {
 };
 
 const clientWith = (content: string) => ({
-  chat: vi.fn().mockResolvedValue({ content, model: "test" }),
+  chatStream: vi.fn().mockResolvedValue({ content, model: "test" }),
 }) as unknown as ModelApiClient;
 
 describe("project agent", () => {
+  it("追加件不能作为新建或整篇替换资料进入提案", async () => {
+    const client = clientWith(JSON.stringify({ action: "finish", message: "登记日志", changes: [
+      { type: "outline.upsert", summary: "追加日志", targetId: 11, kind: "章纲", title: "修订日志", content: "# 追加件｜本轮登记\n只包含新增记录" },
+      { type: "outline.upsert", summary: "另建日志", kind: "世界观与作品设定", title: "修订日志", content: "# 追加件｜本轮登记\n只包含新增记录" },
+    ] }));
+    const result = await runProjectAgent({ mode: "execute", instruction: "追加日志", project }, client, delegates());
+    expect(result.changes).toEqual([]);
+    expect(result.toolEvents.filter(event => event.status === "error")).toHaveLength(2);
+    expect(project.outlines).toHaveLength(1);
+  });
+  it("后续规划轮遇到 524 时返回已完成临时稿和明确的未完成提示", async () => {
+    const chatStream = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({ action: "edit", changes: [{ type: "card.upsert", summary: "调整人物", targetId: 21, cardType: "角色卡", title: "林舟", content: "主动追查线索" }] }) })
+      .mockRejectedValueOnce(new Error("API 中转服务返回 524"));
+    const result = await runProjectAgent({ mode: "execute", instruction: "修改人物卡，再更新大纲", project }, { chatStream } as unknown as ModelApiClient, delegates());
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(result.changes).toHaveLength(1);
+    expect(result.message).toContain("已保留 1 项");
+    expect(result.message).toContain("其余任务尚未完成");
+    expect(result.toolEvents.at(-1)).toMatchObject({ tool: "project.request", status: "error", message: "API 中转服务返回 524" });
+    expect(project.cards[0].content).toBe("谨慎，擅长整理档案。");
+  });
+
+  it("首轮请求超时明确报告没有生成变更", async () => {
+    const chatStream = vi.fn().mockRejectedValue(new Error("524"));
+    const result = await runProjectAgent({ mode: "execute", instruction: "更新总纲", project }, { chatStream } as unknown as ModelApiClient, delegates());
+    expect(result.changes).toEqual([]);
+    expect(result.message).toContain("尚未生成可确认变更");
+  });
+  it("edit 后 finish 重述补标题和章纲时只执行一次，复查能读到临时标题", async () => {
+    const changes = [
+      { type: "chapter.retitle", summary: "补标题", targetIds: [1], scope: "missing", instruction: "按正文命名" },
+      { type: "outline.write", summary: "推进章纲", kind: "章纲", title: "第 4 章", instruction: "推进旧账线索" },
+    ];
+    const chatStream = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({ action: "edit", changes }) })
+      .mockResolvedValueOnce({ content: JSON.stringify({ action: "finish", message: "请确认", changes: changes.map(item => ({ ...item, summary: `${item.summary}已完成` })) }) });
+    const workers = delegates();
+    workers.chapterTitles.mockResolvedValue({ type: "chapter.titles", summary: "补标题", titles: [{ targetId: 1, title: "第 1 章 旧账线索" }] });
+    workers.outline.mockResolvedValue({ type: "outline.upsert", summary: "推进章纲", kind: "章纲", title: "第 4 章", content: "追查旧账" });
+    const onStage = vi.fn();
+    const result = await runProjectAgent({ mode: "execute", instruction: "补标题并推进章纲", project, onStage }, { chatStream } as unknown as ModelApiClient, workers);
+    expect(workers.chapterTitles).toHaveBeenCalledTimes(1);
+    expect(workers.outline).toHaveBeenCalledTimes(1);
+    expect(result.changes).toHaveLength(2);
+    expect(onStage.mock.calls.at(-1)?.[0].chapters[0].title).toBe("第 1 章 旧账线索");
+    expect(project.chapters[0].title).toBe("第一章 入城");
+  });
   it("selects relevant project documents within the context packet", () => {
     const context = buildProjectAgentContext({
       mode: "discuss",
@@ -162,8 +210,8 @@ describe("project agent", () => {
       JSON.stringify({ action: "open", kind: "章节", id: "2" }),
       JSON.stringify({ action: "finish", message: "林舟已确认旧书来自码头仓库。", changes: [] }),
     ];
-    const chat = vi.fn().mockImplementation(() => Promise.resolve({ content: turns.shift(), model: "test" }));
-    const client = { chat } as unknown as ModelApiClient;
+    const chatStream = vi.fn().mockImplementation(() => Promise.resolve({ content: turns.shift(), model: "test" }));
+    const client = { chatStream } as unknown as ModelApiClient;
 
     const result = await runProjectAgent({
       mode: "discuss",
@@ -171,18 +219,18 @@ describe("project agent", () => {
       project,
     }, client, delegates());
 
-    expect(chat).toHaveBeenCalledTimes(3);
+    expect(chatStream).toHaveBeenCalledTimes(3);
     expect(result.message).toContain("码头仓库");
     expect(result.toolEvents.map(event => event.tool)).toEqual(["project.context", "project.search", "project.open"]);
     // open 必须真的把第二章正文回灌给模型，否则循环就退化成空转
-    const openTurn = chat.mock.calls[2][0] as Array<{ content: string }>;
+    const openTurn = chatStream.mock.calls[2][0] as Array<{ content: string }>;
     expect(openTurn.at(-1)?.content).toContain("码头仓库");
   });
 
   it("多轮检索后请求体不会无上限增长", async () => {
     // 回归：messages 只增不减，真实使用中请求体从几 KB 撑到 62 KB，做到一半突然被中转站拒绝
     const bulky = { ...project, chapters: project.chapters.map(chapter => ({ ...chapter, content: "旧仓库的档案细节。".repeat(2000) })) };
-    const chat = vi.fn().mockImplementation((messages: Array<{ content: string }>) => {
+    const chatStream = vi.fn().mockImplementation((messages: Array<{ content: string }>) => {
       const bytes = messages.reduce((sum, message) => sum + Buffer.byteLength(message.content, "utf8"), 0);
       // 40 KB 上限叠上最后一轮的截断余量，留一些余地
       expect(bytes).toBeLessThan(16 * 1024 * 3);
@@ -195,11 +243,11 @@ describe("project agent", () => {
       project: bulky,
       contextWindowKTokens: 16,
       maxSteps: 8,
-    }, { chat } as unknown as ModelApiClient, delegates());
+    }, { chatStream } as unknown as ModelApiClient, delegates());
 
-    expect(chat).toHaveBeenCalledTimes(8);
+    expect(chatStream).toHaveBeenCalledTimes(8);
     // 被省略早期轮次时要如实告知模型，而不是默默丢掉
-    const lastTurn = chat.mock.calls.at(-1)?.[0] as Array<{ content: string }>;
+    const lastTurn = chatStream.mock.calls.at(-1)?.[0] as Array<{ content: string }>;
     expect(lastTurn.some(message => message.content.includes("已省略较早的"))).toBe(true);
     // system 与首条请求（含项目资料）是任务前提，任何情况下都不能被丢
     expect(lastTurn[0]?.content).toContain("小说项目助手");
@@ -207,8 +255,8 @@ describe("project agent", () => {
   });
 
   it("stops the loop at maxSteps and still returns a result", async () => {
-    const chat = vi.fn().mockResolvedValue({ content: JSON.stringify({ action: "search", query: "林舟" }), model: "test" });
-    const client = { chat } as unknown as ModelApiClient;
+    const chatStream = vi.fn().mockResolvedValue({ content: JSON.stringify({ action: "search", query: "林舟" }), model: "test" });
+    const client = { chatStream } as unknown as ModelApiClient;
 
     const result = await runProjectAgent({
       mode: "discuss",
@@ -217,14 +265,14 @@ describe("project agent", () => {
       maxSteps: 3,
     }, client, delegates());
 
-    expect(chat).toHaveBeenCalledTimes(3);
+    expect(chatStream).toHaveBeenCalledTimes(3);
     expect(result.changes).toEqual([]);
     expect(result.message).toContain("尚未完成");
   });
 
   it("recovers when the model puts a change type in the action field", async () => {
     // 真实接口上 gpt-5.6-sol 会回 {"action":"chapter.draft_next",...}，把两套命名空间混在一起
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "chapter.draft_next", summary: "起草第三章", title: "第三章 旧仓库", instruction: "承接夜雨结尾", outlineId: 0 }),
       model: "test",
     });
@@ -234,7 +282,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "继续写第三章", project,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapter: delegate });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapter: delegate });
 
     expect(delegate).toHaveBeenCalledOnce();
     expect(result.changes.map(change => change.type)).toEqual(["chapter.create"]);
@@ -242,7 +290,7 @@ describe("project agent", () => {
   });
 
   it("drops one malformed change without losing the reply or the valid ones", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "整理完成。", changes: [
         { type: "card.write", summary: "坏的", targetId: "168", patch: { currentState: "x" } },
         { type: "card.write", summary: "好的", targetId: 21, cardType: "角色卡", title: "林舟", instruction: "补充当前目标。" },
@@ -255,7 +303,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "整理林舟卡片", project,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), card });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), card });
 
     expect(result.message).toBe("整理完成。");
     expect(card).toHaveBeenCalledOnce();
@@ -264,7 +312,7 @@ describe("project agent", () => {
   });
 
   it("delegates a chapter revise and returns a chapter.update proposal", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "已修订第二章。", changes: [
         { type: "chapter.revise", summary: "去 AI 味", targetId: 2, instruction: "保留情节和人物口吻" },
       ] }),
@@ -276,14 +324,14 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "把第二章的 AI 味去掉", project,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
     expect(chapterRevise).toHaveBeenCalledWith(expect.objectContaining({ targetId: 2, instruction: "保留情节和人物口吻" }));
     expect(result.changes).toEqual([{ type: "chapter.update", summary: "去 AI 味", targetId: 2, content: "夜雨敲在窗框上。" }]);
   });
 
   it("执行全部有效修订而不是在第十章静默停下", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "开始批量修订。", changes: Array.from({ length: 13 }, (_, index) => ({
         type: "chapter.revise", summary: `修订 ${index + 1}`, targetId: index + 1, instruction: "润色",
       })) }),
@@ -295,7 +343,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "把全书都润色一遍", project: { ...project, chapters: Array.from({ length: 13 }, (_, index) => ({ id: index + 1, title: `第${index + 1}章`, content: '旧稿' })) },
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
     expect(chapterRevise).toHaveBeenCalledTimes(13);
     expect(result.changes).toHaveLength(13);
@@ -304,7 +352,7 @@ describe("project agent", () => {
 
   it("整轮委派超预算后停手，剩余变更如实报出", async () => {
     // 回归：一轮最多 16 项委派，每项都要跑完整的正文生成，串行下来可能几十分钟不返回
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "开始批量起草。", changes: Array.from({ length: 6 }, (_, index) => ({
         type: "chapter.draft_next", summary: `起草 ${index + 1}`, title: `第 ${index + 3} 章`, instruction: "承接上一章",
       })) }),
@@ -316,7 +364,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "一口气把后面几章都写了", project, delegateBudgetMs: 5,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapter });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapter });
 
     // 关联生成顺序执行，第一项完成时已超时，其余逐项报告
     expect(chapter).toHaveBeenCalledTimes(1);
@@ -327,7 +375,7 @@ describe("project agent", () => {
   });
 
   it("预算只拦委派，不影响本地就能落地的变更", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "整理完成。", changes: [
         { type: "memory.document.upsert", summary: "整理时间线", kind: "时间线", title: "时间线", content: "第一天入城。" },
         { type: "chapter.delete", summary: "删除空稿", targetId: 2, title: "第二章 夜雨" },
@@ -337,7 +385,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "整理时间线并删掉空稿", project, delegateBudgetMs: 1,
-    }, { chat } as unknown as ModelApiClient, delegates());
+    }, { chatStream } as unknown as ModelApiClient, delegates());
 
     expect(result.changes.map(change => change.type)).toEqual(["memory.document.upsert", "chapter.delete"]);
     expect(result.toolEvents.filter(event => event.status === "error")).toHaveLength(0);
@@ -348,7 +396,7 @@ describe("project agent", () => {
     // 10 章批量必须给足 10×20 = 200 分钟，而不是在 20 分钟处停手
     vi.useFakeTimers();
     try {
-      const chat = vi.fn().mockResolvedValue({
+      const chatStream = vi.fn().mockResolvedValue({
         content: JSON.stringify({ action: "finish", message: "批量修订。", changes: Array.from({ length: 10 }, (_, index) => ({
           type: "chapter.revise", summary: `修订 ${index + 1}`, targetId: index + 1, instruction: "统一结尾",
         })) }),
@@ -359,7 +407,7 @@ describe("project agent", () => {
 
       const pending = runProjectAgent({
         mode: "execute", instruction: "把第 150 到 159 章的结尾都改掉", project: { ...project, chapters: Array.from({ length: 10 }, (_, index) => ({ id: index + 1, title: `第${index + 150}章`, content: '旧稿' })) },
-      }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+      }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
       await vi.advanceTimersByTimeAsync(61 * 60_000);
 
       const result = await pending;
@@ -406,7 +454,7 @@ describe("project agent", () => {
     ];
     // messages 数组会被原地追加，mock.calls 事后看到的都是最终态，只能在调用当时抓下末条
     const tails: string[] = [];
-    const chat = vi.fn().mockImplementation((messages: Array<{ content: string }>) => {
+    const chatStream = vi.fn().mockImplementation((messages: Array<{ content: string }>) => {
       tails.push(messages.at(-1)?.content || "");
       return Promise.resolve({ content: turns.shift(), model: "test" });
     });
@@ -415,7 +463,7 @@ describe("project agent", () => {
       mode: "discuss",
       instruction: "把第 150 到 152 章读一遍",
       project: bigProject,
-    }, { chat } as unknown as ModelApiClient, delegates());
+    }, { chatStream } as unknown as ModelApiClient, delegates());
 
     expect(result.toolEvents.map(event => event.tool)).toEqual(["project.context", "project.list", "project.open"]);
     // list 只回序号、id 和字数，不回正文
@@ -428,7 +476,7 @@ describe("project agent", () => {
   });
 
   it("批量补标题交给标题智能体，只产出一条 chapter.titles", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "开始补标题。", changes: [
         { type: "chapter.retitle", summary: "批量补标题", targetIds: [], scope: "missing", instruction: "标题贴合本章事件" },
       ] }),
@@ -445,7 +493,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "把之前缺的章节标题都补上", project,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterTitles });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterTitles });
 
     expect(chapterTitles).toHaveBeenCalledWith(expect.objectContaining({ type: "chapter.retitle", scope: "missing", targetIds: [] }));
     expect(result.changes).toHaveLength(1);
@@ -454,7 +502,7 @@ describe("project agent", () => {
   });
 
   it("拆章交给拆章智能体，只产出一条 chapter.parts，正文不进变更", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "开始拆章。", changes: [
         { type: "chapter.split", summary: "把超长章拆开", targetIds: [1, 2], targetWords: 2400, instruction: "新段落标题贴合该段事件" },
       ] }),
@@ -471,7 +519,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "150 到 159 章有的六千字，拆成两千多字一章", project,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterSplit });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterSplit });
 
     expect(chapterSplit).toHaveBeenCalledWith(expect.objectContaining({ type: "chapter.split", targetIds: [1, 2], targetWords: 2400 }));
     expect(result.changes).toHaveLength(1);
@@ -482,7 +530,7 @@ describe("project agent", () => {
   });
 
   it("作者直接说拆成几章时，章数跟着意图一起交给拆章智能体", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "拆成 6 章。", changes: [
         { type: "chapter.split", summary: "两章拆成 6 章", targetIds: [1, 2], targetWords: 2000, targetParts: 6 },
       ] }),
@@ -499,13 +547,13 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "150、151 两章字数到了 6000，拆成 6 章，每章 2000 字", project,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterSplit });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterSplit });
 
     expect(chapterSplit).toHaveBeenCalledWith(expect.objectContaining({ targetParts: 6, targetWords: 2000 }));
     expect(result.changes[0].type).toBe("chapter.parts");
   });
   it("关联委派顺序执行，一项失败如实报告", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "批量润色。", changes: Array.from({ length: 6 }, (_, index) => ({
         type: "chapter.revise", summary: `润色 ${index + 1}`, targetId: index + 1, instruction: "只改文字", mode: "polish",
       })) }),
@@ -525,7 +573,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "把这几章都润一遍", project: { ...project, chapters: Array.from({ length: 6 }, (_, index) => ({ id: index + 1, title: `第${index + 1}章`, content: '旧稿' })) },
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
     expect(peak).toBe(1);
     expect(chapterRevise).toHaveBeenCalledTimes(6);
@@ -535,7 +583,7 @@ describe("project agent", () => {
   });
 
   it("委派失败要说清是哪一章、什么原因、下一步怎么办", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "批量润色。", changes: [
         { type: "chapter.revise", summary: "润色第二章", targetId: 2, instruction: "只改文字", mode: "polish" },
       ] }),
@@ -545,7 +593,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "润色第二章", project,
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
     const failure = result.toolEvents.find(event => event.tool === "chapter.revise" && event.status === "error");
     expect(failure?.message).toContain("润色第二章｜目标 2");
@@ -555,7 +603,7 @@ describe("project agent", () => {
   });
 
   it("委派阶段持续上报进度，前端进度条不会整段停住", async () => {
-    const chat = vi.fn().mockResolvedValue({
+    const chatStream = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "批量润色。", changes: [
         { type: "chapter.revise", summary: "润色第一章", targetId: 1, instruction: "只改文字", mode: "polish" },
         { type: "chapter.revise", summary: "润色第二章", targetId: 2, instruction: "只改文字", mode: "polish" },
@@ -571,7 +619,7 @@ describe("project agent", () => {
       instruction: "润色前两章",
       project,
       onDelegate: event => seen.push(`${event.status}:${event.done}/${event.total}`),
-    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+    }, { chatStream } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
     expect(seen.filter(item => item.startsWith("start"))).toHaveLength(2);
     expect(seen.at(-1)).toBe("complete:2/2");
@@ -608,7 +656,7 @@ describe("project agent", () => {
     expect(result.message).toContain("码头仓库");
     expect(result.changes).toHaveLength(1);
     // 本地抢救成功，不应再调第二次模型修格式
-    expect((client as unknown as { chat: ReturnType<typeof vi.fn> }).chat).toHaveBeenCalledTimes(1);
+    expect((client as unknown as { chatStream: ReturnType<typeof vi.fn> }).chatStream).toHaveBeenCalledTimes(1);
   });
 
   it("散文包着 JSON 的回包能剥出动作", async () => {
@@ -626,10 +674,10 @@ describe("project agent", () => {
   it("两轮都解析不出动作时，够长的散文回复直接当内容收尾", async () => {
     // 模型直接把大纲写成散文，连 JSON 都没包：丢掉的话作者就白等了
     const prose = `关于这本书的主线：${"林舟在城南整理旧书档案，逐步揭开码头仓库背后三十年前的旧案。".repeat(12)}`;
-    const chat = vi.fn()
+    const chatStream = vi.fn()
       .mockResolvedValueOnce({ content: prose, model: "test" })
       .mockResolvedValue({ content: "还是解析不了", model: "test" });
-    const client = { chat } as unknown as ModelApiClient;
+    const client = { chatStream } as unknown as ModelApiClient;
 
     const result = await runProjectAgent(
       { mode: "discuss", instruction: "这书到底讲的是什么", project, contextWindowKTokens: 64 },
@@ -648,7 +696,7 @@ describe("project agent", () => {
   });
 
   it("当模型返回空或{}时不会发送无上下文的只调整格式修复，而是带完整上下文收尾", async () => {
-    const chat = vi.fn()
+    const chatStream = vi.fn()
       // 第一轮 list
       .mockResolvedValueOnce({ content: JSON.stringify({ action: "list", from: 1, to: 2 }), model: "test" })
       // 第二轮返回空 JSON {}
@@ -658,12 +706,12 @@ describe("project agent", () => {
 
     const result = await runProjectAgent(
       { mode: "discuss", instruction: "192和194连贯吗", project },
-      { chat } as unknown as ModelApiClient,
+      { chatStream } as unknown as ModelApiClient,
       delegates(),
     );
 
     // 严禁发出带有空待整理内容的“请把以下内容整理成约定的 JSON 动作”
-    for (const call of chat.mock.calls) {
+    for (const call of chatStream.mock.calls) {
       const messages = call[0] as Array<{ role: string; content: string }>;
       const userMessage = messages.find(msg => msg.content.includes("请把以下内容整理成约定的 JSON 动作"));
       if (userMessage) {
@@ -707,7 +755,7 @@ describe("project agent", () => {
 </｜｜DSML｜｜ invoke>
 </｜｜DSML｜｜ calls>`;
 
-    const chat = vi.fn()
+    const chatStream = vi.fn()
       // 第一轮模型输出 DSML 请求打开第 1、2 章
       .mockResolvedValueOnce({ content: dsmlResponse, model: "test" })
       // 第二轮正文载入后，给出最终答复
@@ -715,7 +763,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent(
       { mode: "discuss", instruction: "看两章正文", project },
-      { chat } as unknown as ModelApiClient,
+      { chatStream } as unknown as ModelApiClient,
       delegates(),
     );
 
@@ -732,7 +780,7 @@ describe("project agent", () => {
 describe("project agent context regressions", () => {
   it("长历史和多轮读取不会丢掉当前问题，讨论模式不带写入工具说明", async () => {
     const requests: Array<Array<{ role: string; content: string }>> = [];
-    const chat = vi.fn(async (messages: Array<{ role: string; content: string }>) => {
+    const chatStream = vi.fn(async (messages: Array<{ role: string; content: string }>) => {
       requests.push(messages);
       return { model: "test", content: JSON.stringify(requests.length < 5
         ? { action: "open", id: [1, 2] }
@@ -742,7 +790,7 @@ describe("project agent context regressions", () => {
       mode: "discuss", instruction: "本轮唯一问题：192后面194是否缺剧情",
       history: Array.from({ length: 10 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `旧消息${i}` + "旧".repeat(1400) })),
       project: { ...project, chapters: project.chapters.map(chapter => ({ ...chapter, content: "中".repeat(4000) })) },
-    }, { chat } as unknown as ModelApiClient, delegates());
+    }, { chatStream } as unknown as ModelApiClient, delegates());
     for (const messages of requests) {
       expect(messages.some(message => message.content.includes("本轮唯一问题：192后面194是否缺剧情"))).toBe(true);
       expect(messages[0].content).not.toContain("chapter.delete");
@@ -753,14 +801,14 @@ describe("project agent context regressions", () => {
 
   it("计划模式不给写入说明，finish 里的变更也会丢掉", async () => {
     const requests: Array<Array<{ content: string }>> = [];
-    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+    const chatStream = vi.fn(async (messages: Array<{ content: string }>) => {
       requests.push(messages);
       return { model: "test", content: JSON.stringify({ action: "finish", message: "先改第 2 章的雨，再补一张角色卡。", changes: [{ type: "chapter.delete", summary: "删章", targetId: 2 }] }) };
     });
     const result = await runProjectAgent({
       mode: "plan", instruction: "规划怎么改第 2 章",
       project,
-    }, { chat } as unknown as ModelApiClient, delegates());
+    }, { chatStream } as unknown as ModelApiClient, delegates());
     expect(requests[0][0].content).toContain("计划模式只出方案");
     expect(requests[0][0].content).not.toContain("chapter.delete");
     expect(result.changes).toEqual([]);
@@ -770,7 +818,7 @@ describe("project agent context regressions", () => {
   it("计划模式下模型照提 edit：挡在跑变更之前，直接让它改写方案", async () => {
     const requests: Array<Array<{ content: string }>> = [];
     let call = 0;
-    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+    const chatStream = vi.fn(async (messages: Array<{ content: string }>) => {
       requests.push(messages);
       call += 1;
       // 第一轮不听提示词，直接提变更；第二轮才把方案写进 message
@@ -784,14 +832,14 @@ describe("project agent context regressions", () => {
     const result = await runProjectAgent({
       mode: "plan", instruction: "规划怎么改第 2 章",
       project,
-    }, { chat } as unknown as ModelApiClient, delegates());
+    }, { chatStream } as unknown as ModelApiClient, delegates());
     expect(requests[1].at(-1)?.content).toContain("当前模式不能修改项目");
     expect(result.changes).toEqual([]);
     expect(result.message).toContain("雨停");
   });
 
   it("1M 窗口也不会把整本书塞进一轮请求", async () => {
-    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+    const chatStream = vi.fn(async (messages: Array<{ content: string }>) => {
       expect(Buffer.byteLength(messages.map(message => message.content).join(""), "utf8")).toBeLessThanOrEqual(180_000);
       return { model: "test", content: JSON.stringify({ action: "finish", message: "先读到这里。", changes: [] }) };
     });
@@ -800,13 +848,13 @@ describe("project agent context regressions", () => {
       contextWindowKTokens: 1024,
       instruction: "通读全书并规划后面的章纲",
       project: { chapters: Array.from({ length: 207 }, (_, index) => ({ id: index + 1, title: `第${index + 1}章`, content: "人物继续做事。".repeat(800) })) },
-    }, { chat } as unknown as ModelApiClient, delegates());
+    }, { chatStream } as unknown as ModelApiClient, delegates());
   });
 
   it("连续分段读取保留长章的中间内容及 Unicode 字符", async () => {
     const content = "开头\r\n" + "雨🌧".repeat(1800) + "中间关键线索" + "夜".repeat(3000) + "结尾";
     const pages: string[] = [];
-    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+    const chatStream = vi.fn(async (messages: Array<{ content: string }>) => {
       const tool = messages.at(-1)?.content || "";
       const page = /<正文>\n([\s\S]*)\n<\/正文>/u.exec(tool);
       if (page) pages.push(page[1]);
@@ -815,7 +863,7 @@ describe("project agent context regressions", () => {
         ? { action: "finish", message: "正文已读完。", changes: [] }
         : { action: "open", id: 1 }) };
     });
-    await runProjectAgent({ mode: "discuss", contextWindowKTokens: 16, instruction: "检查全文是否有缺失", project: { ...project, chapters: [{ id: 1, title: "第192章", content }] } }, { chat } as unknown as ModelApiClient, delegates());
+    await runProjectAgent({ mode: "discuss", contextWindowKTokens: 16, instruction: "检查全文是否有缺失", project: { ...project, chapters: [{ id: 1, title: "第192章", content }] } }, { chatStream } as unknown as ModelApiClient, delegates());
     expect(pages.length).toBeGreaterThan(2);
     expect(pages.join("")).toBe(content);
   });
@@ -826,21 +874,21 @@ describe("project agent context regressions", () => {
       { action: "open", id: [101, "第194章 夜雨"] },
       { action: "finish", message: "两章已读取。", changes: [] },
     ];
-    const chat = vi.fn().mockImplementation(async () => ({ content: JSON.stringify(replies.shift()), model: "test" }));
+    const chatStream = vi.fn().mockImplementation(async () => ({ content: JSON.stringify(replies.shift()), model: "test" }));
     await runProjectAgent({ mode: "discuss", instruction: "192章之后为什么是194章", project: { ...project, chapters: [
       { id: 101, title: "第192章 入城", content: "192正文" },
       { id: 102, title: "第194章 夜雨", content: "194正文" },
-    ] } }, { chat } as unknown as ModelApiClient, delegates());
-    expect(JSON.stringify(chat.mock.calls[1])).toContain("#2｜id=102｜标题：第194章 夜雨");
-    expect(JSON.stringify(chat.mock.calls[2])).toContain("194正文");
+    ] } }, { chatStream } as unknown as ModelApiClient, delegates());
+    expect(JSON.stringify(chatStream.mock.calls[1])).toContain("#2｜id=102｜标题：第194章 夜雨");
+    expect(JSON.stringify(chatStream.mock.calls[2])).toContain("194正文");
   });
 
   it("残缺工具标记恢复失败不泄露，也不猜动作执行", async () => {
     const broken = '["1","2"]</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>';
-    const chat = vi.fn().mockResolvedValue({ content: broken, model: "test" });
-    const result = await runProjectAgent({ mode: "execute", instruction: "检查192和194", project }, { chat } as unknown as ModelApiClient, delegates());
-    expect(chat).toHaveBeenCalledTimes(2);
-    expect(JSON.stringify(chat.mock.calls[1])).toContain("检查192和194");
+    const chatStream = vi.fn().mockResolvedValue({ content: broken, model: "test" });
+    const result = await runProjectAgent({ mode: "execute", instruction: "检查192和194", project }, { chatStream } as unknown as ModelApiClient, delegates());
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(chatStream.mock.calls[1])).toContain("检查192和194");
     expect(result.message).toContain("工具指令解析失败");
     expect(result.message).not.toContain("DSML");
     expect(result.toolEvents.some(event => event.tool === "project.open")).toBe(false);

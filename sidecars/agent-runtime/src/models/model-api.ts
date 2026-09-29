@@ -969,6 +969,7 @@ export class ModelApiClient {
       }), streamResponse.status);
     }
     const reader = responseBody.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
+    let outputTruncated = false;
     // 正常完成后也必须取消 reader，否则中转不关连接时 socket 会挂在连接池里，拖累后续请求
     const finishStream = async () => { try { await reader.cancel(); } catch { /* 已关闭则忽略 */ } };
     try {
@@ -1003,6 +1004,7 @@ export class ModelApiClient {
               const startUsage = event.type === "message_start" && event.message && typeof event.message === "object"
                 ? (event.message as Record<string, unknown>).usage
                 : undefined;
+              if (delta?.stop_reason === "max_tokens") outputTruncated = true;
               usage = mergeUsage(usage, parseUsage(startUsage ?? event.usage));
               if (event.type === "message_stop") break streamLoop;
               continue;
@@ -1018,6 +1020,7 @@ export class ModelApiClient {
             // event but do provide choice.finish_reason. Stop as soon as the
             // model reports completion so the UI cannot remain stuck waiting
             // for another read from an otherwise open connection.
+            if (choice?.finish_reason === "length") outputTruncated = true;
             if (typeof choice?.finish_reason === "string" && choice.finish_reason.trim()) break streamLoop;
           } catch (error) {
             // Ignore proxy keep-alives, but surface a real upstream error event.
@@ -1052,6 +1055,8 @@ export class ModelApiClient {
       }
     }
     recordRuntimeUsage(usage);
+    // 达到输出上限的半篇文本不能作为完整文档交给覆盖流程
+    if (outputTruncated) throw new Error("模型输出达到长度上限，内容不完整，已阻止生成覆盖稿。请缩小修改范围或分段修改");
     // Some OpenAI-compatible gateways accept stream=true but answer with one
     // ordinary JSON response. Preserve compatibility and still update UI once.
     if (!content) {

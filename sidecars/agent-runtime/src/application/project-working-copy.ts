@@ -1,4 +1,4 @@
-import { applyTextReplacements, type ProjectAgentChange } from "@zhizhang/contracts";
+import { assertWholeOutlineContent, applyTextReplacements, type ProjectAgentChange } from "@zhizhang/contracts";
 
 /** 第208章算单章；第206～215章这种区间不算，避免阶段节拍误伤某一章 */
 export function chapterOutlineNumber(title: unknown, content?: unknown): string | undefined {
@@ -34,7 +34,11 @@ export function stageProjectChange(project: Record<string, unknown>, change: Pro
       project.memoryDocuments = [];
       break;
     case "chapter.create": update("chapters", undefined, { title: change.title, content: change.content }); break;
+    case "chapter.titles":
+      for (const item of change.titles) update("chapters", item.targetId, { title: item.title });
+      break;
     case "outline.upsert": {
+      assertWholeOutlineContent(change.content);
       const targeted = attachOutlineTarget(project, change);
       const targetId = targeted.type === "outline.upsert" ? targeted.targetId : change.targetId;
       update("outlines", targetId, { kind: change.kind, title: change.title, content: change.content, ...(change.chapterId === undefined ? {} : { chapterId: change.chapterId }) });
@@ -67,7 +71,7 @@ export function stageProjectChange(project: Record<string, unknown>, change: Pro
     case "graph.edge.upsert":
       project.graphEdges = [...list("graphEdges").filter(item => item.id !== change.targetId), { id: change.targetId, source: change.source, target: change.target, label: change.label, weight: change.weight }];
       break;
-    // 批量命名、拆章和删除保留现有前端落地流程，不在临时副本里伪造完成
+    // 拆章和删除保留现有前端落地流程，不在临时副本里伪造完成
     default: break;
   }
 }
@@ -75,6 +79,7 @@ export function stageProjectChange(project: Record<string, unknown>, change: Pro
 /** 同一对象多次修改只展示最终稿，避免前端把中间稿重复应用 */
 export function proposalKey(change: ProjectAgentChange): string | undefined {
   if (change.type === "project.update") return change.type;
+  if (change.type === "chapter.titles") return `${change.type}:${change.titles.map(item => String(item.targetId)).sort().join(",")}`;
   if (change.type === "memory.document.upsert") return `${change.type}:${change.kind}`;
   if (change.type === "outline.upsert") {
     const number = change.kind === "章纲" ? chapterOutlineNumber(change.title, change.content) : undefined;
