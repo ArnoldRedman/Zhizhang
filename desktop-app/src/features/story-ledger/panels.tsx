@@ -23,7 +23,7 @@ export function ChapterBriefFields({ outline, onChange }: { outline: OutlineDocu
 }
 
 /** 作者可改的承诺账。没填期限或节奏的条目留在这里，不进每一章的提示词 */
-export function PromiseLedger({ promises, onChange }: { promises: StoryPromise[]; onChange: (next: StoryPromise[]) => void }) {
+export function PromiseLedger({ promises, onChange, expanded = false }: { promises: StoryPromise[]; onChange: (next: StoryPromise[]) => void; expanded?: boolean }) {
   const [text, setText] = useState('');
   const [planted, setPlanted] = useState('');
   const [due, setDue] = useState('');
@@ -47,7 +47,7 @@ export function PromiseLedger({ promises, onChange }: { promises: StoryPromise[]
     setEvery('');
   };
   return (
-    <details className="outline-promises">
+    <details className="outline-promises" open={expanded || undefined}>
       <summary>承诺账 <small>{promises.filter(item => item.status === 'open').length} 条未收。填了期限或节奏，到期才进写作</small></summary>
       {promises.map(item => (
         <div className="promise-row" key={item.id}>

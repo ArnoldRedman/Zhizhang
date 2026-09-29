@@ -18,9 +18,9 @@ import { answerAuthorQuestion, answeredAuthorQuestions, dismissAuthorQuestion, g
 import { candidateExcerpts, deriveCardCandidates, ignoreCardCandidate, type DerivedCardCandidate } from './domain/card-candidates';
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
-import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
+import { boundChapterOutlineFor, buildChapterWriteContext, compileChapterBrief, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
 import { ChapterBriefFields, PromiseLedger } from './features/story-ledger/panels';
-import { replacePromises } from './domain/promises';
+import { duePromises, replacePromises } from './domain/promises';
 import { draftAcceptanceIssues } from './features/chapter-agent/acceptance';
 import { analyzeAIChapter, buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
@@ -35,6 +35,7 @@ import { PaneResizer } from './features/editor/pane-resizer';
 import { PlumBranch } from './features/editor/plum-branch';
 import { Icon } from './components/icon';
 import './App.css';
+import './features/editor/workspace.css';
 import { builtinSkills } from './data/builtin-skills';
 import {
   countNovelCharacters,
@@ -1330,7 +1331,27 @@ function App() {
       return existing ? projects.map(project => project.id === next.id ? next : project) : [...projects, next];
     });
   };
-  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
+  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'promises' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
+  // 书内两个视图：写作只留章节与正文，大纲、卡片、图谱、记忆、文风、检测收进资料视图
+  const [outlineGroupView, setOutlineGroupView] = useState<'book' | 'chapter'>('book');
+  const [bookView, setBookView] = useState<'write' | 'library' | 'tasks'>('write');
+  // 右栏默认展开：写作时它就是本章资料与写作智能体的位置。收起状态记在本地，
+  // 收起来之后下次进书还是收着，不再每次都要点一下
+  const [showAgentPanel, setShowAgentPanel] = useState(() => localStorage.getItem('editor-agent-collapsed') !== '1');
+  const toggleAgentPanel = (open: boolean) => {
+    setShowAgentPanel(open);
+    localStorage.setItem('editor-agent-collapsed', open ? '0' : '1');
+  };
+  const [showMoreMenu, setShowMoreMenu] = useState(false);
+  // 右栏写作时的两态：本章资料（章纲边界、到期承诺、待答）与写作智能体
+  const [chapterPaneView, setChapterPaneView] = useState<'brief' | 'agent'>('agent');
+  // 章节目录底部的更多操作，以及章节工具条上的写作设置
+  const [showChapterMenu, setShowChapterMenu] = useState(false);
+  // 窄屏（手机与窄窗口）没有并排空间，左栏改成抽屉，由底部入口拉开
+  const [railOpen, setRailOpen] = useState(false);
+  const [showWritingSettings, setShowWritingSettings] = useState(false);
+  // 右栏的本次写作设置默认折成一行 chip，展开才给表单
+  const [agentSettingsOpen, setAgentSettingsOpen] = useState<'instruction' | 'outline' | 'cards' | 'memory' | null>(null);
   const [aiDetecting, setAIDetecting] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [copiedTitle, setCopiedTitle] = useState(false);
@@ -1462,120 +1483,6 @@ function App() {
   // 懒人连续创作：要写几章、当前写到第几章；停止只在本章写完后生效
   /** 旧章审查：正文已经写好的章只能重跑审查，才发现当时没人修的遗留问题 */
   /** 写作操作台：润色续写、连续创作、旧章审查三件费地方的事共用一个二级面板 */
-  const [showWritingConsole, setShowWritingConsole] = useState(false);
-  /** 操作台窗口位置与大小：记在本地，拖过一次下次打开还是这个样子 */
-  const [consoleFrame, setConsoleFrame] = useState<{ x: number; y: number; width: number; height: number } | null>(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem('writing-console-frame') || 'null');
-      if (saved && typeof saved.x === 'number' && typeof saved.y === 'number' && typeof saved.width === 'number' && typeof saved.height === 'number') {
-        // 若此前受 max-width: 500px 限制存成了窄尺寸，恢复到更合理的预设宽度
-        const width = saved.width <= 560
-          ? Math.min(900, Math.max(520, window.innerWidth - 64))
-          : Math.max(520, Math.min(window.innerWidth - 32, saved.width));
-        const height = Math.max(320, Math.min(window.innerHeight - 32, saved.height));
-        return {
-          x: Math.min(Math.max(-width + 160, saved.x), window.innerWidth - 80),
-          y: Math.min(Math.max(0, saved.y), window.innerHeight - 48),
-          width,
-          height,
-        };
-      }
-    } catch {
-      // 存档坏了就用居中默认值，不值得打断打开面板
-    }
-    return null;
-  });
-  const consoleModalRef = useRef<HTMLDivElement | null>(null);
-  const consoleDragRef = useRef<{ mode: 'move' | 'resize'; startX: number; startY: number; frame: { x: number; y: number; width: number; height: number } } | null>(null);
-  const consoleDragEndTimeRef = useRef(0);
-  const consoleOverlayPointerDownRef = useRef(false);
-
-  /** 拖标题栏移动、拖右下角缩放：先把当前矩形固定成内联样式，之后按位移算新值 */
-  const startConsoleDrag = (mode: 'move' | 'resize') => (event: React.PointerEvent<HTMLElement>) => {
-    // 标题栏里有按钮，点按钮不该带着窗口跑
-    if ((event.target as HTMLElement).closest('button')) {
-      return;
-    }
-    const rect = consoleModalRef.current?.getBoundingClientRect();
-    if (!rect) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    const currentTarget = event.currentTarget;
-    try {
-      currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // 忽略不支持指针捕获的环境
-    }
-    const frame = { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
-    setConsoleFrame(frame);
-    let hasMoved = false;
-    consoleDragRef.current = { mode, startX: event.clientX, startY: event.clientY, frame };
-
-    const move = (moveEvent: PointerEvent) => {
-      const drag = consoleDragRef.current;
-      if (!drag) {
-        return;
-      }
-      const dx = moveEvent.clientX - drag.startX;
-      const dy = moveEvent.clientY - drag.startY;
-      if (!hasMoved && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) {
-        hasMoved = true;
-      }
-      const next = drag.mode === 'move'
-        ? {
-          ...drag.frame,
-          // 留住标题栏与一小截右边框，别拖出屏幕找不回来
-          x: Math.min(Math.max(-drag.frame.width + 160, drag.frame.x + dx), window.innerWidth - 80),
-          y: Math.min(Math.max(0, drag.frame.y + dy), window.innerHeight - 48),
-        }
-        : {
-          ...drag.frame,
-          // 缩放支持横向拉宽或收拢，最小 520px，最大不超过屏幕剩余可用区
-          width: Math.max(520, Math.min(Math.max(520, window.innerWidth - drag.frame.x), drag.frame.width + dx)),
-          height: Math.max(320, Math.min(Math.max(320, window.innerHeight - drag.frame.y), drag.frame.height + dy)),
-        };
-      setConsoleFrame(next);
-    };
-
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      try {
-        currentTarget.releasePointerCapture(event.pointerId);
-      } catch {
-        // 忽略
-      }
-      if (hasMoved) {
-        consoleDragEndTimeRef.current = Date.now();
-        // 捕获阶段拦截松手瞬间产生的原生 click，防止遮罩将拖拽判定为背景点击而误关
-        const stopClick = (clickEvent: MouseEvent) => {
-          clickEvent.stopPropagation();
-          clickEvent.preventDefault();
-          window.removeEventListener('click', stopClick, true);
-        };
-        window.addEventListener('click', stopClick, true);
-        setTimeout(() => {
-          window.removeEventListener('click', stopClick, true);
-        }, 200);
-      }
-      consoleDragRef.current = null;
-      setConsoleFrame(current => {
-        if (current) {
-          try {
-            localStorage.setItem('writing-console-frame', JSON.stringify(current));
-          } catch {
-            // 存不下就只在本次会话生效
-          }
-        }
-        return current;
-      });
-    };
-
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
-  };
 
   const [legacyReviewRange, setLegacyReviewRange] = useState<{ from: number; to: number } | null>(null);
   const [legacyReview, setLegacyReview] = useState<{ running: boolean; done: number; total: number; message: string; items: LegacyReviewItem[] }>({ running: false, done: 0, total: 0, message: '', items: [] });
@@ -1616,7 +1523,7 @@ function App() {
   const consoleChapters = editingProject?.chapters || [];
   const consoleRange = legacyReviewRange ?? { from: Math.max(1, consoleChapters.length - 9), to: consoleChapters.length };
   // 面板关着就不算：聚类只在操作台打开且已有报告时跑（几十毫秒级，不进渲染热路径）
-  const reviewClusters = showWritingConsole && reviewItems.length && editingProject
+  const reviewClusters = bookView === 'tasks' && reviewItems.length && editingProject
     ? buildReviewClusters(reviewItems, editingProject.cards)
     : [];
 
@@ -7219,6 +7126,21 @@ function App() {
   const outlineMode = editingProject !== null && editorSidebarTab === 'outline';
   const cardMode = editingProject !== null && editorSidebarTab === 'cards';
   const styleMode = editingProject !== null && editorSidebarTab === 'style';
+  // 全书字数用章上已存的 wordCount 累加：正文不给这里逐章重算，两百章每次渲染都过一遍太贵
+  const bookTotalWords = (editingProject?.chapters || []).reduce((sum, chapter) => sum + (chapter.wordCount || 0), 0);
+  const activeChapterNumber = editingProject && activeChapter ? editingProject.chapters.findIndex(item => item.id === activeChapter.id) + 1 : 0;
+  const currentChapterDetection = activeChapter ? editingProject?.aiDetection?.chapters.find(item => item.chapterId === activeChapter.id) : undefined;
+  // 右栏「本章资料」：章纲上填的信息边界、账里到期或踩上节奏的承诺、还没答的问题
+  const chapterBrief = editingProject && activeChapter && activeChapterNumber > 0 ? compileChapterBrief(editingProject, activeChapter, activeChapterNumber) : undefined;
+  const chapterPromises = editingProject ? duePromises(editingProject.promises, activeChapterNumber) : [];
+  const openQuestions = (editingProject?.authorQuestions || []).filter(item => !item.answer.trim());
+  // 切回写作视图时强制回到章节：写作视图左栏只放章节目录，资料页签只在资料视图出现
+  const switchBookView = (view: 'write' | 'library' | 'tasks') => {
+    setBookView(view);
+    if (view === 'write') setEditorSidebarTab('chapters');
+    // 资料视图左栏是资料分组；留着章节目录或剧情搜索只会显示成「原来那个小面板」
+    if (view === 'library' && (editorSidebarTab === 'chapters' || editorSidebarTab === 'search')) setEditorSidebarTab('outline');
+  };
   const localToday = (() => { const date = new Date(); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; })();
   const usageRows = usageDays.filter(day => {
     if (usageStartDate || usageEndDate) return (!usageStartDate || day.date >= usageStartDate) && (!usageEndDate || day.date <= usageEndDate);
@@ -7312,27 +7234,45 @@ function App() {
       {editingProject ? (
         <div className="editor-view">
           <header className="editor-header">
-            <button className="btn-back" onClick={handleCloseEditor}><Icon name="arrow-left" size={16} />返回</button>
-            <h2>{editingProject.title}</h2>
-            <button className={`editor-tool-button project-agent-toggle ${showProjectAgent ? 'active' : ''}`} title="打开项目 Agent 对话" onClick={() => setShowProjectAgent(current => !current)}><Icon name="sparkles" size={15} />项目 Agent{projectAgentPendingChanges.length ? ` ${projectAgentPendingChanges.length}` : ''}</button>
-            {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && <>
-              <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Icon name="search" size={14} />搜索</button>
-              <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}><Icon name="highlighter" size={14} />标记</button>
-              <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}><Icon name="ban" size={14} />禁词</button>
-              <button className="editor-tool-button" title="历史版本与回滚（Ctrl/⌘ H）" disabled={!activeChapter} onClick={() => setShowChapterHistory(true)}><Icon name="history" size={14} />历史{activeChapter?.snapshots?.length ? ` ${activeChapter.snapshots.length}` : ''}</button>
-              <button className="editor-tool-button" title="通读当前章（Ctrl/⌘ P）" disabled={!activeChapter} onClick={() => setReadingMode(true)}><Icon name="book-open" size={14} />阅读</button>
-              <button className="editor-tool-button" title="写作统计（Ctrl/⌘ J）" onClick={() => setShowWritingStats(true)}><Icon name="bar-chart" size={14} />统计</button>
-              <button className="editor-tool-button" title="导出小说（Ctrl/⌘ E）" onClick={() => setShowExportModal(true)}><Icon name="download" size={14} />导出</button>
-              <button className="editor-tool-button" title="快捷键（Ctrl/⌘ /）" onClick={() => setShowShortcuts(true)}><Icon name="keyboard" size={14} /></button>
-              <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}><Icon name="save" size={14} />{chapterSaving ? '保存中...' : '保存章节'}</button>
-              <div className="editor-stats">
-                <span>{autoSaveStatus === 'saving' ? '自动保存中' : autoSaveStatus === 'saved' ? '已自动保存' : autoSaveStatus === 'error' ? '保存失败' : '本地写作'}</span>
-                <span>{editingProject.chapters.length} 章</span>
+            <button className="btn-back" title="返回书库" onClick={handleCloseEditor}><Icon name="arrow-left" size={16} /></button>
+            <div className="editor-title">
+              <h2>{editingProject.title}</h2>
+              <span>{activeChapterNumber ? `第 ${activeChapterNumber} 章 / 共 ${editingProject.chapters.length} 章 · ` : `${editingProject.chapters.length} 章 · `}全书 {bookTotalWords.toLocaleString()} 字</span>
+              {outlineMode && <span className="editor-mode-label">大纲编辑</span>}
+              {cardMode && <span className="editor-mode-label">卡片编辑</span>}
+              {styleMode && <span className="editor-mode-label">作品文风</span>}
+            </div>
+            <div className="view-switch" role="tablist" aria-label="书内视图">
+              <button className={bookView === 'write' ? 'active' : ''} onClick={() => switchBookView('write')}>写作</button>
+              <button className={bookView === 'library' ? 'active' : ''} onClick={() => switchBookView('library')}>资料</button>
+              <button className={bookView === 'tasks' ? 'active' : ''} onClick={() => switchBookView('tasks')}>任务</button>
+            </div>
+            <div className="editor-header-actions">
+              {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && (
+                <button className="editor-tool-button icon-only" title="搜索当前章节（Ctrl/⌘ F）" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Icon name="search" size={15} /></button>
+              )}
+              <button className={`editor-tool-button project-agent-toggle ${showProjectAgent ? 'active' : ''}`} title="打开项目 Agent 对话" onClick={() => setShowProjectAgent(current => !current)}><Icon name="sparkles" size={15} />项目 Agent{projectAgentPendingChanges.length ? ` ${projectAgentPendingChanges.length}` : ''}</button>
+              <div className="editor-more">
+                <button className={`editor-tool-button ${showMoreMenu ? 'active' : ''}`} title="标记、禁词、历史、阅读、统计、导出、快捷键" onClick={() => setShowMoreMenu(current => !current)}><Icon name="more" size={16} />更多</button>
+                {showMoreMenu && <>
+                  <div className="editor-menu-backdrop" onClick={() => setShowMoreMenu(false)} />
+                  <div className="editor-more-menu" role="menu">
+                    {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && <>
+                      <button role="menuitem" className={writingMarksEnabled ? 'active' : ''} onClick={() => { setWritingMarksEnabled(current => !current); setShowMoreMenu(false); }}><Icon name="highlighter" size={14} />人物名称与禁词标记{writingMarksEnabled ? '（已开）' : ''}</button>
+                      <button role="menuitem" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); setShowMoreMenu(false); }}><Icon name="ban" size={14} />编辑禁词列表</button>
+                      <button role="menuitem" disabled={!activeChapter} onClick={() => { setShowChapterHistory(true); setShowMoreMenu(false); }}><Icon name="history" size={14} />历史版本{activeChapter?.snapshots?.length ? ` ${activeChapter.snapshots.length}` : ''}</button>
+                      <button role="menuitem" disabled={!activeChapter} onClick={() => { setReadingMode(true); setShowMoreMenu(false); }}><Icon name="book-open" size={14} />通读当前章（Ctrl/⌘ P）</button>
+                      <button role="menuitem" disabled={!activeChapter?.content.trim()} onClick={() => { formatActiveChapter(); setShowMoreMenu(false); }}><Icon name="pencil" size={14} />格式化正文</button>
+                      <button role="menuitem" onClick={() => { setShowWritingStats(true); setShowMoreMenu(false); }}><Icon name="bar-chart" size={14} />写作统计（Ctrl/⌘ J）</button>
+                      <button role="menuitem" onClick={() => { setShowExportModal(true); setShowMoreMenu(false); }}><Icon name="download" size={14} />导出小说（Ctrl/⌘ E）</button>
+                      <button role="menuitem" onClick={() => { setShowShortcuts(true); setShowMoreMenu(false); }}><Icon name="keyboard" size={14} />快捷键（Ctrl/⌘ /）</button>
+                      <button role="menuitem" disabled={!activeChapter || chapterSaving} onClick={() => { persistCurrentChapter(); setShowMoreMenu(false); }}><Icon name="save" size={14} />{chapterSaving ? '保存中…' : '保存章节（Ctrl/⌘ S）'}</button>
+                    </>}
+                    <button role="menuitem" onClick={() => setShowMoreMenu(false)}><Icon name="x" size={14} />收起菜单</button>
+                  </div>
+                </>}
               </div>
-            </>}
-            {outlineMode && <span className="editor-mode-label">大纲编辑</span>}
-            {cardMode && <span className="editor-mode-label">卡片编辑</span>}
-            {styleMode && <span className="editor-mode-label">作品文风</span>}
+            </div>
           </header>
 
           {showProjectAgent && <aside className="project-agent-drawer" aria-label="项目 Agent 对话" style={{ ['--pane-project-agent' as string]: `${panes.sizes.projectAgent}px` }}>
@@ -7377,15 +7317,16 @@ function App() {
             </div>
           )}
 
-          <div className="editor-body">
+          <div className={`editor-body ${bookView === 'write' ? 'view-write' : bookView === 'library' ? 'view-library' : 'view-tasks'} ${showAgentPanel ? 'agent-open' : 'agent-collapsed'}${railOpen ? ' rail-open' : ''}`}>
             <aside
               className="editor-sidebar"
               style={{ ['--editor-sidebar-width' as string]: `${panes.sizes.editorSidebar}px`, ['--editor-sidebar-tabs-height' as string]: `${panes.sizes.editorSidebarTabs}px` }}
             >
+              {bookView === 'library' && <div className="chapters-head"><strong>本书资料</strong><small>自动保存</small></div>}
               <div className="editor-sidebar-tabs" ref={sidebarTabsRef}>
                 <button
                   className={editorSidebarTab === 'chapters' ? 'active' : ''}
-                  onClick={() => setEditorSidebarTab('chapters')}
+                  onClick={() => switchBookView('write')}
                 >
                   <Icon name="library" size={14} />章节{pendingQuestionCount > 0 && <small className="tab-alert" title={`${pendingQuestionCount} 个模型提问待答`}>{pendingQuestionCount} 待答</small>}
                 </button>
@@ -7396,11 +7337,13 @@ function App() {
                   <Icon name="search" size={14} />剧情搜索
                 </button>
                 <button
-                  className={editorSidebarTab === 'outline' ? 'active' : ''}
-                  onClick={() => setEditorSidebarTab('outline')}
+                  className={editorSidebarTab === 'outline' && outlineGroupView === 'book' ? 'active' : ''}
+                  onClick={() => { setEditorSidebarTab('outline'); setOutlineGroupView('book'); }}
                 >
-                  <Icon name="pen" size={14} />大纲
+                  <Icon name="pen" size={14} />总纲与设定
                 </button>
+                <button className={editorSidebarTab === 'outline' && outlineGroupView === 'chapter' ? 'active' : ''} onClick={() => { setEditorSidebarTab('outline'); setOutlineGroupView('chapter'); }}>章纲 <small>{editingProject.outlines.filter(item => item.kind === '章纲').length} 篇</small></button>
+                <button className={editorSidebarTab === 'promises' ? 'active' : ''} onClick={() => setEditorSidebarTab('promises')}>承诺账 <small>{editingProject.promises?.length || 0} 条</small></button>
                 <button
                   className={editorSidebarTab === 'knowledge-graph' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('knowledge-graph')}
@@ -7411,7 +7354,7 @@ function App() {
                   className={editorSidebarTab === 'cards' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('cards')}
                 >
-                  <Icon name="cards" size={14} />卡片{cardCandidateCount > 0 && <small className="tab-alert" title={`${cardCandidateCount} 个本章新出现的事物待建卡`}>{cardCandidateCount} 待建</small>}
+                  <Icon name="cards" size={14} />人物与物品卡{cardCandidateCount > 0 && <small className="tab-alert" title={`${cardCandidateCount} 个本章新出现的事物待建卡`}>{cardCandidateCount} 待建</small>}
                 </button>
                 <button
                   className={editorSidebarTab === 'style' ? 'active' : ''}
@@ -7458,13 +7401,33 @@ function App() {
                 </div>;
               })()}
 
-              {editorSidebarTab === 'chapters' && (() => {
+              {bookView === 'tasks' && (
+                <div className="chapters-panel">
+                  <div className="chapters-head"><strong>任务与产出</strong><small>{continuousWriting || legacyReview.running || batchRevise?.running ? '运行中' : '空闲'}</small></div>
+                  <div className="chapters-list">
+                    <button type="button" className="chapter-item" onClick={() => document.getElementById('task-continuous')?.scrollIntoView({ block: 'nearest' })}><span className="chapter-title">懒人连续创作</span><span className="chapter-meta num">{continuousWriting ? `${continuousWriting.done}/${continuousWriting.total} 章` : '未运行'}</span></button>
+                    <button type="button" className="chapter-item" onClick={() => document.getElementById('task-rewrite')?.scrollIntoView({ block: 'nearest' })}><span className="chapter-title">重写旧章</span><span className="chapter-meta">{chapterRewrite ? `${chapterRewrite.done}/${chapterRewrite.total} 章` : rewriteRange ? `第 ${rewriteRange.from} 至 ${rewriteRange.to} 章` : '未运行'}</span></button>
+                    <button type="button" className="chapter-item" onClick={() => document.getElementById('task-review')?.scrollIntoView({ block: 'nearest' })}><span className="chapter-title">审查旧章与批量修订</span><span className="chapter-meta num">{reviewItems.length ? `已审 ${reviewItems.length} 章` : '还没审过'}</span></button>
+                  </div>
+                  <div className="chapters-footer"><button type="button" className="btn-secondary" onClick={() => switchBookView('write')}>切回写作</button></div>
+                </div>
+              )}
+
+              {bookView === 'write' && editorSidebarTab === 'chapters' && (() => {
                 const chapters = editingProject.chapters;
                 const activeIndex = activeChapter ? chapters.findIndex(item => item.id === activeChapter.id) : -1;
                 const selected = activeIndex >= 0 ? chapters[activeIndex] : null;
                 const recycled = editingProject.deletedChapters?.length || 0;
+                const chapterQuery = chapterJumpQuery.trim();
+                const visibleChapters = chapterQuery
+                  ? chapters.filter((chapter, index) => chapter.title.includes(chapterQuery) || String(index + 1) === chapterQuery)
+                  : chapters;
                 return (
                 <div className="chapters-panel">
+                  <div className="chapters-head">
+                    <strong>章节目录</strong>
+                    <small>{chapters.length} 章 · 全书 {bookTotalWords.toLocaleString()} 字</small>
+                  </div>
                   {pendingQuestions.length > 0 && (
                     <details className="author-questions" open>
                       <summary>模型有 {pendingQuestions.length} 个问题等你答 <small>一次答完再写，不要一题写一遍</small></summary>
@@ -7483,68 +7446,22 @@ function App() {
                       </div>
                     </details>
                   )}
-                  <div className="project-writing-stats">
-                    <strong>{editingProject.wordCount.toLocaleString()} <small>总字数</small></strong>
-                    <span>{chapters.length} 章</span>
-                  </div>
-                  <div className="chapter-target-row">
-                    <label htmlFor="chapter-target-words">本章目标</label>
-                    <input id="chapter-target-words" className="input" type="number" min="200" step="100" value={chapterTargetWordsDraft} onChange={event => setChapterTargetWordsDraft(event.target.value)} onBlur={updateChapterTargetWords} />
-                    <span>字</span>
-                  </div>
-                  <div className="chapter-target-row">
-                    <label htmlFor="review-mode">审查档位</label>
-                    <select id="review-mode" className="select" value={editingProject.reviewMode || 'lean'} onChange={event => updateEditorProject(project => ({ ...project, reviewMode: event.target.value as Project['reviewMode'], updatedAt: new Date().toISOString() }))}>
-                      <option value="lean">lean · 结构 + 一致性</option>
-                      <option value="full">full · 加人物与文字视角</option>
-                      <option value="solo">solo · 一次合并审查</option>
-                    </select>
-                  </div>
-                  <div className="chapter-target-row">
-                    <label htmlFor="quote-style">引号风格</label>
-                    <select id="quote-style" className="select" value={editingProject.quoteStyle || ''} onChange={event => updateEditorProject(project => ({ ...project, quoteStyle: (event.target.value || undefined) as Project['quoteStyle'], updatedAt: new Date().toISOString() }))}>
-                      <option value="">按已有正文</option>
-                      <option value="curly">“中文弯引号”</option>
-                      <option value="corner">「方括引号」</option>
-                      <option value="ascii">"直引号"</option>
-                    </select>
-                    <button className="btn-secondary" onClick={normalizeBookPunctuation}>全书统一</button>
-                  </div>
-                  <div className="chapter-target-row">
-                    <label htmlFor="max-ai-rate">AI 率上限</label>
-                    <input id="max-ai-rate" className="input" type="number" min="1" max="100" step="1" value={editingProject.maxAIRate ?? 30} onChange={event => updateEditorProject(project => ({ ...project, maxAIRate: Math.max(1, Math.min(100, Number(event.target.value) || 30)), updatedAt: new Date().toISOString() }))} />
-                    <span>%（本地启发式，只展示不改写）</span>
-                  </div>
-                  <details className="chapter-target-row">
-                    <summary>允许的句式（验证门不报）</summary>
-                    <textarea className="input" rows={3} placeholder="一行一句原文片段，例如：声音不大，却" value={(editingProject.allowedPhrases || []).join('\n')} onChange={event => updateEditorProject(project => ({ ...project, allowedPhrases: event.target.value.split(/\r?\n/u).map(line => line.trim()).filter(Boolean).slice(0, 60), updatedAt: new Date().toISOString() }))} />
-                  </details>
-                  <div className="chapter-jump-row">
+                  {/* 目录搜索：只过滤列表，回车跳到能唯一定位的那一章 */}
+                  <div className="chapters-search">
+                    <Icon name="search" size={13} />
                     <input
                       className="input"
                       type="text"
-                      placeholder="跳转：章节序号或标题"
-                      aria-label="跳转到指定章节"
+                      placeholder="找章节（标题或序号）"
+                      aria-label="查找章节"
                       value={chapterJumpQuery}
                       onChange={event => setChapterJumpQuery(event.target.value)}
                       onKeyDown={event => { if (event.key === 'Enter') jumpToChapterByQuery(); }}
                     />
-                    <button type="button" onClick={jumpToChapterByQuery} disabled={!chapterJumpQuery.trim()}>跳转</button>
-                    <button type="button" onClick={jumpToLatestChapter} disabled={!chapters.length}>最新章</button>
-                  </div>
-                  {/* 排序、插入、定位、删除统一放在列表上方，只作用于当前选中章节；
-                      挤在列表项里会把标题压成每行三个字，长篇几乎看不到目录 */}
-                  <div className="chapter-toolbar" role="toolbar" aria-label="章节操作">
-                    <button type="button" title="在末尾新建章节" onClick={handleAddChapter}><Icon name="file-plus" size={13} />新建</button>
-                    <button type="button" title={selected ? `上移《${selected.title}》` : '先选中章节'} aria-label="上移当前章节" disabled={activeIndex <= 0} onClick={() => { if (selected) void moveActiveChapter(selected.id, -1); }}><Icon name="chevron-up" size={13} /></button>
-                    <button type="button" title={selected ? `下移《${selected.title}》` : '先选中章节'} aria-label="下移当前章节" disabled={activeIndex < 0 || activeIndex === chapters.length - 1} onClick={() => { if (selected) void moveActiveChapter(selected.id, 1); }}><Icon name="chevron-down" size={13} /></button>
-                    <button type="button" title={selected ? `在《${selected.title}》后插入新章` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void insertChapterBelow(selected.id); }}><Icon name="plus" size={13} />插入</button>
-                    <button type="button" title={selected ? `打开《${selected.title}》文件所在位置` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void handleOpenChapterLocation(selected); }}><Icon name="folder-open" size={13} />定位</button>
-                    <button type="button" className="chapter-toolbar-danger" title={selected ? `删除《${selected.title}》` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) setChapterPendingDeletion(selected); }}><Icon name="trash" size={13} />删除</button>
-                    {recycled > 0 && <button type="button" className="chapter-toolbar-recycle" title="查看已删除章节" onClick={() => setShowRecycleBin(true)}><Icon name="archive" size={13} />回收站 {recycled}</button>}
+                    {chapterJumpQuery.trim() && <button type="button" className="link-button" onClick={() => setChapterJumpQuery('')}>清空</button>}
                   </div>
                   <div className="chapters-list" ref={chaptersListRef}>
-                    {chapters.map(chapter => (
+                    {visibleChapters.map(chapter => (
                       <div
                         key={chapter.id}
                         data-chapter-id={chapter.id}
@@ -7561,6 +7478,26 @@ function App() {
                         <div className="chapter-meta">{chapter.wordCount} 字{chapter.snapshots?.length ? ` · ${chapter.snapshots.length} 版本` : ''}</div>
                       </div>
                     ))}
+                    {chapterQuery && !visibleChapters.length && <p className="empty-hint compact">没有标题或序号匹配“{chapterQuery}”的章节</p>}
+                  </div>
+                  {/* 章节操作收到列表底部：目录本身要留干净，挤在列表项里会把标题压成一行三个字 */}
+                  <div className="chapters-footer">
+                    <button type="button" className="btn-secondary" title="在末尾新建章节" onClick={handleAddChapter}><Icon name="file-plus" size={13} />新建章节</button>
+                    <div className="chapter-more">
+                      <button type="button" className="icon-button" aria-label="更多章节操作" aria-expanded={showChapterMenu} onClick={() => setShowChapterMenu(current => !current)}><Icon name="more" size={15} /></button>
+                      {showChapterMenu && <>
+                        <div className="editor-menu-backdrop" onClick={() => setShowChapterMenu(false)} />
+                        <div className="editor-more-menu chapter-more-menu" role="menu">
+                          <button role="menuitem" disabled={!selected} onClick={() => { if (selected) void moveActiveChapter(selected.id, -1); setShowChapterMenu(false); }}>上移当前章节</button>
+                          <button role="menuitem" disabled={!selected} onClick={() => { if (selected) void moveActiveChapter(selected.id, 1); setShowChapterMenu(false); }}>下移当前章节</button>
+                          <button role="menuitem" disabled={!selected} onClick={() => { if (selected) void insertChapterBelow(selected.id); setShowChapterMenu(false); }}>在选中章后插入新章</button>
+                          <button role="menuitem" disabled={!selected} onClick={() => { if (selected) void handleOpenChapterLocation(selected); setShowChapterMenu(false); }}>打开位置</button>
+                          <button role="menuitem" disabled={!selected} onClick={() => { if (selected) setChapterPendingDeletion(selected); setShowChapterMenu(false); }}>删除当前章节</button>
+                          <button role="menuitem" onClick={() => { jumpToLatestChapter(); setShowChapterMenu(false); }}>跳到最新章</button>
+                          {recycled > 0 && <button role="menuitem" onClick={() => { setShowRecycleBin(true); setShowChapterMenu(false); }}>已删除章节 {recycled}</button>}
+                        </div>
+                      </>}
+                    </div>
                   </div>
                 </div>
                 );
@@ -7572,9 +7509,8 @@ function App() {
                     <button className="btn-add-chapter" onClick={() => setShowOutlineTypeModal(true)}>+ 新建大纲</button>
                     <button className="outline-location-button" onClick={handleOpenOutlineLocation}>打开位置</button>
                   </div>
-                  <PromiseLedger promises={editingProject.promises || []} onChange={promises => updateEditorProject(project => replacePromises(project, promises))} />
                   <div className="outline-document-list">
-                    {groupOutlines(editingProject.outlines).map(({ group, items }) => {
+                    {groupOutlines(editingProject.outlines.filter(item => outlineGroupView === 'chapter' ? item.kind === '章纲' : item.kind !== '章纲')).map(({ group, items }) => {
                       const collapsed = collapsedOutlineGroups.has(group);
                       return (
                         <div key={group} className="outline-group">
@@ -7746,6 +7682,117 @@ function App() {
             <PaneResizer name="editorSidebar" axis="x" label="拖动调整侧栏宽度，双击复位" controller={panes} />
 
             <main className="editor-main">
+                {bookView === 'tasks' && (
+                  <div className="tasks-view">
+          {(aiToolResult || aiToolRunning) && (
+          <section className="agent-task-section">
+            <div className="panel-section-title">润色 / 续写</div>
+              <div className="ai-writing-tools">
+                <div className="agent-card-picker-title">润色 / 续写要求 <small>可选</small></div>
+                <textarea value={aiToolInstruction} onChange={event => setAIToolInstruction(event.target.value)} placeholder="例如：加强紧张感，保留冷峻文风；或让主角先观察再行动" />
+                <div className="ai-writing-tool-actions">
+                  <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('polish')}>{aiToolRunning && aiToolMode === 'polish' ? '润色中...' : '润色选中内容 / 整章'}</button>
+                  <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('de-ai')}>{aiToolRunning && aiToolMode === 'de-ai' ? '处理中...' : '去 AI 味'}</button>
+                  <button className="btn-primary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('continue')}>{aiToolRunning && aiToolMode === 'continue' ? '续写中...' : '生成续写'}</button>
+                </div>
+                {aiToolResult && <div className="ai-tool-result">
+                  <div><strong>{aiToolResult.mode === 'continue' ? '续写草稿' : aiToolResult.mode === 'de-ai' ? '去 AI 味草稿' : '润色草稿'}</strong><span>{countNovelCharacters(aiToolResult.content)} 字{aiToolResult.maxWords ? ` / 最多 ${aiToolResult.maxWords} 字` : ''}</span></div>
+                  <textarea value={aiToolResult.content} onChange={event => setAIToolResult(current => current ? { ...current, content: event.target.value } : current)} />
+                  <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => copyText(aiToolResult.content)}>复制</button><button className="btn-primary" onClick={acceptAIToolResult}>{aiToolResult.mode === 'continue' ? '确认插入章节' : '确认替换'}</button></div>
+                </div>}
+              </div>
+          </section>
+          )}
+          <section className="agent-task-section" id="task-continuous">
+              <div className="agent-card-picker">
+                <div className="agent-card-picker-title"><span>懒人连续创作</span><small>{continuousWriting ? `已写 ${continuousWriting.done}/${continuousWriting.total} 章` : (() => { const planned = plannedThroughChapterNumber(editingProject); const planEnd = plannedVolumeEndChapter(editingProject); return [planned ? `章纲已备到第 ${planned} 章` : '', planEnd ? `总纲计划到第 ${planEnd} 章` : '', `正文 ${editingProject.chapters.length} 章`].filter(Boolean).join('，'); })()}</small></div>
+                <div className="ai-writing-tool-actions">
+                  <label className="agent-continuous-count">再写 <input className="input" type="number" min={1} max={200} value={continuousCount} disabled={Boolean(continuousWriting)} onChange={event => setContinuousCount(Number(event.target.value) || 1)} /> 章</label>
+                  {continuousWriting
+                    ? <button className="btn-secondary" onClick={() => { continuousAbortRef.current = true; }}>{continuousAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
+                    : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runContinuousWriting()}>新建并连续创作</button>}
+                </div>
+                <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '自动生成章纲、写正文、采用草稿、提炼记忆，一章接一章跑。跑的时候可以切回写作，改前面的章节。写满章数、到达总纲末章或遇到错误时停止。'}</p>
+              </div>
+          </section>
+          <section className="agent-task-section" id="task-rewrite">
+              <div className="agent-card-picker">
+                <div className="agent-card-picker-title"><span>重写旧章</span><small>{chapterRewrite ? `已重写 ${chapterRewrite.done}/${chapterRewrite.total} 章` : '重走构思、正文、验证门、审查与记忆'}</small></div>
+                <div className="ai-writing-tool-actions writing-console-range">
+                  {(() => { const range = rewriteRange ?? { from: editingProject.chapters.length, to: editingProject.chapters.length }; return <>
+                    <label className="writing-console-range-field">从第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={range.from} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteRange({ ...range, from: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                    <label className="writing-console-range-field">到第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={range.to} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteRange({ ...range, to: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                  </>; })()}
+                  <label className="writing-console-range-field">方式 <select className="select" value={rewriteMode} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteMode(event.target.value as 'keep' | 'redo')}><option value="keep">保事件换写法</option><option value="redo">从构思重来</option></select></label>
+                  {chapterRewrite
+                    ? <button className="btn-secondary" onClick={() => { rewriteAbortRef.current = true; }}>{rewriteAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
+                    : <button className="btn-primary" disabled={agentRunning(agentStage) || Boolean(continuousWriting) || !editingProject.chapters.length} onClick={() => void runChapterRewrite()}>开始重写</button>}
+                </div>
+                <p className="empty-hint compact">{chapterRewrite ? chapterRewrite.message : '保事件：保留原稿事件、时间线与人物变化，只换写法。从构思重来：按总纲与前文重新构思。旧稿保存在章节历史，可逐章回退；中途可停。'}</p>
+              </div>
+          </section>
+          <section className="agent-task-section" id="task-review">
+              <div className="agent-card-picker">
+                <div className="agent-card-picker-title"><span>审查旧章</span><small>{legacyReview.running ? `已审 ${legacyReview.done}/${legacyReview.total} 章` : (legacyReview.message || '正文已经写好的章重跑审查，报告存进知识面板')}</small></div>
+                <div className="ai-writing-tool-actions writing-console-range">
+                  <label className="writing-console-range-field">从第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={consoleRange.from} disabled={legacyReview.running} onChange={event => setLegacyReviewRange({ ...consoleRange, from: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                  <label className="writing-console-range-field">到第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={consoleRange.to} disabled={legacyReview.running} onChange={event => setLegacyReviewRange({ ...consoleRange, to: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
+                  <label className="writing-console-range-field">并发 <input className="input console-number" type="number" min={1} max={6} value={reviewConcurrency} disabled={legacyReview.running || Boolean(batchRevise?.running)} onChange={event => setReviewConcurrency(Math.min(6, Math.max(1, Number(event.target.value) || 1)))} /> 章</label>
+                  <small className="writing-console-range-hint">{consoleRangeHint}</small>
+                  {legacyReview.running
+                    ? <button className="btn-secondary" onClick={() => { legacyReviewAbortRef.current = true; }}>{legacyReviewAbortRef.current ? '本章审完即停' : '审完本章后停止'}</button>
+                    : <button className="btn-primary" disabled={agentRunning(agentStage) || !editingProject.chapters.length} onClick={() => { legacyReviewAbortRef.current = false; const range = legacyReviewRange ?? { from: Math.max(1, editingProject.chapters.length - 9), to: editingProject.chapters.length }; void runLegacyReview(range.from, range.to); }}>开始审查</button>}
+                </div>
+                {reviewClusters.length > 0 && <div className="agent-review-clusters">
+                  <div className="agent-card-picker-title"><span>疑似同一个问题散在多章</span><small>点一下就勾上涉及的章，一起改</small></div>
+                  <div className="agent-cluster-chips">
+                    {reviewClusters.map(cluster => (
+                      <button key={cluster.text} type="button" className="agent-cluster-chip" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(current => [...new Set([...current, ...cluster.numbers])])}>
+                        {cluster.text}<small>第 {cluster.numbers.join('、')} 章</small>
+                      </button>
+                    ))}
+                  </div>
+                </div>}
+                {selectedReviewNumbers.length > 0 && <div className="agent-review-batch">
+                  <div className="agent-card-picker-title"><span>批量修订 {selectedReviewNumbers.length} 章</span><small>{batchRevise?.message || '各章共用下面这句统一口径'}</small></div>
+                  <textarea className="input" rows={2} value={reviewUnifiedNote} disabled={batchRevise?.running} onChange={event => setReviewUnifiedNote(event.target.value)} placeholder="统一口径（可选，但同一问题就该写）：例如「随访数据跨时不到一年，最早一份报告就是第一次入院那天」" />
+                  <div className="ai-writing-tool-actions">
+                    {batchRevise?.running
+                      ? <button className="btn-secondary" onClick={() => { reviseAbortRef.current = true; }}>{reviseAbortRef.current ? '改完本章即停' : '改完本章后停止'}</button>
+                      : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runBatchRevise(selectedReviewNumbers)}>按意见修订选中的 {selectedReviewNumbers.length} 章</button>}
+                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers([])}>清空选择</button>
+                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(reviewItems.filter(item => item.issues.length > 0).map(item => item.number))}>只选有问题的</button>
+                    {reviewUnifiedNote.trim() && <button className="btn-secondary" onClick={() => { copyText(reviewUnifiedNote.trim()); setNotice({ title: '已复制统一口径', content: '粘进硬事实账本或总纲，以后写新章也照这条办，否则这个错还会长回来。' }); }}>复制口径（写进档案）</button>}
+                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(selectedReviewNumbers.length === reviewItems.length ? [] : reviewItems.map(item => item.number))}>{selectedReviewNumbers.length === reviewItems.length ? '取消全选' : '全选'}</button>
+                  </div>
+                  <p className="empty-hint compact">串行改，一路模型调用；中途可停，已改完的章不回滚。每章旧版本都进章节历史，可逐章回退复核。</p>
+                </div>}
+                {reviewItems.length > 0 ? <div className="agent-review-list">
+                  {reviewItems.map(item => {
+                    const reviseState = reviseStates[item.number];
+                    const elapsed = reviseState?.status === 'running' ? Math.max(0, Math.round((nowTick - reviseState.startedAt) / 1000)) : 0;
+                    return (
+                    <div key={item.number} className={`agent-review-row ${reviseState?.status === 'running' ? 'active' : item.status}`}>
+                      <div className="agent-review-row-title">
+                        <label className="agent-review-check"><input type="checkbox" checked={selectedReviewNumbers.includes(item.number)} disabled={batchRevise?.running} onChange={event => setSelectedReviewNumbers(current => event.target.checked ? [...new Set([...current, item.number])] : current.filter(number => number !== item.number))} /></label>
+                        <strong>第 {item.number} 章 {item.title.replace(/^第\s*\d+\s*章\s*/u, '')}</strong><small>{reviseState?.status === 'running' ? `修订中…已 ${elapsed} 秒` : reviseState?.status === 'done' ? reviseState.message : item.message || (item.status === 'pending' ? '待审' : '')}</small></div>
+                      {item.issues.length > 0 && <ul className="agent-review-issues">{item.issues.map((text, index) => <li key={index}>{text}</li>)}</ul>}
+                      {item.issues.length + item.suggestions.length > 0 && <div className="ai-writing-tool-actions">
+                        <button className="btn-secondary" disabled={reviseState?.status === 'running' || reviseState?.status === 'done'} onClick={() => void reviseReviewedChapter(item)}>
+                          {reviseState?.status === 'running' ? `修订中…已 ${elapsed} 秒` : reviseState?.status === 'done' ? '已按意见修订' : '按意见修订本章'}
+                        </button>
+                        {reviseState?.status === 'error' && <small className="agent-review-error">{reviseState.message}</small>}
+                      </div>}
+                    </div>
+                    );
+                  })}
+                </div> : <p className="empty-hint compact">还没有审查记录。默认从最近十章开始，可调整范围。</p>}
+                <p className="empty-hint compact">先审出问题，再按意见修订。报告保存在大纲页；批量修订共用统一口径，覆盖前保留章节历史。</p>
+              </div>
+          </section>
+                  </div>
+                )}
+
               {editorSidebarTab === 'search' ? (
                 <section className="project-search-workspace" aria-label="剧情搜索">
                   <header className="project-search-header">
@@ -7786,6 +7833,8 @@ function App() {
                       </article>)}
                     </div> : <div className="project-search-empty"><b><Icon name="search" size={42} /></b><strong>没有找到“{searchQuery}”</strong><span>试试人物全名、事件关键词或地点名称。</span></div>}
                 </section>
+              ) : editorSidebarTab === 'promises' ? (
+                <section className="promise-workspace"><header><h2>承诺账</h2><p>记录埋下的线索与兑现期限</p></header><PromiseLedger expanded promises={editingProject.promises || []} onChange={promises => updateEditorProject(project => replacePromises(project, promises))} /></section>
               ) : editorSidebarTab === 'outline' ? (
                 <section className="outline-workspace">
                   {activeOutline ? <>
@@ -7919,15 +7968,6 @@ function App() {
                 </section>
               ) : activeChapter ? (
                 <>
-                  <div className="chapter-editor-toolbar">
-                    <div className="chapter-toolbar-search">
-                      <button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button>
-                      <span className="search-shortcut">⌘/Ctrl F</span>
-                    </div>
-                    <button className={`editor-tool-button ${showAnnotationPanel ? 'active' : ''}`} title="选中一段正文写批注，只改那一段" onClick={() => setShowAnnotationPanel(current => !current)}>批注{activeChapter.annotations?.length ? ` ${activeChapter.annotations.length}` : ''}</button>
-                    <button className="editor-tool-button" title="统一换行、清理多余空格和空行" onClick={formatActiveChapter} disabled={!activeChapter.content.trim()}>格式化正文</button>
-                    <span className="chapter-goal-status">目标 {Number(editingProject.chapterTargetWords) || 3000} 字 · 上限 {Math.floor((Number(editingProject.chapterTargetWords) || 3000) * 1.2)} 字</span>
-                  </div>
                   {showSearchPanel && (
                     <section className="search-panel" aria-label="搜索与替换">
                       <div className="search-panel-row">
@@ -7984,6 +8024,58 @@ function App() {
                       <Icon name={copiedTitle ? 'check' : 'copy'} size={14} />
                       <span>{copiedTitle ? '已复制标题' : '复制标题'}</span>
                     </button>
+                    <div className="chapter-head-links">
+                      <div className="chapter-settings-wrap">
+                        <button type="button" className={`link-button ${showWritingSettings ? 'active' : ''}`} title="本章目标、审查档位、引号风格、AI 率上限与允许的句式" aria-expanded={showWritingSettings} onClick={() => setShowWritingSettings(current => !current)}><Icon name="settings" size={13} />写作设置</button>
+                        {showWritingSettings && <>
+                          <div className="editor-menu-backdrop" onClick={() => setShowWritingSettings(false)} />
+                          <div className="writing-settings-popover" role="dialog" aria-label="写作设置">
+                            <div className="writing-settings-head"><strong>写作设置</strong><small>作用于整本书</small><button className="icon-delete" title="关闭" onClick={() => setShowWritingSettings(false)}><Icon name="x" size={14} /></button></div>
+                            <div className="chapter-target-row">
+                    <label htmlFor="chapter-target-words">本章目标</label>
+                    <input id="chapter-target-words" className="input" type="number" min="200" step="100" value={chapterTargetWordsDraft} onChange={event => setChapterTargetWordsDraft(event.target.value)} onBlur={updateChapterTargetWords} />
+                    <span>字</span>
+                  </div>
+                  <div className="chapter-target-row">
+                    <label htmlFor="review-mode">审查档位</label>
+                    <select id="review-mode" className="select" value={editingProject.reviewMode || 'lean'} onChange={event => updateEditorProject(project => ({ ...project, reviewMode: event.target.value as Project['reviewMode'], updatedAt: new Date().toISOString() }))}>
+                      <option value="lean">lean · 结构 + 一致性</option>
+                      <option value="full">full · 加人物与文字视角</option>
+                      <option value="solo">solo · 一次合并审查</option>
+                    </select>
+                  </div>
+                  <div className="chapter-target-row">
+                    <label htmlFor="quote-style">引号风格</label>
+                    <select id="quote-style" className="select" value={editingProject.quoteStyle || ''} onChange={event => updateEditorProject(project => ({ ...project, quoteStyle: (event.target.value || undefined) as Project['quoteStyle'], updatedAt: new Date().toISOString() }))}>
+                      <option value="">按已有正文</option>
+                      <option value="curly">“中文弯引号”</option>
+                      <option value="corner">「方括引号」</option>
+                      <option value="ascii">"直引号"</option>
+                    </select>
+                    <button className="btn-secondary" onClick={normalizeBookPunctuation}>全书统一</button>
+                  </div>
+                  <div className="chapter-target-row">
+                    <label htmlFor="max-ai-rate">AI 率上限</label>
+                    <input id="max-ai-rate" className="input" type="number" min="1" max="100" step="1" value={editingProject.maxAIRate ?? 30} onChange={event => updateEditorProject(project => ({ ...project, maxAIRate: Math.max(1, Math.min(100, Number(event.target.value) || 30)), updatedAt: new Date().toISOString() }))} />
+                    <span>%（本地启发式，只展示不改写）</span>
+                  </div>
+                  <details className="chapter-target-row">
+                    <summary>允许的句式（验证门不报）</summary>
+                    <textarea className="input" rows={3} placeholder="一行一句原文片段，例如：声音不大，却" value={(editingProject.allowedPhrases || []).join('\n')} onChange={event => updateEditorProject(project => ({ ...project, allowedPhrases: event.target.value.split(/\r?\n/u).map(line => line.trim()).filter(Boolean).slice(0, 60), updatedAt: new Date().toISOString() }))} />
+                  </details>
+                        </div>
+                        </>}
+                      </div>
+                      <button type="button" className="link-button" onClick={() => setReadingMode(true)}>阅读</button>
+                      <button type="button" className="link-button" disabled={!activeChapter.snapshots?.length} title={activeChapter.snapshots?.length ? '查看并恢复历史版本' : '还没有历史版本'} onClick={() => setShowChapterHistory(true)}>历史 {activeChapter.snapshots?.length || 0}</button>
+                      <button type="button" className={`link-button ${writingMarksEnabled ? 'active' : ''}`} onClick={() => setWritingMarksEnabled(current => !current)}>标记{writingMarksEnabled ? '（已开）' : ''}</button>
+                    </div>
+                  </div>
+                  <div className="chapter-chips">
+                    <button type="button" className={`chip ${showAgentPanel && chapterPaneView === 'brief' ? 'active' : ''}`} onClick={() => { toggleAgentPanel(true); setChapterPaneView('brief'); }}>本章资料 <b>章纲 · 边界 · 承诺</b></button>
+                    {chapterPromises.length ? <button type="button" className="chip warn" onClick={() => { toggleAgentPanel(true); setChapterPaneView('brief'); }}><b>到期承诺 {chapterPromises.length}</b> 条</button> : null}
+                    {openQuestions.length ? <button type="button" className="chip" onClick={() => { toggleAgentPanel(true); setChapterPaneView('brief'); }}>待答 <b>{openQuestions.length}</b></button> : null}
+                    <button type="button" className={`chip ${showAgentPanel && chapterPaneView === 'agent' ? 'active' : ''}`} onClick={() => { toggleAgentPanel(true); setChapterPaneView('agent'); }}>写作智能体</button>
                   </div>
                   <div className="chapter-editor-wrap">
                     <div ref={highlightLayerRef} className="chapter-highlight-layer" aria-hidden="true">{renderMarkedContent(activeChapter.content)}</div>
@@ -7998,6 +8090,16 @@ function App() {
                       spellCheck={false}
                     />
                     <div ref={copyMenuRef} className="chapter-floating-copy-container">
+                      {selectionSnapshot && selectionSnapshot.source.trim() && (
+                        <div className="chapter-selection-bar" role="toolbar" aria-label="选中的文字">
+                          <span className="chapter-selection-count">选中 {countNovelCharacters(selectionSnapshot.source)} 字</span>
+                          <button type="button" disabled={aiToolRunning} onClick={() => { setBookView('tasks'); void runAITool('polish'); }}>{aiToolRunning && aiToolMode === 'polish' ? '润色中…' : '润色'}</button>
+                          <button type="button" disabled={aiToolRunning} onClick={() => { setBookView('tasks'); void runAITool('de-ai'); }}>{aiToolRunning && aiToolMode === 'de-ai' ? '处理中…' : '去 AI 味'}</button>
+                          <button type="button" disabled={aiToolRunning} onClick={() => { setBookView('tasks'); void runAITool('continue'); }}>{aiToolRunning && aiToolMode === 'continue' ? '续写中…' : '从这里续写'}</button>
+                          <button type="button" className={showAnnotationPanel ? 'active' : ''} title="给这段写批注，只改这一段" onClick={() => setShowAnnotationPanel(true)}>批注</button>
+                          <button type="button" className="chapter-selection-close" title="收起工具条" aria-label="收起工具条" onClick={() => setSelectionSnapshot(null)}><Icon name="x" size={12} /></button>
+                        </div>
+                      )}
                       <div className="chapter-floating-copy-group">
                         <button
                           type="button"
@@ -8133,18 +8235,6 @@ function App() {
                       )}
                     </div>
                   )}
-                  <div className="chapter-live-footer">
-                    <span>
-                      本章实时字数 <strong>{activeChapter.wordCount.toLocaleString()}</strong>
-                      {Boolean(activeChapter.authorNote?.trim()) && (
-                        <span className="chapter-footer-author-note-tag">
-                          {' '}· 作话 <strong>{countNovelCharacters(activeChapter.authorNote || '').toLocaleString()}</strong> 字
-                        </span>
-                      )}
-                    </span>
-                    <span>{currentSearchMatches ? `搜索到 ${currentSearchMatches} 处` : writingMarksEnabled ? `人物 ${characterNames.length} 个 · 禁词 ${bannedWords.length} 个` : '标记已关闭'}</span>
-                    {activeChapter.wordCount >= (Number(editingProject.chapterTargetWords) || 3000) && <button className="link-button" onClick={handleAddChapter}>创建下一章</button>}
-                  </div>
                 </>
               ) : (
                 <div className="empty-state">
@@ -8153,10 +8243,29 @@ function App() {
               )}
             </main>
 
+          {bookView === 'tasks' && (
+            <aside className="side side-tasks" aria-label="任务日志" style={{ ['--pane-agent-panel' as string]: `${panes.sizes.agentPanel}px` }}>
+              <PaneResizer name="agentPanel" axis="x" label="拖动调整任务日志宽度，双击复位" invert controller={panes} />
+              <div className="agent-panel-header"><strong>运行日志</strong><div className="grow"></div><button type="button" className="link-button" onClick={() => switchBookView('write')}>切回写作</button></div>
+              <div className="tasks-log">
+                <div className="tasks-log-line"><strong>连续创作</strong><span>{continuousWriting ? continuousWriting.message || '正在跑' : '未运行'}</span></div>
+                <div className="tasks-log-line"><strong>重写旧章</strong><span>{chapterRewrite ? chapterRewrite.message || '正在重写' : '未运行'}</span></div>
+                <div className="tasks-log-line"><strong>审查旧章</strong><span>{legacyReview.message || '未运行'}</span></div>
+                <div className="tasks-log-line"><strong>批量修订</strong><span>{batchRevise ? batchRevise.message || '正在修订' : '未运行'}</span></div>
+              </div>
+              <div className="chapters-footer"><button type="button" className="btn-secondary" onClick={() => switchBookView('write')}>切回写作</button></div>
+            </aside>
+          )}
+
           <aside className="agent-panel" style={{ ['--pane-agent-panel' as string]: `${panes.sizes.agentPanel}px` }}>
             <PaneResizer name="agentPanel" axis="x" label="拖动调整 Agent 面板宽度，双击复位" invert controller={panes} />
               <div className="agent-panel-header">
-                <span>{outlineMode ? '大纲智能体' : cardMode ? '卡片创建智能体' : styleMode ? '文风说明' : 'AI 智能体'}</span>
+                {outlineMode ? <span>大纲智能体</span> : cardMode ? <span>卡片创建智能体</span> : styleMode ? <span>文风说明</span> : (
+                  <div className="view-switch pane-switch" aria-label="右栏内容">
+                    <button aria-pressed={chapterPaneView === 'agent'} className={chapterPaneView === 'agent' ? 'active' : ''} onClick={() => setChapterPaneView('agent')}>写作智能体</button>
+                    <button aria-pressed={chapterPaneView === 'brief'} className={chapterPaneView === 'brief' ? 'active' : ''} onClick={() => setChapterPaneView('brief')}>本章资料</button>
+                  </div>
+                )}
                 <select
                   className="agent-model-select"
                   value={agentConfig.model}
@@ -8165,9 +8274,47 @@ function App() {
                 >
                   {Array.from(new Set([agentConfig.model, ...availableModels])).filter(Boolean).map(model => <option key={model} value={model}>{model}</option>)}
                 </select>
+                <button type="button" className="icon-button" title="收起右栏（正文占满宽度）" aria-label="收起右栏" onClick={() => toggleAgentPanel(false)}><Icon name="arrow-right" size={15} /></button>
               </div>
 
-              {outlineMode ? (
+              {!outlineMode && !cardMode && !styleMode && chapterPaneView === 'brief' && (
+                <section className="chapter-brief-panel" aria-label="本章资料">
+                  <header>
+                    <strong>本章资料</strong>
+                    <button type="button" className="link-button" onClick={() => { switchBookView('library'); setEditorSidebarTab('outline'); }}>编辑章纲</button>
+                  </header>
+                  {chapterBrief && (chapterBrief.mustHide || chapterBrief.hintOnly || chapterBrief.protagonistKnows || chapterBrief.readerKnows) ? (
+                    <dl className="brief-fields">
+                      {chapterBrief.mustHide ? <div className="brief-field brief-field-key"><dt>此刻不说破</dt><dd>{chapterBrief.mustHide}</dd></div> : null}
+                      {chapterBrief.hintOnly ? <div className="brief-field brief-field-key"><dt>只给一半</dt><dd>{chapterBrief.hintOnly}</dd></div> : null}
+                      {chapterBrief.protagonistKnows ? <div className="brief-field"><dt>视角人物已知道</dt><dd>{chapterBrief.protagonistKnows}</dd></div> : null}
+                      {chapterBrief.readerKnows ? <div className="brief-field"><dt>读者已知道</dt><dd>{chapterBrief.readerKnows}</dd></div> : null}
+                    </dl>
+                  ) : <p className="empty-hint brief-hint">这章的章纲还没填信息边界。填上「此刻不说破」和「只给一半」，写作时会当成必须完成的具体动作，不是禁止项。</p>}
+
+                  <div className="brief-block">
+                    <strong>到期承诺{chapterPromises.length ? ` · ${chapterPromises.length} 条` : ''}</strong>
+                    {chapterPromises.length ? chapterPromises.map(promise => (
+                      <div className="brief-line" key={promise.id}>
+                        <span>{promise.text}</span>
+                        <small>{promise.dueChapter ? `期限第 ${promise.dueChapter} 章` : promise.everyChapters ? `每 ${promise.everyChapters} 章一次` : ''}</small>
+                      </div>
+                    )) : <p className="empty-hint brief-hint">没有到期的承诺。没填期限也没填节奏的条目只是备忘，不进写作提示词。</p>}
+                  </div>
+
+                  {openQuestions.length ? <div className="brief-block">
+                    <strong>待作者回答 · {openQuestions.length} 条</strong>
+                    {openQuestions.slice(-3).reverse().map(item => (
+                      <div className="brief-line" key={item.id}>
+                        <span>{item.question}</span>
+                        <small>来自第 {item.chapterNumber} 章</small>
+                      </div>
+                    ))}
+                  </div> : null}
+                </section>
+              )}
+
+              {!outlineMode && !cardMode && !styleMode && chapterPaneView === 'brief' ? null : outlineMode ? (
                 <div className="agent-panel-scroll outline-agent-panel">
                   <section className="agent-task-section">
                     <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className="link-button" onClick={() => { setOutlineSessionId(rotateSessionId('outline')); setOutlineChatMessages([]); outlineStreamRawRef.current = ''; setOutlineStreamContent(''); setNotice({ title: '已开启新对话', content: '大纲创作不再带之前的会话记忆；已保存的大纲内容不受影响。' }); }} title="开启新对话：不再使用之前的会话上下文（小说资料不受影响）">新对话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
@@ -8214,41 +8361,50 @@ function App() {
                   </section>
                 </div>
               ) : (
-              <div className="agent-panel-scroll">
-                <section className="agent-task-section">
+              <div className="writing-agent-layout">
+                <section className="agent-settings" aria-label="本次写作设置">
+                  <div className="agent-settings-line">
+                    <button type="button" className={`chip ${agentSettingsOpen === 'instruction' ? 'active' : ''}`} aria-expanded={agentSettingsOpen === 'instruction'} onClick={() => setAgentSettingsOpen(current => current === 'instruction' ? null : 'instruction')}>创作指令 <b>{agentInstruction.trim() ? '已填' : '默认'}</b></button>
+                    <button type="button" className={`chip ${agentSettingsOpen === 'outline' ? 'active' : ''}`} aria-expanded={agentSettingsOpen === 'outline'} onClick={() => setAgentSettingsOpen(current => current === 'outline' ? null : 'outline')}>章纲 <b>{extraOutlineCount ? `额外 ${extraOutlineCount} 份` : '按本章绑定'}</b></button>
+                    <button type="button" className={`chip ${agentSettingsOpen === 'cards' ? 'active' : ''}`} aria-expanded={agentSettingsOpen === 'cards'} onClick={() => setAgentSettingsOpen(current => current === 'cards' ? null : 'cards')}>带入卡片 <b>{selectedCardIds.length ? `${selectedCardIds.length} 张` : '自动'}</b></button>
+                    <button type="button" className={`chip ${agentSettingsOpen === 'memory' ? 'active' : ''}`} aria-expanded={agentSettingsOpen === 'memory'} onClick={() => setAgentSettingsOpen(current => current === 'memory' ? null : 'memory')}>前文记忆 <b>最近 6 章</b></button>
+                  </div>
+                  {agentSettingsOpen === 'instruction' && <div className="agent-setting-detail"><label htmlFor="chapter-agent-instruction">本次创作指令</label><p>{agentInstruction || '在底部输入这次想怎么写，再运行写作智能体。'}</p><button type="button" className="link-button" onClick={() => document.getElementById('chapter-agent-instruction')?.focus()}>编辑指令</button></div>}
+                  {agentSettingsOpen === 'outline' && <div className="agent-card-picker agent-setting-detail">
+                    <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{extraOutlineCount ? `${extraOutlineCount} 份` : '未选：只用本章绑定的章纲'}</small></div>
+                    <button type="button" className={`agent-context-select ${showChapterOutlinePicker ? 'active' : ''}`} onClick={() => setShowChapterOutlinePicker(current => !current)}>选择章纲</button>
+                    {showChapterOutlinePicker && <div className="agent-context-dropdown">{editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => <label key={outline.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} /><span><strong>{outline.title || '未命名章纲'}</strong><small>{String(outline.chapterId ?? '') === String(activeChapter?.id ?? '') ? '当前章节' : '其他章节'}</small></span></label>)}</div>}
+                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行章节智能体时会先按总纲与前文自动生成一份并绑定到本章；'; })()}世界观、总纲位置与最近章节记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
+                  </div>}
+                  {agentSettingsOpen === 'cards' && <div className="agent-card-picker agent-setting-detail">
+                    <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length ? `${selectedCardIds.length} 张` : '未勾选：按章纲与上一章出现的卡自动带入'}</small>{selectedCardIds.length > 0 && <button type="button" className="link-button" onClick={() => setSelectedCardIds([])}>自动选择</button>}</div>
+                    <button type="button" className={`agent-context-select ${showChapterCardPicker ? 'active' : ''}`} onClick={() => setShowChapterCardPicker(current => !current)}>选择卡片</button>
+                    {showChapterCardPicker && <div className="agent-context-dropdown">{editingProject.cards.length === 0 ? <p className="empty-hint compact">先在卡片页创建知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedCardIds.includes(card.id)} onChange={() => toggleCardForChapter(card.id)} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>}
+                  </div>}
+                  {agentSettingsOpen === 'memory' && <div className="agent-memory-picker agent-setting-detail">
+                    <div className="agent-card-picker-title">前文记忆 <small>自动加载最近六章与伏笔状态</small></div>
+                    {(() => { const previous = activeChapter ? editingProject.chapters[editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id) - 1] : undefined; const memory = previous ? editingProject.memories.find(item => item.chapterId === previous.id) : undefined; return memory ? <div className="agent-context-fixed-item"><strong>{memory.sourceChapterNumber ? `第 ${memory.sourceChapterNumber} 章` : memory.chapterTitle}</strong><small>{memory.summary || '已自动加载上一章结构化记忆'}</small></div> : <p className="empty-hint compact">上一章暂无结构化记忆。</p>; })()}
+                  </div>}
+                </section>
+                  {/* 设置、消息和输入独立占行，消息变长时只滚动消息区 */}
+                  <div className="agent-actions-bar">
                   <div className="agent-instruction-heading"><label>创作指令</label><button type="button" className="link-button" onClick={() => { setChapterSessionId(rotateSessionId('chapter')); setAgentDraft(null); setAgentDisplayContent(''); setAgentProgress([]); setNotice({ title: '已清空对话记忆', content: '下一章起不再带之前的会话上下文（上一轮生成留下的计划与摘要）；总纲、故事账本、章节记忆不受影响。' }); }} title="清空对话记忆：不再使用之前的会话上下文（总纲、故事账本、章节记忆不受影响）">清空对话记忆</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
-                  <textarea value={agentInstruction} onChange={(event) => setAgentInstruction(event.target.value)} />
+                  <textarea id="chapter-agent-instruction" aria-label="创作指令" placeholder="例如：把这一段改成他先听见声音，再想起自己是谁" value={agentInstruction} onChange={(event) => setAgentInstruction(event.target.value)} />
                   {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择本次写作技能">
                     <div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div>
                     <p>不选时由智能体按创作意图自动调用；勾选后会优先带入，章节承接和下一章计划仍会自动保留。</p>
                     <div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div>
                   </section>}
-                  <div className="agent-card-picker">
-                    <div className="agent-card-picker-title"><span>写作操作台</span><small>{continuousWriting ? `连续创作中 ${continuousWriting.done}/${continuousWriting.total} 章` : legacyReview.running ? `审查旧章中 ${legacyReview.done}/${legacyReview.total} 章` : aiToolResult ? `有未处理的${aiToolResult.mode === 'continue' ? '续写' : aiToolResult.mode === 'de-ai' ? '去 AI 味' : '润色'}草稿` : '润色续写、懒人连续创作、审查旧章'}</small></div>
-                    <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => setShowWritingConsole(true)}>打开写作操作台</button></div>
-                    <p className="empty-hint compact">这三件事都要占地方，挪到单独的面板里跑；这里只留一行状态，跑起来后关掉面板也不会中断。</p>
-                  </div>
-                  <div className="agent-card-picker">
-                    <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{extraOutlineCount ? `${extraOutlineCount} 份` : '未选：只用本章绑定的章纲'}</small></div>
-                    <button type="button" className={`agent-context-select ${showChapterOutlinePicker ? 'active' : ''}`} onClick={() => setShowChapterOutlinePicker(current => !current)}>选择章纲</button>
-                    {showChapterOutlinePicker && <div className="agent-context-dropdown">{editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => <label key={outline.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} /><span><strong>{outline.title || '未命名章纲'}</strong><small>{String(outline.chapterId ?? '') === String(activeChapter?.id ?? '') ? '当前章节' : '其他章节'}</small></span></label>)}</div>}
-                    <p className="empty-hint compact">{(() => { const bound = activeChapter ? boundChapterOutlineFor(editingProject, activeChapter) : undefined; return bound ? `已自动绑定：${bound.title || '本章章纲'}；` : '本章还没有章纲，运行章节智能体时会先按总纲与前文自动生成一份并绑定到本章；'; })()}世界观、总纲位置与最近章节记忆自动带入，这里勾选的是额外参考的其他章纲。</p>
-                  </div>
-                  <div className="agent-card-picker">
-                    <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length ? `${selectedCardIds.length} 张` : '未勾选：按章纲与上一章出现的卡自动带入'}</small>{selectedCardIds.length > 0 && <button type="button" className="link-button" onClick={() => setSelectedCardIds([])}>自动选择</button>}</div>
-                    <button type="button" className={`agent-context-select ${showChapterCardPicker ? 'active' : ''}`} onClick={() => setShowChapterCardPicker(current => !current)}>选择卡片</button>
-                    {showChapterCardPicker && <div className="agent-context-dropdown">{editingProject.cards.length === 0 ? <p className="empty-hint compact">先在卡片页创建知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedCardIds.includes(card.id)} onChange={() => toggleCardForChapter(card.id)} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>}
-                  </div>
-                  <div className="agent-memory-picker">
-                    <div className="agent-card-picker-title">前文记忆 <small>自动加载最近六章与伏笔状态</small></div>
-                    {(() => { const previous = activeChapter ? editingProject.chapters[editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id) - 1] : undefined; const memory = previous ? editingProject.memories.find(item => item.chapterId === previous.id) : undefined; return memory ? <div className="agent-context-fixed-item"><strong>{memory.sourceChapterNumber ? `第 ${memory.sourceChapterNumber} 章` : memory.chapterTitle}</strong><small>{memory.summary || '已自动加载上一章结构化记忆'}</small></div> : <p className="empty-hint compact">上一章暂无结构化记忆。</p>; })()}
-                  </div>
                   <button className="btn-secondary" disabled={projectAgentRunning || !activeChapter} onClick={() => { setShowProjectAgent(true); setProjectAgentSession(current => current ? { ...current, mode: 'execute' } : current); setProjectAgentInput(`请修订《${activeChapter?.title || '当前章'}》，并检查和联动修改受影响的前后章节、总纲与人物资料。先阅读相关原文，修改后核对衔接。\n具体要求：${agentInstruction.trim()}`); }}>关联修订前后章节</button>
-                  <button className={`agent-run-button ${agentRunning(agentStage) ? 'running' : ''}`} aria-busy={agentRunning(agentStage)} onClick={runChapterAgent}>
-                    {agentRunning(agentStage) ? `智能体执行中 · ${agentProgressPercent}%` : '运行章节智能体'}
-                  </button>
-                </section>
-
+                  <div className="agent-composer-actions">
+                    <button className="btn-primary" disabled={aiToolRunning || agentRunning(agentStage) || !activeChapter} onClick={() => { setBookView('tasks'); void runAITool('continue'); }}>接着写本章</button>
+                    <button className={`agent-run-button ${agentRunning(agentStage) ? 'running' : ''}`} aria-busy={agentRunning(agentStage)} onClick={runChapterAgent}>
+                      {agentRunning(agentStage) ? `执行中 · ${agentProgressPercent}%` : '写作并保存草稿'}
+                    </button>
+                  </div>
+                  </div>
+                <div className="writing-agent-thread" aria-label="写作智能体消息">
+                {!agentProgress.length && !agentDraft && !agentError && <div className="agent-thread-empty"><strong>写作智能体</strong><p>带上本章资料，从你的创作指令开始。</p><small>生成的草稿会显示在这里，确认采用后写入正文。</small></div>}
                 {agentProgress.length > 0 && (
                   <section className={`agent-progress-panel ${agentStage === 'error' ? 'error' : agentStage === 'done' ? 'done' : ''}`} aria-live="polite">
                     <div className="agent-progress-heading">
@@ -8366,10 +8522,35 @@ function App() {
                     </div>
                   </section>
                 )}
+                </div>
               </div>
               )}
             </aside>
+            {/* 右栏收起后没有入口就打不开了：贴右边缘留一个把手 */}
+            {!showAgentPanel && bookView !== 'tasks' && (
+              <button type="button" className="agent-reopen" title="打开右栏：本章资料与写作智能体" onClick={() => toggleAgentPanel(true)}>‹ 本章资料与助手</button>
+            )}
           </div>
+
+          {/* 状态条：字数、保存、检测与任务都从顶栏下移到这里，顶栏只留入口 */}
+          <footer className="editor-statusbar">
+            <span className="status-item">{activeChapter ? `本章 ${countNovelCharacters(activeChapter.content)} 字 / 目标 ${Number(editingProject.chapterTargetWords) || 3000}` : `${editingProject.chapters.length} 章`}</span>
+            <span className="status-item">全书 {bookTotalWords.toLocaleString()} 字</span>
+            {activeChapter ? <span className="status-item">{currentSearchMatches ? `搜索到 ${currentSearchMatches} 处` : `人物 ${characterNames.length} 个 · 禁词 ${bannedWords.length} 个`}{activeChapter.wordCount >= (Number(editingProject.chapterTargetWords) || 3000) ? ' · 已到本章目标' : ''}</span> : null}
+            <span className={`status-item${autoSaveStatus === 'error' ? ' status-error' : ''}`}>{autoSaveStatus === 'saving' ? '自动保存中' : autoSaveStatus === 'saved' ? '已自动保存' : autoSaveStatus === 'error' ? '保存失败' : '本地写作'}</span>
+            <span className="status-item grow" />
+            <button type="button" className="status-button" title="AI 检测当前章与全书" onClick={() => { switchBookView('library'); setEditorSidebarTab('ai-detect'); }}>AI 检测{currentChapterDetection ? ` ${currentChapterDetection.aiRate}%` : ''}</button>
+            <button type="button" className="status-button" title="连续创作、重写旧章、批量审查" onClick={() => setBookView('tasks')}>{continuousWriting ? `连续创作 ${continuousWriting.done}/${continuousWriting.total}` : legacyReview.running ? `审查旧章 ${legacyReview.done}/${legacyReview.total}` : batchRevise?.running ? `批量修订 ${batchRevise.done}/${batchRevise.total}` : '任务'}</button>
+            <span className="status-item">Ctrl / ⌘ + Enter 接着写</span>
+          </footer>
+
+          {/* 窄屏底部入口：并排放不下左栏时，章节与右栏靠这里拉出来 */}
+          <nav className="editor-mobile-bar" aria-label="窄屏导航">
+            <button type="button" className={railOpen ? 'active' : ''} onClick={() => { setRailOpen(current => !current); toggleAgentPanel(false); }}><Icon name="library" size={16} />章节</button>
+            <button type="button" className={showAgentPanel && chapterPaneView === 'brief' ? 'active' : ''} onClick={() => { toggleAgentPanel(!(showAgentPanel && chapterPaneView === 'brief')); setChapterPaneView('brief'); setRailOpen(false); }}><Icon name="cards" size={16} />本章</button>
+            <button type="button" className={showAgentPanel && chapterPaneView === 'agent' ? 'active' : ''} onClick={() => { toggleAgentPanel(!(showAgentPanel && chapterPaneView === 'agent')); setChapterPaneView('agent'); setRailOpen(false); }}><Icon name="sparkles" size={16} />助手</button>
+            <button type="button" className={showMoreMenu ? 'active' : ''} onClick={() => setShowMoreMenu(current => !current)}><Icon name="more" size={16} />更多</button>
+          </nav>
         </div>
       ) : (
         <>
@@ -9268,154 +9449,6 @@ function App() {
       )}
 
       {/* 写作统计：作者视角的日更数据，不是 token 账单 */}
-        {showWritingConsole && editingProject && <div
-          className="modal-overlay writing-console-overlay"
-          onPointerDown={event => {
-            consoleOverlayPointerDownRef.current = event.target === event.currentTarget;
-          }}
-          onClick={event => {
-            // 只有当真正点击在遮罩本身且不是刚拖拽松手时才关闭面板
-            const wasJustDragging = Date.now() - consoleDragEndTimeRef.current < 300;
-            if (event.target === event.currentTarget && consoleOverlayPointerDownRef.current && !wasJustDragging) {
-              setShowWritingConsole(false);
-            }
-            consoleOverlayPointerDownRef.current = false;
-          }}
-        >
-          <div
-            ref={consoleModalRef}
-            className="modal writing-console-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label="写作操作台"
-            style={consoleFrame ? {
-              position: 'fixed',
-              left: consoleFrame.x,
-              top: consoleFrame.y,
-              width: consoleFrame.width,
-              height: consoleFrame.height,
-              minWidth: 520,
-              minHeight: 320,
-              maxWidth: 'none',
-              maxHeight: 'none',
-            } : undefined}
-            onClick={event => event.stopPropagation()}
-          >
-            <div className="modal-header writing-console-header" onPointerDown={startConsoleDrag('move')}>
-              <h3>写作操作台</h3>
-              <small className="writing-console-drag-hint">拖标题栏移动 · 右下角缩放</small>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowWritingConsole(false)}><Icon name="x" size={16} /></button>
-            </div>
-            <div className="modal-body writing-console-body">
-          <section className="agent-task-section">
-            <div className="panel-section-title">润色 / 续写</div>
-              <div className="ai-writing-tools">
-                <div className="agent-card-picker-title">润色 / 续写要求 <small>可选</small></div>
-                <textarea value={aiToolInstruction} onChange={event => setAIToolInstruction(event.target.value)} placeholder="例如：加强紧张感，保留冷峻文风；或让主角先观察再行动" />
-                <div className="ai-writing-tool-actions">
-                  <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('polish')}>{aiToolRunning && aiToolMode === 'polish' ? '润色中...' : '润色选中内容 / 整章'}</button>
-                  <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('de-ai')}>{aiToolRunning && aiToolMode === 'de-ai' ? '处理中...' : '去 AI 味'}</button>
-                  <button className="btn-primary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('continue')}>{aiToolRunning && aiToolMode === 'continue' ? '续写中...' : '生成续写'}</button>
-                </div>
-                {aiToolResult && <div className="ai-tool-result">
-                  <div><strong>{aiToolResult.mode === 'continue' ? '续写草稿' : aiToolResult.mode === 'de-ai' ? '去 AI 味草稿' : '润色草稿'}</strong><span>{countNovelCharacters(aiToolResult.content)} 字{aiToolResult.maxWords ? ` / 最多 ${aiToolResult.maxWords} 字` : ''}</span></div>
-                  <textarea value={aiToolResult.content} onChange={event => setAIToolResult(current => current ? { ...current, content: event.target.value } : current)} />
-                  <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => copyText(aiToolResult.content)}>复制</button><button className="btn-primary" onClick={acceptAIToolResult}>{aiToolResult.mode === 'continue' ? '确认插入章节' : '确认替换'}</button></div>
-                </div>}
-              </div>
-          </section>
-          <section className="agent-task-section">
-              <div className="agent-card-picker">
-                <div className="agent-card-picker-title"><span>懒人连续创作</span><small>{continuousWriting ? `已写 ${continuousWriting.done}/${continuousWriting.total} 章` : (() => { const planned = plannedThroughChapterNumber(editingProject); const planEnd = plannedVolumeEndChapter(editingProject); return [planned ? `章纲已备到第 ${planned} 章` : '', planEnd ? `总纲计划到第 ${planEnd} 章` : '', `正文 ${editingProject.chapters.length} 章`].filter(Boolean).join('，'); })()}</small></div>
-                <div className="ai-writing-tool-actions">
-                  <label className="agent-continuous-count">再写 <input className="input" type="number" min={1} max={200} value={continuousCount} disabled={Boolean(continuousWriting)} onChange={event => setContinuousCount(Number(event.target.value) || 1)} /> 章</label>
-                  {continuousWriting
-                    ? <button className="btn-secondary" onClick={() => { continuousAbortRef.current = true; }}>{continuousAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
-                    : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runContinuousWriting()}>新建并连续创作</button>}
-                </div>
-                <p className="empty-hint compact">{continuousWriting ? continuousWriting.message : '每章自动：新建章节、生成章纲（总纲没有逐章条目时先规划一段节拍表，存在大纲页可改）、构思、写正文、采用、提炼记忆，再接着写下一章；模型拿不准的事记进大纲页的「给作者｜待答」，不打断写作。写满章数、写到总纲按卷写明的末章、正文明显残缺、出错或点停止为止。'}</p>
-              </div>
-          </section>
-          <section className="agent-task-section">
-              <div className="agent-card-picker">
-                <div className="agent-card-picker-title"><span>重写旧章</span><small>{chapterRewrite ? `已重写 ${chapterRewrite.done}/${chapterRewrite.total} 章` : '把已有的章按新流程重写一遍：构思、正文、验证门、审查、记忆全走'}</small></div>
-                <div className="ai-writing-tool-actions writing-console-range">
-                  {(() => { const range = rewriteRange ?? { from: editingProject.chapters.length, to: editingProject.chapters.length }; return <>
-                    <label className="writing-console-range-field">从第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={range.from} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteRange({ ...range, from: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
-                    <label className="writing-console-range-field">到第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={range.to} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteRange({ ...range, to: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
-                  </>; })()}
-                  <label className="writing-console-range-field">方式 <select className="select" value={rewriteMode} disabled={Boolean(chapterRewrite)} onChange={event => setRewriteMode(event.target.value as 'keep' | 'redo')}><option value="keep">保事件换写法</option><option value="redo">从构思重来</option></select></label>
-                  {chapterRewrite
-                    ? <button className="btn-secondary" onClick={() => { rewriteAbortRef.current = true; }}>{rewriteAbortRef.current ? '本章写完即停' : '写完本章后停止'}</button>
-                    : <button className="btn-primary" disabled={agentRunning(agentStage) || Boolean(continuousWriting) || !editingProject.chapters.length} onClick={() => void runChapterRewrite()}>开始重写</button>}
-                </div>
-                <p className="empty-hint compact">{chapterRewrite ? chapterRewrite.message : '保事件：原稿记忆里的事件、时间线、人物变化、章末落点当作本章必须发生的事，只换写法，不生成新章纲；从构思重来：原稿作废，按总纲、故事账本和上一章重新构思，和写新章一样。每章旧稿进章节历史，重写完立刻提炼记忆，下一章按新记忆承接。逐章串行，中途可停。'}</p>
-              </div>
-          </section>
-          <section className="agent-task-section">
-              <div className="agent-card-picker">
-                <div className="agent-card-picker-title"><span>审查旧章</span><small>{legacyReview.running ? `已审 ${legacyReview.done}/${legacyReview.total} 章` : (legacyReview.message || '正文已经写好的章重跑审查，报告存进知识面板')}</small></div>
-                <div className="ai-writing-tool-actions writing-console-range">
-                  <label className="writing-console-range-field">从第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={consoleRange.from} disabled={legacyReview.running} onChange={event => setLegacyReviewRange({ ...consoleRange, from: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
-                  <label className="writing-console-range-field">到第 <input className="input console-number" type="number" min={1} max={editingProject.chapters.length} value={consoleRange.to} disabled={legacyReview.running} onChange={event => setLegacyReviewRange({ ...consoleRange, to: Math.min(editingProject.chapters.length, Number(event.target.value) || 1) })} /> 章</label>
-                  <label className="writing-console-range-field">并发 <input className="input console-number" type="number" min={1} max={6} value={reviewConcurrency} disabled={legacyReview.running || Boolean(batchRevise?.running)} onChange={event => setReviewConcurrency(Math.min(6, Math.max(1, Number(event.target.value) || 1)))} /> 章</label>
-                  <small className="writing-console-range-hint">{consoleRangeHint}</small>
-                  {legacyReview.running
-                    ? <button className="btn-secondary" onClick={() => { legacyReviewAbortRef.current = true; }}>{legacyReviewAbortRef.current ? '本章审完即停' : '审完本章后停止'}</button>
-                    : <button className="btn-primary" disabled={agentRunning(agentStage) || !editingProject.chapters.length} onClick={() => { legacyReviewAbortRef.current = false; const range = legacyReviewRange ?? { from: Math.max(1, editingProject.chapters.length - 9), to: editingProject.chapters.length }; void runLegacyReview(range.from, range.to); }}>开始审查</button>}
-                </div>
-                {reviewClusters.length > 0 && <div className="agent-review-clusters">
-                  <div className="agent-card-picker-title"><span>疑似同一个问题散在多章</span><small>点一下就勾上涉及的章，一起改</small></div>
-                  <div className="agent-cluster-chips">
-                    {reviewClusters.map(cluster => (
-                      <button key={cluster.text} type="button" className="agent-cluster-chip" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(current => [...new Set([...current, ...cluster.numbers])])}>
-                        {cluster.text}<small>第 {cluster.numbers.join('、')} 章</small>
-                      </button>
-                    ))}
-                  </div>
-                </div>}
-                {selectedReviewNumbers.length > 0 && <div className="agent-review-batch">
-                  <div className="agent-card-picker-title"><span>批量修订 {selectedReviewNumbers.length} 章</span><small>{batchRevise?.message || '各章共用下面这句统一口径'}</small></div>
-                  <textarea className="input" rows={2} value={reviewUnifiedNote} disabled={batchRevise?.running} onChange={event => setReviewUnifiedNote(event.target.value)} placeholder="统一口径（可选，但同一问题就该写）：例如「随访数据跨时不到一年，最早一份报告就是第一次入院那天」" />
-                  <div className="ai-writing-tool-actions">
-                    {batchRevise?.running
-                      ? <button className="btn-secondary" onClick={() => { reviseAbortRef.current = true; }}>{reviseAbortRef.current ? '改完本章即停' : '改完本章后停止'}</button>
-                      : <button className="btn-primary" disabled={agentRunning(agentStage)} onClick={() => void runBatchRevise(selectedReviewNumbers)}>按意见修订选中的 {selectedReviewNumbers.length} 章</button>}
-                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers([])}>清空选择</button>
-                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(reviewItems.filter(item => item.issues.length > 0).map(item => item.number))}>只选有问题的</button>
-                    {reviewUnifiedNote.trim() && <button className="btn-secondary" onClick={() => { copyText(reviewUnifiedNote.trim()); setNotice({ title: '已复制统一口径', content: '粘进硬事实账本或总纲，以后写新章也照这条办，否则这个错还会长回来。' }); }}>复制口径（写进档案）</button>}
-                    <button className="btn-secondary" disabled={batchRevise?.running} onClick={() => setSelectedReviewNumbers(selectedReviewNumbers.length === reviewItems.length ? [] : reviewItems.map(item => item.number))}>{selectedReviewNumbers.length === reviewItems.length ? '取消全选' : '全选'}</button>
-                  </div>
-                  <p className="empty-hint compact">串行改，一路模型调用；中途可停，已改完的章不回滚。每章旧版本都进章节历史，可逐章回退复核。</p>
-                </div>}
-                {reviewItems.length > 0 ? <div className="agent-review-list">
-                  {reviewItems.map(item => {
-                    const reviseState = reviseStates[item.number];
-                    const elapsed = reviseState?.status === 'running' ? Math.max(0, Math.round((nowTick - reviseState.startedAt) / 1000)) : 0;
-                    return (
-                    <div key={item.number} className={`agent-review-row ${reviseState?.status === 'running' ? 'active' : item.status}`}>
-                      <div className="agent-review-row-title">
-                        <label className="agent-review-check"><input type="checkbox" checked={selectedReviewNumbers.includes(item.number)} disabled={batchRevise?.running} onChange={event => setSelectedReviewNumbers(current => event.target.checked ? [...new Set([...current, item.number])] : current.filter(number => number !== item.number))} /></label>
-                        <strong>第 {item.number} 章 {item.title.replace(/^第\s*\d+\s*章\s*/u, '')}</strong><small>{reviseState?.status === 'running' ? `修订中…已 ${elapsed} 秒` : reviseState?.status === 'done' ? reviseState.message : item.message || (item.status === 'pending' ? '待审' : '')}</small></div>
-                      {item.issues.length > 0 && <ul className="agent-review-issues">{item.issues.map((text, index) => <li key={index}>{text}</li>)}</ul>}
-                      {item.issues.length + item.suggestions.length > 0 && <div className="ai-writing-tool-actions">
-                        <button className="btn-secondary" disabled={reviseState?.status === 'running' || reviseState?.status === 'done'} onClick={() => void reviseReviewedChapter(item)}>
-                          {reviseState?.status === 'running' ? `修订中…已 ${elapsed} 秒` : reviseState?.status === 'done' ? '已按意见修订' : '按意见修订本章'}
-                        </button>
-                        {reviseState?.status === 'error' && <small className="agent-review-error">{reviseState.message}</small>}
-                      </div>}
-                    </div>
-                    );
-                  })}
-                </div> : <p className="empty-hint compact">还没审过旧章。默认从最近十章开始，改成 156 到 182 就能一次审完那批。</p>}
-                <p className="empty-hint compact">审查只跑审查那一步，不重写正文；报告存成大綱页的“审查报告｜第 N 章”，面板里随时回看。“按意见修订本章”走定点修订：指令没点到的地方保持原样，覆盖前会把旧版压进章节历史。</p>
-              </div>
-          </section>
-            </div>
-            <div className="modal-footer"><span className="empty-hint compact">面板关掉不影响正在跑的连续创作与旧章审查，状态在右侧留一行提示。</span><button className="btn-primary" onClick={() => setShowWritingConsole(false)}>关闭</button></div>
-            <div className="writing-console-resize" role="separator" aria-label="调整面板大小" onPointerDown={startConsoleDrag('resize')} />
-          </div>
-        </div>}
       {pendingDraftAcceptance && (
         <div className="modal-overlay draft-acceptance-overlay" onClick={() => setPendingDraftAcceptance(null)}>
           <div className="modal draft-acceptance-modal" role="dialog" aria-modal="true" aria-labelledby="draft-acceptance-title" onClick={event => event.stopPropagation()}>

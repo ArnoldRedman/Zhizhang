@@ -1,0 +1,158 @@
+/* 书内工作区以设计稿的三栏尺度为准，限定作用域避免影响书库和设置页 */
+.editor-view { --ui-font: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; height: 100dvh; min-height: 0; font: 13px/1.5 var(--ui-font); }
+.editor-view .editor-header { height: 54px; padding: 0 16px; gap: 12px; }
+.editor-view .editor-title { flex: 1; overflow: hidden; }
+.editor-view .editor-title h2 { flex: 0 1 auto; font-size: 15px; font-weight: 600; }
+.editor-view .editor-title > span { font-size: 11.5px; }
+.editor-view .editor-header-actions { margin-left: 0; }
+.editor-view .btn-back { width: 30px; height: 30px; padding: 0; justify-content: center; }
+.editor-view .editor-body { min-height: 0; }
+.editor-view .editor-main { min-height: 0; padding: 0; background: var(--surface-raised); }
+.editor-view .chapters-panel { padding: 0; max-height: none; }
+.editor-view .chapters-list { padding: 0; }
+.editor-view .chapter-item { width: 100%; margin: 0; padding: 8px 14px; text-align: left; }
+.editor-view .chapters-head { flex-shrink: 0; }
+.editor-view .chapters-head small { font-size: 10.5px; white-space: nowrap; }
+.editor-view .chapters-search { margin: 0 12px 10px; padding: 0 9px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-raised); }
+.editor-view .chapters-search .input { padding: 5px 0; border: 0; background: transparent; }
+.editor-view .chapters-footer { padding: 10px 12px; flex-shrink: 0; }
+.editor-view .editor-sidebar-footer { display: none; }
+.editor-view .chapter-title-wrap { padding: 16px 30px 0; border: 0; background: var(--surface-raised); flex-shrink: 0; flex-wrap: wrap; }
+.editor-view .chapter-title-input { min-width: 160px; color: var(--text); }
+.editor-view .chapter-head-links { margin-left: auto; }
+.editor-view .chapter-head-links .link-button { margin: 0; white-space: nowrap; }
+.editor-view .chapter-quick-copy-button { border-color: transparent; padding: 4px 8px; }
+.editor-view .chapter-chips { padding: 12px 30px 10px; flex-shrink: 0; }
+.editor-view .chapter-chips .chip { border-radius: 0; }
+/* 标题、正文和作话栏连成暖色稿纸，深色主题沿用对应纸色 */
+.editor-view .view-write .editor-main,
+.editor-view .chapter-title-wrap,
+.editor-view .chapter-chips,
+.editor-view .chapter-editor-wrap { background: var(--paper-bg); }
+.editor-view .chapter-highlight-layer,
+.editor-view .chapter-content-editor { width: 100%; max-width: none; margin: 0; font-size: var(--reader-size); line-height: var(--reader-line); color: var(--text); }
+.editor-view .chapter-editor-wrap .chapter-content-editor { color: transparent; }
+.editor-view .chapter-editor-wrap:focus-within .chapter-content-editor { color: var(--text); -webkit-text-fill-color: var(--text); }
+.editor-view .chapter-author-note-bar { border: 0; background: var(--paper-bg); padding: 4px 30px 8px; }
+.editor-view .chapter-author-note-expand-trigger { font-size: 11px; color: var(--text-5); }
+.editor-view .editor-statusbar { height: 32px; overflow: hidden; }
+.editor-view .agent-panel-header { min-height: 54px; padding: 10px 12px; flex-shrink: 0; gap: 6px; }
+.editor-view .agent-panel-header .pane-switch { display: flex; flex-direction: row; gap: 2px; }
+.editor-view .pane-switch button { padding: 5px 7px; font-size: 11.5px; white-space: nowrap; }
+.editor-view .agent-model-select { padding: 4px; font-size: 11px; background: var(--surface-raised); }
+.editor-view .agent-panel-header .icon-button { flex-shrink: 0; width: 28px; padding: 0; }
+.editor-view .writing-agent-layout { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; flex: 1; min-height: 0; overflow: hidden; }
+.editor-view .agent-settings { grid-row: 1; min-height: 0; max-height: 40vh; overflow-y: auto; border-bottom: 1px solid var(--line); }
+.editor-view .agent-settings-line { padding: 12px; border: 0; gap: 6px; }
+.editor-view .agent-settings-line .chip { padding: 5px 9px; border-radius: 0; }
+.editor-view .agent-setting-detail { margin: 0 12px 12px; padding: 10px 0 0; border: 0; border-top: 1px dashed var(--line); border-radius: 0; background: transparent; font-size: 12px; color: var(--text-3); line-height: 1.7; }
+.editor-view .agent-setting-detail label { color: var(--text-5); font-size: 11px; }
+.editor-view .writing-agent-thread { grid-row: 2; min-height: 0; overflow-y: auto; overflow-wrap: anywhere; }
+.editor-view .agent-thread-empty { padding: 24px 16px; color: var(--text-5); font-size: 12.5px; line-height: 1.75; }
+.editor-view .agent-thread-empty strong { color: var(--text-3); font-size: 12.5px; font-weight: 500; }
+.editor-view .agent-thread-empty p { margin: 6px 0; }
+.editor-view .agent-thread-empty small { font-size: 11px; }
+.editor-view .writing-agent-thread > section,
+.editor-view .writing-agent-thread > details { margin: 0; padding: 12px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; }
+.editor-view .agent-actions-bar { grid-row: 3; margin: 0; padding: 10px 12px 12px; background: var(--surface-raised); gap: 8px; }
+.editor-view .agent-actions-bar .agent-instruction-heading { margin: 0; }
+.editor-view .agent-actions-bar label { font-size: 11px; color: var(--text-5); }
+.editor-view .agent-actions-bar textarea { height: 64px; min-height: 56px; max-height: 140px; font: 12.5px/1.7 var(--ui-font); }
+.editor-view .agent-actions-bar > .btn-secondary { order: 4; border: 0; background: transparent; color: var(--text-5); padding: 0; min-height: 24px; font-size: 11.5px; text-align: left; }
+.editor-view .agent-run-button { min-height: 30px; margin: 0; padding: 6px 12px; border-radius: var(--r-sm); background: var(--accent); color: #fff; font-size: 12.5px; }
+.editor-view .agent-run-button.running { background: var(--accent-tint); color: var(--accent-fg); }
+.editor-view .agent-composer-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.editor-view .agent-composer-actions button { padding: 6px; font-size: 12px; font-weight: 500; box-shadow: none; }
+.editor-view .agent-composer-actions .agent-run-button:not(.running) { border: 1px solid var(--line); background: var(--surface-raised); color: var(--text-3); }
+.editor-view .tasks-view { background: var(--surface); }
+.editor-view .tasks-view > .agent-task-section { display: flex; flex-direction: column; min-width: 0; margin: 0; padding: 16px 18px; border-radius: 0; border-bottom: 0; }
+.editor-view .tasks-view > .agent-task-section > .agent-card-picker { display: flex; flex-direction: column; gap: 12px; padding: 0; border: 0; background: transparent; border-radius: 0; }
+.editor-view .tasks-view .agent-card-picker-title { display: flex; flex-direction: column; gap: 8px; font-size: 13px; font-weight: 600; }
+.editor-view .tasks-view .agent-card-picker-title small { color: var(--text-5); font-size: 12px; font-weight: 400; line-height: 1.7; }
+.editor-view .tasks-view .empty-hint { font-size: 12px; line-height: 1.7; color: var(--text-5); }
+.editor-view .tasks-view .writing-console-range { align-items: flex-start; }
+.editor-view .tasks-view .writing-console-range-field { flex-wrap: wrap; }
+.editor-view .tasks-view .select { max-width: 100%; }
+.editor-view .tasks-view > .agent-task-section > .agent-card-picker { flex: 1; }
+.editor-view .view-tasks .editor-sidebar > :not(.chapters-panel) { display: none; }
+.editor-view .tasks-view > .agent-task-section > .agent-card-picker > .ai-writing-tool-actions { display: contents; }
+.editor-view .tasks-view > .agent-task-section > .agent-card-picker > p { order: 1; }
+.editor-view .tasks-view .ai-writing-tool-actions > label,
+.editor-view .tasks-view .writing-console-range-hint { order: 2; }
+.editor-view .tasks-view > .agent-task-section > .agent-card-picker > .ai-writing-tool-actions > button { order: 10; margin-top: auto; box-shadow: none; font-weight: 500; }
+.editor-view .tasks-view .console-number { width: 52px; min-width: 0; flex: 0 0 52px; }
+.editor-view .tasks-view .agent-review-list,
+.editor-view .tasks-view .agent-review-clusters,
+.editor-view .tasks-view .agent-review-batch { order: 3; }
+.editor-view .side-tasks > .pane-resizer-x { position: absolute; left: 0; top: 0; bottom: 0; background: transparent; }
+.editor-view .side-tasks > .pane-resizer-x:hover { background: var(--accent); }
+.editor-view .tasks-log { padding: 0; }
+.editor-view .tasks-log-line { display: grid; gap: 5px; padding: 12px; border-bottom-style: solid; }
+.editor-view .project-agent-drawer { top: 54px; bottom: 32px; }
+.editor-view button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.editor-view .view-library .editor-sidebar-tabs { max-height: none; padding: 0; gap: 0; }
+.editor-view .view-library .editor-sidebar-tabs button { min-height: 42px; padding: 8px 14px; border-left-width: 3px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.editor-view .view-library .editor-sidebar-tabs button:first-child { display: none; }
+.editor-view .view-library .editor-sidebar-tabs small { margin-left: auto; color: var(--text-5); font-size: 11px; }
+.editor-view .view-library .pane-resizer-y { display: none; }
+.editor-view .promise-workspace { padding: 16px 30px; overflow-y: auto; }
+.editor-view .promise-workspace h2 { font-size: 19px; font-weight: 600; }
+.editor-view .promise-workspace header p { margin: 8px 0 16px; color: var(--text-5); font-size: 12px; }
+.editor-view .promise-workspace .outline-promises { margin: 0; padding: 0; border: 0; background: transparent; }
+.editor-view .promise-workspace .outline-promises summary { padding-bottom: 12px; color: var(--text-4); }
+.editor-view .promise-workspace .promise-row { padding: 12px 0; border-top: 1px solid var(--line); }
+.editor-view .promise-workspace .promise-row > .input { width: 100%; }
+.editor-view .chapter-floating-copy-container { opacity: 0; transition: opacity .15s; }
+.editor-view .chapter-editor-wrap:hover .chapter-floating-copy-container,
+.editor-view .chapter-floating-copy-container:focus-within,
+.editor-view .chapter-floating-copy-container:has(.chapter-selection-bar) { opacity: 1; }
+@media (min-width: 901px) {
+  .editor-view .editor-mobile-bar { display: none; }
+}
+@media (max-width: 1200px) and (min-width: 901px) {
+  .editor-view .editor-title > span { display: none; }
+  .editor-view .chapter-title-wrap { gap: 8px; }
+  .editor-view .chapter-head-links { width: 100%; justify-content: flex-end; }
+  .editor-view .tasks-view { grid-template-columns: 1fr; }
+  .editor-view .tasks-view > .agent-task-section { height: auto; border-left: 0; border-bottom: 1px solid var(--line); }
+}
+@media (max-width: 900px) {
+  .editor-view .editor-header { height: 54px; min-height: 54px; padding: 0 10px; gap: 8px; flex-wrap: nowrap; background: var(--surface-raised); }
+  .editor-view .editor-title h2 { font-family: var(--ui-font); }
+  .editor-view .editor-title h2 { font-size: 13px; }
+  .editor-view .editor-header > .view-switch button { padding: 5px 8px; }
+  .editor-view .editor-header-actions { display: none; }
+  .editor-view .editor-header-actions:has(.editor-more-menu) { display: block; position: absolute; right: 10px; top: 54px; z-index: 40; }
+  .editor-view .editor-header-actions:has(.editor-more-menu) > button,
+  .editor-view .editor-header-actions:has(.editor-more-menu) .editor-more > button { display: none; }
+  .editor-view .editor-body { flex: 1; display: flex; flex-direction: row; height: auto; overflow: hidden; }
+  .editor-view .editor-main { width: auto; flex: 1; height: 100%; min-height: 0; overflow: hidden; }
+  .editor-view .editor-sidebar,
+  .editor-view .agent-panel,
+  .editor-view .side-tasks { position: absolute; top: 0; bottom: 0; z-index: 30; max-width: 90%; height: auto; box-shadow: var(--shadow-2); }
+  .editor-view .editor-sidebar { left: 0; width: 280px; }
+  .editor-view .agent-panel { left: auto; right: 0; width: 336px; background: var(--surface); }
+  .editor-view .side-tasks { display: none; }
+  .editor-view .chapters-panel > .chapters-list { flex: 1; min-height: 0; overflow-y: auto; }
+  .editor-view .chapter-title-wrap { padding: 14px 16px 0; }
+  .editor-view .chapter-title-input { font-size: 19px; padding: 0; min-height: 0; background: transparent; border: 0; border-radius: 0; }
+  .editor-view .chapter-head-links .link-button { font-weight: 400; }
+  .editor-view .chapter-quick-copy-button { background: transparent; border-color: transparent; color: var(--text-5); font-weight: 400; }
+  .editor-view .agent-reopen { display: none; }
+  .editor-view .chapter-head-links { flex-wrap: wrap; }
+  .editor-view .chapter-chips { padding: 10px 16px; }
+  .editor-view .chapter-highlight-layer,
+  .editor-view .chapter-editor-wrap .chapter-content-editor { padding: 6px 16px 20px; }
+  .editor-view .chapter-editor-wrap { flex: 1; min-height: 0; overflow: hidden; }
+  .editor-view .chapter-editor-wrap .chapter-highlight-layer { display: block; min-height: 0; background: transparent; }
+  .editor-view .chapter-editor-wrap .chapter-content-editor,
+  .editor-view .chapter-editor-wrap:focus-within .chapter-content-editor { position: absolute; inset: 0; height: 100%; min-height: 0; resize: none; background: transparent; }
+  .editor-view .chapter-editor-wrap .chapter-content-editor { color: transparent; -webkit-text-fill-color: transparent; }
+  .editor-view .chapter-editor-wrap:focus-within .chapter-content-editor { color: var(--text); -webkit-text-fill-color: var(--text); }
+  .editor-view .editor-statusbar { padding: 0 10px; gap: 8px; font-size: 10px; }
+  .editor-view .editor-statusbar > .status-item:last-child { display: none; }
+  .editor-view .editor-statusbar .status-button { white-space: nowrap; }
+  .editor-view .tasks-view { grid-template-columns: 1fr; }
+  .editor-view .tasks-view > .agent-task-section { height: auto; border-left: 0; border-bottom: 1px solid var(--line); }
+  .editor-view .writing-settings-popover { position: fixed; top: 100px; right: 12px; width: min(340px, calc(100vw - 24px)); }
+}

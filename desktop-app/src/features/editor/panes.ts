@@ -16,10 +16,10 @@ export interface PaneSpec {
 /** 界面上所有可拖动分栏的取值区间，集中在这里，改档位不用翻组件 */
 export const panes = {
   appSidebar: { key: 'pane-app-sidebar', min: 168, max: 420, fallback: 232 },
-  editorSidebar: { key: 'editor-sidebar-width', min: 180, max: 560, fallback: 280 },
+  editorSidebar: { key: 'editor-sidebar-width', min: 180, max: 560, fallback: 244 },
   editorSidebarTabs: { key: 'editor-sidebar-tabs-height', min: 84, max: 520, fallback: 232 },
   projectAgent: { key: 'pane-project-agent', min: 320, max: 760, fallback: 470 },
-  agentPanel: { key: 'pane-agent-panel', min: 280, max: 640, fallback: 360 },
+  agentPanel: { key: 'pane-agent-panel', min: 320, max: 640, fallback: 336 },
   libraryList: { key: 'pane-library-list', min: 170, max: 460, fallback: 245 },
   libraryReader: { key: 'pane-library-reader', min: 220, max: 620, fallback: 330 },
   dismantleLibrary: { key: 'pane-dismantle-library', min: 170, max: 440, fallback: 230 },

@@ -2824,7 +2824,7 @@ select.input {
 .outline-type-option strong { font-size: 14px; }
 .outline-type-option span { color: var(--text-5); font-size: 11px; }
 
-.agent-panel-header > div {
+.agent-panel-header > div:not(.view-switch) {
   display: grid;
   gap: 3px;
 }
@@ -4761,3 +4761,370 @@ select.input {
 
 /* 记忆快照编辑器：重新提炼与保存并排 */
 .memory-document-actions { display: flex; align-items: center; gap: 8px; }
+
+/* ── 书内工作区重排 ────────────────────────────────────────────────
+   顶栏只留入口：返回、书名与位置、写作/资料切换、搜索、项目 Agent、更多
+   字数、保存、检测、任务下移到状态条；右栏默认收起，按需拉出
+   写作视图左栏只放章节目录，七个资料页签收进资料视图 */
+
+/* 顶栏 */
+.editor-header h2 { flex: 0 0 auto; font-size: 17px; }
+.editor-title { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex: 0 1 auto; }
+.editor-title > span { color: var(--text-5); font-size: 11px; white-space: nowrap; }
+.editor-title h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.view-switch { display: flex; flex: 0 0 auto; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-sunken); }
+.view-switch button { padding: 5px 12px; border: none; border-radius: 4px; background: transparent; color: var(--text-4); font-size: 12px; }
+.view-switch button:hover { color: var(--text-2); }
+.view-switch button.active { background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow-1); }
+.editor-header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: 0 0 auto; }
+.editor-tool-button.icon-only { padding: 7px 9px; }
+.editor-more { position: relative; }
+.editor-menu-backdrop { position: fixed; inset: 0; z-index: 39; }
+.editor-more-menu { position: absolute; z-index: 40; top: calc(100% + 6px); right: 0; display: grid; gap: 1px; min-width: 216px; padding: 6px; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--surface-raised); box-shadow: var(--shadow-2); }
+.editor-more-menu button { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: none; border-radius: var(--r-sm); background: transparent; color: var(--text-3); font-size: 12.5px; text-align: left; }
+.editor-more-menu button:hover { background: var(--accent-tint); color: var(--accent-fg); }
+.editor-more-menu button.active { color: var(--accent-fg); }
+.editor-more-menu button:disabled { color: var(--text-6); }
+.editor-more-menu button:disabled:hover { background: transparent; color: var(--text-6); }
+
+/* 写作视图：左栏只留章节；资料视图：七个资料页签 */
+.editor-body.view-write .editor-sidebar-tabs { display: none; }
+.editor-body.view-write .pane-resizer-y { display: none; }
+
+/* 右栏默认收起 */
+.editor-body.agent-collapsed .agent-panel { display: none; }
+
+/* 状态条 */
+.editor-statusbar { display: flex; align-items: center; gap: 14px; height: 34px; flex: 0 0 auto; padding: 0 18px; border-top: 1px solid var(--line); background: var(--surface); color: var(--text-5); font-size: 11px; }
+.editor-statusbar .grow { flex: 1; }
+.editor-statusbar .status-item { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.editor-statusbar .status-error { color: var(--danger-fg); }
+.editor-statusbar .status-button { padding: 4px 8px; border: 1px solid transparent; border-radius: var(--r-sm); background: transparent; color: var(--text-5); font-size: 11px; }
+.editor-statusbar .status-button:hover { border-color: var(--line-strong); color: var(--text-2); }
+
+/* 右栏收起后，项目 Agent 抽屉不压住状态条 */
+.project-agent-drawer { bottom: 34px; }
+
+/* 右栏顶部的本章资料：章纲的信息边界、到期承诺、待答，写作时不用离开正文 */
+.chapter-brief-panel { flex: 0 0 auto; max-height: 44%; overflow-y: auto; padding: 12px 14px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.chapter-brief-panel > header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.chapter-brief-panel > header strong { color: var(--text-3); font-size: 12px; }
+.brief-fields { display: grid; gap: 0; }
+.brief-field { display: grid; gap: 2px; padding: 7px 0; border-top: 1px dashed var(--line); }
+.brief-field:first-child { border-top: none; padding-top: 0; }
+.brief-field dt { color: var(--text-5); font-size: 11px; }
+.brief-field dd { color: var(--text-2); font-size: 12.5px; line-height: 1.6; }
+.brief-field-key dt { color: var(--accent-fg); }
+.brief-block { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.brief-block > strong { display: block; margin-bottom: 6px; color: var(--text-3); font-size: 12px; }
+.brief-line { display: grid; gap: 2px; padding: 6px 0; border-top: 1px dashed var(--line); }
+.brief-line:first-of-type { border-top: none; padding-top: 0; }
+.brief-line > span { color: var(--text-2); font-size: 12.5px; line-height: 1.6; }
+.brief-line > small { color: var(--text-5); font-size: 11px; }
+.brief-hint { margin: 0; padding: 0; }
+
+/* 任务面板：写作操作台从浮动模态改成贴着底部的停靠面板
+   遮罩不再挡正文，可以一边跑任务一边接着写；进度同时显示在状态条右侧
+   ponytail: 拖拽与缩放的旧状态还在写 localStorage，这里用 CSS 把面板钉住；
+   等面板内容按新分组重做时一并删掉 consoleFrame 与拖拽处理 */
+.writing-console-overlay { align-items: flex-end; justify-content: center; background: transparent; backdrop-filter: none; pointer-events: none; }
+.writing-console-modal {
+  position: fixed !important;
+  left: 0 !important;
+  right: 0 !important;
+  top: auto !important;
+  bottom: 34px !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  height: 46vh !important;
+  min-height: 280px !important;
+  max-height: none !important;
+  margin: 0 !important;
+  border-radius: var(--r-lg) var(--r-lg) 0 0 !important;
+  box-shadow: 0 -12px 32px rgba(0, 0, 0, .28) !important;
+  pointer-events: auto;
+}
+.writing-console-header { cursor: default; }
+
+/* 右栏两态切换器 */
+.agent-panel-header .pane-switch button { padding: 4px 10px; font-size: 11.5px; }
+
+/* 资料态下本章资料占满右栏 */
+.chapter-brief-panel { max-height: none; }
+.agent-panel > .chapter-brief-panel { flex: 1; }
+
+/* 章节工具条上的右栏入口 */
+.chapter-editor-toolbar > .editor-tool-button { flex: 0 0 auto; }
+
+/* 任务面板：贴着底部，按任务分栏，不再是一列从上往下堆
+   ponytail: 用 auto-fit 分栏，润色续写那块还在，等选区工具条接管后这里自然剩三栏 */
+.writing-console-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); align-items: start; gap: 0; padding: 0; overflow-y: auto; }
+.writing-console-body > .agent-task-section { display: grid; gap: 8px; padding: 14px 16px; border-left: 1px solid var(--line); }
+.writing-console-body > .agent-task-section:first-child { border-left: none; }
+.writing-console-body .agent-review-list { max-height: 32vh; }
+
+/* 选中文字后浮出的工具条：润色、去 AI 味、从这里续写贴在选择处上方
+   这三件事原来在写作操作台里，点完草稿仍然回到任务面板里审 */
+.chapter-selection-bar { display: flex; align-items: center; gap: 2px; margin-bottom: 8px; padding: 4px; border: 1px solid var(--accent-line); border-radius: var(--r-sm); background: var(--surface-raised); box-shadow: var(--shadow-2); }
+.chapter-selection-bar .chapter-selection-count { padding: 0 8px; color: var(--text-5); font-size: 11px; font-variant-numeric: tabular-nums; }
+.chapter-selection-bar button { padding: 5px 10px; border: none; border-radius: 4px; background: transparent; color: var(--text-3); font-size: 11.5px; }
+.chapter-selection-bar button:hover:not(:disabled) { background: var(--accent-bg); color: var(--accent-fg); }
+.chapter-selection-bar button:disabled { color: var(--text-6); }
+.chapter-selection-bar .chapter-selection-close { padding: 5px 7px; color: var(--text-5); }
+
+/* 章节目录：搜索、列表、底部操作三段，设置项搬进写作设置面板
+   ponytail: 目录搜索只过滤已加载的章节标题，全文检索仍在剧情搜索页 */
+.chapters-panel { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.chapters-panel > .chapters-list { flex: 1; min-height: 0; }
+.chapters-search { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); color: var(--text-5); }
+.chapters-search .input { flex: 1; min-width: 0; height: 28px; padding: 4px 8px; font-size: 12px; }
+.chapters-footer { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-top: 1px solid var(--line); }
+.chapters-footer .btn-secondary { flex: 1; justify-content: center; }
+.chapter-more { position: relative; }
+.chapter-more-menu { top: auto; bottom: calc(100% + 6px); right: 0; }
+.chapter-more-menu button.danger { color: var(--danger-fg); }
+.chapter-more-menu button.danger:hover { background: var(--danger-bg); color: var(--danger-fg); }
+
+/* 写作设置：书级设置从目录里搬出来，挂在章节工具条上 */
+.chapter-settings-wrap { position: relative; }
+.writing-settings-popover { position: absolute; z-index: 40; top: calc(100% + 6px); right: 0; width: 340px; padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--surface-raised); box-shadow: var(--shadow-2); }
+.writing-settings-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+.writing-settings-head strong { color: var(--text-2); font-size: 13px; }
+.writing-settings-head small { margin-right: auto; color: var(--text-5); font-size: 11px; }
+.writing-settings-popover .chapter-target-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.writing-settings-popover .chapter-target-row > label,
+.writing-settings-popover .chapter-target-row > summary { flex: 0 0 76px; color: var(--text-4); font-size: 12px; }
+.writing-settings-popover .chapter-target-row .input,
+.writing-settings-popover .chapter-target-row .select { flex: 1; min-width: 0; }
+.writing-settings-popover details.chapter-target-row { display: block; }
+
+/* ── 界面密度与形态统一 ────────────────────────────────────────────
+   这一层是书内工作区的基准：控件 28px 高、正文 12.5px、元信息 11px、
+   组间距 12-14px。列表用细线分段，不再每行一个盒子，靠留白与字重分层。
+   形状锁定：按钮与输入 --r-sm，卡片与面板 --r-md，抽屉与模态 --r-lg */
+
+/* 元信息不再低于 11px：10px 的中文在 150% 缩放的屏幕上几乎看不清 */
+.chapter-meta, .search-shortcut, .memory-document-meta, .ai-detection-updated,
+.editor-statusbar, .status-item, .status-button { font-size: 11px; }
+
+/* 控件统一：高度、内边距、字重、悬停一致 */
+.editor-tool-button {
+  min-height: 28px;
+  padding: 5px 10px;
+  border-color: var(--line);
+  background: var(--surface-raised);
+  color: var(--text-3);
+  font-size: 12px;
+}
+.editor-tool-button:hover { border-color: var(--accent-line); color: var(--accent-fg); background: var(--accent-tint); }
+.editor-tool-button.active { border-color: var(--accent-line); color: var(--accent-fg); background: var(--accent-tint); }
+.chapter-editor-toolbar .editor-tool-button { min-height: 26px; padding: 4px 9px; }
+.chapter-editor-toolbar { gap: 6px; padding: 10px 18px; }
+.chapter-editor-toolbar .chapter-settings-wrap { margin-left: auto; }
+
+.input, .textarea, .select { min-height: 28px; padding: 5px 9px; border-color: var(--line); font-size: 12.5px; }
+.btn-secondary, .btn-primary, .btn-ghost { min-height: 30px; padding: 6px 12px; font-size: 12.5px; }
+.icon-button { min-height: 28px; padding: 0 8px; }
+.link-button { font-size: 11.5px; }
+
+/* 目录：细线行 + 选中一根竖线，不再一行一个盒子 */
+.chapters-list { padding: 4px 0 8px; }
+.chapter-item { padding: 8px 12px; background: transparent; border: none; border-left: 3px solid transparent; border-radius: 0; border-bottom: 1px solid var(--line); }
+.chapter-item:hover { background: var(--surface-raised); border-bottom-color: var(--line); border-left-color: var(--line-strong); }
+.chapter-item.active { background: var(--accent-tint); border-left-color: var(--accent); }
+.chapter-item.active .chapter-title { color: var(--accent-fg); font-weight: 600; }
+.chapter-title { font-size: 12.5px; line-height: 1.5; }
+.chapter-meta { margin-top: 2px; line-height: 1.4; }
+
+/* 资料列表同一套行 */
+.outline-document-item, .knowledge-card-item, .memory-item, .ai-detection-item {
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  border-bottom: 1px solid var(--line);
+}
+.outline-document-item:hover, .knowledge-card-item:hover, .memory-item:hover { background: var(--surface-raised); }
+.outline-document-item.active, .knowledge-card-item.active { background: var(--accent-tint); border-left-color: var(--accent); }
+
+/* 面板：标题、分组间距、说明文字统一 */
+.panel-section-title { margin-bottom: 10px; font-size: 12.5px; }
+.panel-section-title span { font-size: 11px; }
+.chapter-target-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+.chapter-target-row > label { color: var(--text-4); }
+.empty-hint { font-size: 12px; line-height: 1.7; }
+.empty-hint.compact { font-size: 11.5px; }
+
+/* 右栏与任务面板里的分组也不再套盒子 */
+.agent-panel-header { padding: 10px 12px; }
+.agent-task-section .panel-section-title { color: var(--text-2); }
+
+/* ── 对齐设计稿：章头、chip、控件形态 ──────────────────────────────
+   稿子里的控件一律白底 + 一根细边，悬停才染强调色；app 原来是灰底方块
+   （--surface-sunken / --line 填充），视觉重量比稿子重一档 */
+
+/* 章头：标题一行、右侧小链接、下面一排 chip，中间没有灰底工具条 */
+.chapter-title-wrap { display: flex; align-items: center; gap: 10px; padding: 18px 28px 0; }
+.chapter-title-input { flex: 1; min-width: 0; width: auto; padding: 0; font-family: var(--ui-font); font-size: 19px; font-weight: 600; line-height: 1.35; }
+.chapter-title-input::placeholder { color: var(--text-6); font-weight: 400; }
+.chapter-head-links { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.chapter-head-links .link-button { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: var(--r-sm); color: var(--text-5); font-size: 11.5px; }
+.chapter-head-links .link-button:hover:not(:disabled) { background: var(--accent-tint); color: var(--accent-fg); }
+.chapter-head-links .link-button.active { background: var(--accent-tint); color: var(--accent-fg); }
+.chapter-head-links .link-button:disabled { color: var(--text-6); }
+.chapter-quick-copy-button { height: 26px; padding: 4px 10px; margin-right: 0; border: 1px solid var(--line); border-radius: var(--r-sm); background: transparent; color: var(--text-5); font-size: 11.5px; }
+.chapter-quick-copy-button:hover { border-color: var(--accent-line); color: var(--accent-fg); }
+
+/* chip：胶囊 + 细边 + 11.5px，和稿子一致 */
+.chapter-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 12px 28px 10px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border: 1px solid var(--line); border-radius: var(--r-full); background: transparent; color: var(--text-4); font-size: 11.5px; line-height: 1.5; }
+.chip b { color: var(--text-2); font-weight: 600; }
+.chip:hover { border-color: var(--accent-line); color: var(--accent-fg); }
+.chip.active { border-color: var(--accent-line); background: var(--accent-tint); color: var(--accent-fg); }
+.chip.warn { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-fg); }
+.chip.warn b { color: var(--warn-fg); }
+
+/* 控件形态：白底细边，悬停染强调色 */
+.btn-back, .icon-button, .btn-secondary, .editor-tool-button, .status-button {
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  color: var(--text-3);
+}
+.btn-back { padding: 6px 10px; border-radius: var(--r-sm); }
+.btn-back:hover, .icon-button:hover, .btn-secondary:hover, .editor-tool-button:hover { border-color: var(--accent-line); background: var(--accent-tint); color: var(--accent-fg); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-fg); border-color: var(--accent-fg); }
+.input, .textarea, .select { background: var(--surface-raised); border-color: var(--line); }
+.input:focus, .textarea:focus, .select:focus { border-color: var(--accent-line); }
+.chapters-search .input { background: var(--surface-raised); }
+
+/* 目录头：书名下面的章节数与总字数 */
+.chapters-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 12px 14px 8px; }
+.chapters-head strong { color: var(--text-3); font-size: 12px; }
+.chapters-head small { color: var(--text-5); font-size: 11px; font-variant-numeric: tabular-nums; }
+.chapters-footer .btn-secondary { border-style: dashed; background: transparent; }
+.chapters-footer .btn-secondary:hover { border-style: solid; }
+
+/* ── 窄屏：并排放不下三栏，左栏改成抽屉，右栏浮在上面，底部给四个入口 ──
+   之前窄屏没有任何入口，左栏和右栏都打不开，只能看正文 */
+.editor-mobile-bar { display: none; }
+@media (max-width: 900px) {
+  .editor-body { position: relative; }
+  .editor-sidebar { position: fixed; z-index: 30; top: 64px; bottom: 96px; left: 0; display: none; width: 280px; max-width: 86%; box-shadow: var(--shadow-2); }
+  .editor-body.rail-open .editor-sidebar { display: flex; }
+  .agent-panel { position: fixed; z-index: 30; top: 64px; bottom: 96px; right: 0; width: 330px; max-width: 90%; box-shadow: var(--shadow-2); }
+  .editor-mobile-bar { display: flex; align-items: center; justify-content: space-around; height: 52px; flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--surface-raised); }
+  .editor-mobile-bar button { display: grid; justify-items: center; gap: 3px; padding: 6px 12px; border: none; background: transparent; color: var(--text-4); font-size: 10.5px; }
+  .editor-mobile-bar button.active { color: var(--accent-fg); }
+  .editor-title > span { display: none; }
+  .editor-statusbar .status-item:nth-child(2),
+  .editor-statusbar .status-item:nth-child(3) { display: none; }
+}
+
+/* ── 任务视图：原「写作操作台」从浮层变成第一层视图 ──────────────
+   顶栏三段（写作 / 资料 / 任务）里的一段，不再是压在正文上的窗口 */
+.editor-body.view-tasks .editor-main > *:not(.tasks-view) { display: none; }
+.editor-body.view-tasks .agent-panel { display: none; }
+.editor-body.view-tasks .side-tasks { display: flex; }
+.editor-body.view-tasks .editor-mobile-bar { display: flex; }
+.tasks-view { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items: start; overflow-y: auto; }
+.tasks-view > .agent-task-section { display: grid; gap: 10px; padding: 16px 20px; border-left: 1px solid var(--line); align-content: start; }
+.tasks-view > .agent-task-section:first-child { border-left: none; }
+.tasks-view .panel-section-title { display: flex; align-items: baseline; gap: 8px; color: var(--text-2); }
+.tasks-view .ai-writing-tool-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tasks-view .agent-review-list { max-height: 40vh; overflow-y: auto; }
+.side-tasks { display: none; }
+.side-tasks .thread { flex: 1; min-height: 0; overflow-y: auto; }
+
+/* 任务视图：左栏用自己的列表，页签在任务视图里不出现 */
+.editor-body.view-tasks .editor-sidebar-tabs { display: none; }
+.editor-body.view-tasks .pane-resizer-y { display: none; }
+.side-tasks { flex-direction: column; }
+.side-tasks .agent-panel-header strong { font-size: 12.5px; color: var(--text-2); }
+.side-tasks .tasks-log { flex: 1; max-height: none; }
+.side-tasks .agent-chat-bubble strong { font-size: 11px; color: var(--text-5); }
+.side-tasks .agent-chat-bubble span { font-size: 12.5px; line-height: 1.7; color: var(--text-2); }
+
+/* 通用：撑开剩余空间（顶栏与面板头都用它把右侧推到边上） */
+.grow { flex: 1; min-width: 0; }
+
+/* 任务视图的目录行与日志头：补两处对齐 */
+.chapters-list .chapter-title, .chapters-list .chapter-meta { display: block; }
+.side-tasks .agent-panel-header .link-button { margin-left: auto; }
+
+/* 右栏：本次写作设置折成一行 chip，展开才给表单（原来五个带边框的盒子摞满一屏） */
+.agent-settings-line { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.agent-settings-line .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--line); border-radius: var(--r-full); background: transparent; color: var(--text-4); font-size: 11.5px; }
+.agent-settings-line .chip b { color: var(--text-2); font-weight: 600; }
+.agent-settings-line .chip:hover { border-color: var(--accent-line); color: var(--accent-fg); }
+.agent-settings-line .chip.active { border-color: var(--accent-line); background: var(--accent-tint); color: var(--accent-fg); }
+
+/* 右栏主操作钉在底部：设置在上、消息居中、写这一章的动作固定在同一个位置 */
+.agent-panel { position: relative; }
+.agent-actions-bar { margin-top: auto; display: grid; gap: 8px; padding: 10px 12px 12px; border-top: 1px solid var(--line); }
+
+/* 右栏：设置在上、会话居中、主操作钉底
+   主操作原来直接跟在设置下面，下面留一大片空白，现在把最后一段推到栏底 */
+.agent-panel-scroll { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.agent-panel-scroll > .agent-task-section { display: flex; flex-direction: column; align-items: stretch; }
+
+/* ── 对齐稿子：栏头挤两行、正文不限宽、纸色 ─────────────────────────
+   1 右栏栏头的两格切换器被模型下拉挤成竖排两行，稿子里是一行两格
+   2 正文铺满整个中栏，稿子里是限宽居中（33em），两边留白对称
+   3 稿子的纸是白的；这版先跟稿子，纸色设置仍然在阅读模式里生效 */
+.agent-panel-header { flex-wrap: nowrap; gap: 8px; }
+.agent-panel-header .view-switch { flex: 0 0 auto; }
+.agent-panel-header .view-switch button { padding: 5px 10px; white-space: nowrap; }
+.agent-panel-header .agent-model-select { flex: 1 1 60px; min-width: 0; max-width: 120px; }
+.agent-settings-line { flex-wrap: wrap; overflow: visible; }
+
+.chapter-editor-wrap { background: var(--surface-raised); }
+.chapter-highlight-layer, .chapter-editor-wrap .chapter-content-editor { max-width: 33em; margin: 0 auto; padding: 28px 0 32px; }
+.chapter-editor-wrap .chapter-highlight-layer { left: 0; right: 0; }
+
+/* ── 照稿子修：任务视图三栏、右栏设置行不再挤滚动条 ──────────────
+   润色续写已归选中文字工具条，只在有草稿时占一整行；三块任务各占一栏 */
+.tasks-view { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; }
+.tasks-view > .agent-task-section { height: 100%; align-content: start; }
+.tasks-view > .agent-task-section:has(.ai-writing-tools) { grid-column: 1 / -1; height: auto; }
+.tasks-log { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px; display: grid; align-content: start; }
+.tasks-log-line { display: flex; align-items: baseline; gap: 8px; padding: 8px 0; border-bottom: 1px dashed var(--line); }
+.tasks-log-line strong { flex: 0 0 68px; color: var(--text-5); font-size: 11px; }
+.tasks-log-line span { color: var(--text-2); font-size: 12.5px; line-height: 1.6; }
+.agent-settings-line { scrollbar-width: none; }
+.agent-settings-line::-webkit-scrollbar { display: none; }
+
+/* 右栏底部输入区：输入框在上，主按钮在下（稿子帧①） */
+.agent-actions-bar .agent-instruction-heading { margin-bottom: 6px; }
+.agent-actions-bar textarea { width: 100%; min-height: 64px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--text-2); font: 12.5px/1.7 var(--ui-font); resize: vertical; }
+
+/* ── 照用户逐条反馈修 ────────────────────────────────────────────
+   ① 写作/资料/任务 这一块在顶栏右侧 ② 章头 chip 是圆角且随正文白底
+   ③ 正文宽度跟着窗口走 ⑤ 右栏里的块用圆角 ⑥ 收起后要有把手能再打开 */
+.editor-title { flex: 1 1 auto; }
+.editor-header-actions { flex: 0 0 auto; }
+.view-switch { flex: 0 0 auto; }
+
+.sheet-head, .chapter-chips { background: var(--surface-raised); }
+.chapter-chips { padding-bottom: 12px; }
+.chapter-chips .chip { border-radius: var(--r-full); }
+.chip { border-radius: var(--r-full); }
+
+.chapter-highlight-layer, .chapter-editor-wrap .chapter-content-editor { width: 100%; max-width: calc(33em + 60px); padding: 6px 30px 32px; }
+
+.agent-task-section { border-radius: var(--r-md); }
+.agent-panel select, .agent-panel textarea, .agent-panel .input, .agent-settings-line .chip { border-radius: var(--r-sm); }
+.agent-card-picker, .agent-instruction-heading { border-radius: var(--r-md); }
+
+.agent-reopen {
+  position: absolute; top: 96px; right: 0; z-index: 25;
+  padding: 10px 8px; border: 1px solid var(--line-strong); border-right: none;
+  border-radius: var(--r-sm) 0 0 var(--r-sm);
+  background: var(--surface-raised); color: var(--text-3);
+  writing-mode: vertical-rl; letter-spacing: .08em; font-size: 11.5px;
+}
+.agent-reopen:hover { border-color: var(--accent-line); color: var(--accent-fg); }
+
+/* 任务视图右栏（运行日志）：给它面板底色，并且能拖宽
+   ponytail: 用 CSS 原生 resize，不另接 pane 控制器；要跟其它面板一样记忆宽度再加 */
+.side-tasks { position: relative; width: var(--pane-agent-panel, 336px); flex-shrink: 0; min-width: 0; overflow: hidden; background: var(--surface); border-left: 1px solid var(--line); }
+.side-tasks .agent-panel-header { background: var(--surface); border-bottom: 1px solid var(--line); }
