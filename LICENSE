@@ -6,10 +6,4 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 The complete license text is available at:
 https://www.gnu.org/licenses/agpl-3.0.txt
 
-Zhizhang is a derivative work of ApiSaverWriter
-(https://github.com/Vaxue/ApiSaverWriter), also released under
-AGPL-3.0-or-later. The upstream copyright notice is retained below as
-required by the license.
-
-Copyright (C) 2026 ApiSaverWriter contributors
 Copyright (C) 2026 Zhizhang contributors
