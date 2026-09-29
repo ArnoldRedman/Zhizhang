@@ -95,6 +95,12 @@ export interface ChapterReviewInput {
   previousChapter?: { title: string; content: string };
   /** 本章作者的要求：作者明确让停在同一场景时，架构视角不判"没推进" */
   instruction?: string;
+  /** 本章信息边界（章纲上填的四个栏）：一致性视角凭它查有没有说破本章不该说的 */
+  brief?: { readerKnows?: string; protagonistKnows?: string; mustHide?: string; hintOnly?: string };
+  /** 作者承诺账里本章到期或踩上节奏的条目：架构视角凭它查该收的线有没有落到场面里 */
+  duePromises?: Array<{ text: string; dueChapter?: number; everyChapters?: number }>;
+  /** 作者还没答的问题：本章不给最终答案可以，写成没发生不行 */
+  openQuestions?: string[];
 }
 
 export interface ChapterReviewMessage {
@@ -133,8 +139,9 @@ const perspectivePrompts: Record<ReviewPerspective, string> = {
 1. 本章有没有发生前文没发生过的事？先对照紧邻上一章原文中的结果（如宣判、死亡、交付），再看账本；已经完成的结果不能退回待定状态，也不能再次发生。命中时记 S1，category 用 consistency，evidence 引本章原句。整章停在上一章那件事里时 advances 记 false、repeatedEvents 写出重复内容。作者要求留在同一场景时只允许继续处理未完成的部分。
 2. 读者为什么翻下一页？结尾落在动作、画面、台词还是总结、抒情、静止？
 3. 构思里安排的事发生了吗？漏了哪件？
-4. 只在人物确实面对彼此的场景检查关系是否可信；不能因为本章没有升温就判失败，不能建议添一处手部动作或物件互动凑指标。若几个人只会点头沉默、说话不像真人，用原句举证。
-5. 按下面八项逐项 PASS / FAIL。人物分得开一项 FAIL 时另记一条 S2，category 用 character，evidence 里并列引用两个人的台词。
+4. 本章的承诺（见下文"本章的边界与承诺"）落到场面里了吗？只被一句话提到、没有具体动作或代价的，记 S2；一条都没落地的，记 S1，category 用 structure。只报事实，不要求作者再加限制。
+5. 只在人物确实面对彼此的场景检查关系是否可信；不能因为本章没有升温就判失败，不能建议添一处手部动作或物件互动凑指标。若几个人只会点头沉默、说话不像真人，用原句举证。
+6. 按下面八项逐项 PASS / FAIL。人物分得开一项 FAIL 时另记一条 S2，category 用 character，evidence 里并列引用两个人的台词。
 ${fanqieRubric}
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话：本章把故事推进到哪","relationshipProgress":"一句话：主角关系这一章走到哪，没推进就写'无'","repeatedEvents":[],"rubric":{"开头吸引力":"PASS","翻页动力":"PASS","情绪节点":"PASS","信息密度":"PASS","实质推进":"PASS","人物在做事":"PASS","人物分得开":"PASS","感情有戏":"PASS"},"findings":[]}。已完成事件被重写或退回待定时 category 用 consistency；其他问题用 structure、platform、character 或 relationship。${findingsSchema}`,
   character: `你是这本书的人物编辑，只出报告，不改正文。对照人物卡读这一章，回答：
@@ -158,13 +165,14 @@ ${fanqieRubric}
 4. 物品归属、称谓、地点、能力边界有没有前后不一致？
 5. 上一章的"下一章承诺"兑现了吗？没兑现算不算断线？
 6. 本章留下哪些下一章必须接住的事（承诺、悬而未决的动作、刚出现的人物物件）？写进 nextChapterRisks。
+7. 本章有没有说破信息边界里"他此刻不说破的"那些事，或把后文才该揭的底提前抖出来（见下文"本章的边界与承诺"）？命中时记 S2，category 用 consistency，evidence 引本章原句。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","nextChapterRisks":["一句一条"],"findings":[]}。category 用 consistency、factual 或 causal；fix 只写事实统一方向（"统一为左臂旧伤"），不写怎么写得更好。${findingsSchema}`,
   solo: `你是这本书的编辑，只出报告，不改正文。对照作品定位、世界观、人物卡、总纲、故事账本读这一章，回答五件事：
 一、推进：先核对紧邻上一章原文中已完成的结果，再看账本。已经宣判、交付、死亡或揭晓的事不能回到待定状态或再次发生；命中时记 S1，category 用 consistency，evidence 引本章原句。整章重复前文则 advances 记 false、repeatedEvents 写清重复内容。留在同一场景可以，只能继续未完成的事。
 二、一致性：人物状态、已知信息、时间线、物品归属、称谓有没有和前文或设定矛盾？只列明确矛盾。
 三、人物：出场的人有没有按自己的性格说话和做选择？遮住名字能不能认出台词是谁说的？有谁一整章只在沉默、点头、"没问"？同一场戏里几个人反应一样的，记 S2，category 用 character。
 四、人物与关系：在本章实际出现的交锋中，人物有没有按自己的处境说话和做选择？只在有具体原句证据时指出人物像模板或交流不可信，不因关系没有每章升温而扣分，不建议用手部动作凑感情线。
-五、结尾：落在动作画面上，还是总结抒情？本章留下哪些下一章必须接住的事，写进 nextChapterRisks。
+六、本章的边界与承诺（见下文"本章的边界与承诺"）：到期的承诺有没有落到具体动作或代价上（一条都没落地记 S1，category 用 structure）；"他此刻不说破的"那些事有没有被说出口或提前揭底（记 S2，category 用 consistency）。只报事实，不要求作者再加限制。
 返回严格 JSON，不要代码围栏：{"verdict":"APPROVE|CONCERNS|REJECT","advances":true,"progress":"一句话","relationshipProgress":"一句话，没推进就写'无'","repeatedEvents":[],"nextChapterRisks":[],"findings":[]}。${findingsSchema}`,
 };
 
@@ -202,7 +210,16 @@ export function chapterReviewRequest(input: ChapterReviewInput, perspective: Rev
     : "";
   const graphSection = wantsGraph && input.knowledgeGraph ? `\n## 知识图谱约束\n${input.knowledgeGraph}\n` : "";
   const contextSection = wantsGraph && input.retrievedContext?.length ? `\n## 已知背景信息\n${input.retrievedContext.join("\n\n")}\n` : "";
-  const constraints = `${cardsSection}${graphSection}${directionSection ? `\n${directionSection}\n` : ""}${contextSection}`;
+  // 本章的边界与承诺只给架构与一致性视角：一个判该收的线落没落，一个判有没有说破。文字视角不掺进来
+  const boundariesSection = wantsDirection ? [
+    input.brief?.mustHide?.trim() ? `本章他此刻不说破的：${compactText(input.brief.mustHide, 500)}` : "",
+    input.brief?.hintOnly?.trim() ? `本章只给一半的：${compactText(input.brief.hintOnly, 500)}` : "",
+    input.brief?.protagonistKnows?.trim() ? `视角人物此刻已经知道：${compactText(input.brief.protagonistKnows, 500)}` : "",
+    input.brief?.readerKnows?.trim() ? `读者已经知道：${compactText(input.brief.readerKnows, 500)}` : "",
+    input.duePromises?.length ? `本章到期的承诺：\n${input.duePromises.slice(0, 8).map(item => `- ${compactText(item.text, 200)}${item.dueChapter ? `（期限第 ${item.dueChapter} 章）` : ""}${item.everyChapters ? `（每 ${item.everyChapters} 章一次）` : ""}`).join("\n")}` : "",
+    input.openQuestions?.length ? `作者还没拍板：${input.openQuestions.slice(0, 8).map(item => compactText(item.trim(), 200)).filter(Boolean).join("；")}` : "",
+  ].filter(Boolean).join("\n") : "";
+  const constraints = `${cardsSection}${graphSection}${directionSection ? `\n${directionSection}\n` : ""}${boundariesSection ? `\n## 本章的边界与承诺\n${boundariesSection}\n` : ""}${contextSection}`;
   const reviewPrompt = [historyNote, `## 约束摘要\n${constraints || "（暂无额外约束）"}\n\n## 待审查章节\n${input.draftContent}`].filter(Boolean).join("\n\n");
   const session = splitSessionContext(input.sessionContext);
   const messages: ChapterReviewMessage[] = [

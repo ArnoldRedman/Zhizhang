@@ -21,6 +21,7 @@ export const writingGuideFacts = (title: unknown, content: string): string => {
     .join("\n\n").trim();
 };
 export { draftAcceptanceIssues } from "./chapter-acceptance.js";
+export { mentionsFutureChapter, omitFutureChapterFacts } from "./future-facts.js";
 export { detectQuoteStyle, normalizePauses, normalizeQuotes } from "./punctuation.js";
 export type { PunctuationReport, QuoteStyle } from "./punctuation.js";
 

@@ -147,6 +147,47 @@ export function authorAnswersSection(answers: Array<{ question: string; answer: 
   return `## 作者已答复（你之前问过的，按答复写，不要再问）\n${items.map(item => `- 问：${compactText(item.question, 240)}\n  答：${compactText(item.answer, 400)}`).join("\n")}`;
 }
 
+export interface ChapterBrief {
+  readerKnows?: string;
+  protagonistKnows?: string;
+  mustHide?: string;
+  hintOnly?: string;
+}
+
+/** 信息边界每章最多两条：一次塞四条，人物就只剩闭嘴和不动两种动作，比漏一条代价大 */
+const chapterBriefLineLimit = 2;
+
+/**
+ * 写之前的边界：信息控制、到期承诺、还没拍板的问题。三段都空就不出现
+ * 一律写成「本章要做什么」，不写「不许做什么」：本书实测过负向约束堆多了，模型最省事的执行方式就是让角色不说话、不做动作，
+ * 整章停在「他没问、他没说、他没停」，同一件事连着写十章。所以隐瞒要翻译成「用别的说法盖过去」而不是「不能说」
+ */
+export function writingConstraintsSection(input: {
+  brief?: ChapterBrief;
+  duePromises?: Array<{ text: string; dueChapter?: number; everyChapters?: number }>;
+  openQuestions?: string[];
+}): string {
+  const brief = input.brief;
+  // 优先保「必须隐瞒」（漏了会把后面的底提前抖出来），其次「只给一半」，再者视角人物的已知范围
+  const candidates = [
+    brief?.mustHide?.trim() ? `他此刻不说破的：${compactText(brief.mustHide, 500)}。嘴上用别的话盖过去，手上照做，该有的对话和动作一样不少` : "",
+    brief?.hintOnly?.trim() ? `先露一半：${compactText(brief.hintOnly, 500)}，用具体动作或对话交代一半，别一次说完` : "",
+    brief?.protagonistKnows?.trim() ? `视角人物此刻已经知道：${compactText(brief.protagonistKnows, 500)}` : "",
+    brief?.readerKnows?.trim() ? `读者已经知道：${compactText(brief.readerKnows, 500)}，不用再解释一遍，直接往下写` : "",
+  ].filter(Boolean);
+  const lines = candidates.slice(0, chapterBriefLineLimit);
+  const briefBlock = lines.length ? `## 本章信息边界\n${lines.join("\n")}` : "";
+  const promises = (input.duePromises || []).filter(item => item.text?.trim()).slice(0, 8);
+  const promiseBlock = promises.length
+    ? `## 本章要碰到的承诺\n${promises.map(item => `- ${compactText(item.text, 200)}${item.dueChapter ? `（期限第 ${item.dueChapter} 章）` : ""}${item.everyChapters ? `（每 ${item.everyChapters} 章一次）` : ""}`).join("\n")}\n每条落到一个具体场面：谁做了什么、说了哪句话、付了什么代价。本书的其他线按原有节奏继续走。`
+    : "";
+  const questions = (input.openQuestions || []).map(item => item.trim()).filter(Boolean).slice(0, 8);
+  const questionBlock = questions.length
+    ? `## 尚未拍板\n${questions.map(item => `- ${compactText(item, 200)}`).join("\n")}\n本章围绕它给一次具体的进展或表态：人物可以做选择、可以试探、可以摊开一半，只是不给出最终答案。`
+    : "";
+  return [briefBlock, promiseBlock, questionBlock].filter(Boolean).join("\n\n");
+}
+
 /**
  * 作品定位：类型、标签、简介、主角
  * 以前只有卡片和大纲生成看得到简介，写正文的模型不知道这本书是"慢热高甜"还是"权谋清算"，
@@ -304,6 +345,12 @@ export const ChapterState = Annotation.Root({
   recentEndings: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   /** 上一章记忆里的"下一章承诺"：构思要回应它，一致性审查查它兑现了没 */
   previousPromise: Annotation<string | undefined>,
+  /** 章纲上的信息边界；隐瞒没填时由桌面端用上一章作者真相补上 */
+  chapterBrief: Annotation<ChapterBrief | undefined>,
+  /** 作者承诺账里到期或踩上节奏的条目 */
+  duePromises: Annotation<Array<{ text: string; dueChapter?: number; everyChapters?: number }>>({ reducer: (_prev, next) => next, default: () => [] }),
+  /** 作者还没答的问题：本章可以绕开，不能写死 */
+  openQuestions: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   /** 作者允许的字面片段：验证门对命中它们的风格类问题不报 */
   allowedPhrases: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   /** 项目绑定的对标拆书的全书聚合：构思看情绪模块与节奏表，正文只带一段同基调锚点 */
@@ -387,6 +434,7 @@ function chapterMaterialPacket(state: ChapterStateType): string {
     ? `\n## 前文章节（按时间顺序；有裁剪标记的为摘录）\n${state.previousChapters.map(chapter => `### ${chapter.title}\n${chapter.content}`).join("\n\n")}\n`
     : state.continuityContext ? `\n## 上一章结尾\n${state.continuityContext}\n` : "";
   const promiseSection = state.previousPromise ? `\n## 上一章留给本章的事\n${state.previousPromise}\n` : "";
+  const constraints = writingConstraintsSection({ brief: state.chapterBrief, duePromises: state.duePromises, openQuestions: state.openQuestions });
   const directionSection = storyDirectionPacket(state);
   // 重写历史章：卡片正文和设定文档里难免写着后面章的事（"第 204 章体检""第 194 章改称阿妄"），这些在本章时点还没发生
   const number = typeof state.chapterNumber === "number" ? state.chapterNumber : 0;
@@ -400,7 +448,7 @@ function chapterMaterialPacket(state: ChapterStateType): string {
   const referenceSection = state.referenceChapters?.length
     ? `\n## 作者选定的文风参考\n参考表达和人物表现，事件时点以正在写的章节为准：\n${state.referenceChapters.map(chapter => `### ${chapter.title}\n${chapter.content}`).join("\n\n")}\n`
     : "";
-  return [skillsSection, historyNote, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, continuitySection, promiseSection, contextSection, followingSection, referenceSection].filter(Boolean).join("");
+  return [skillsSection, historyNote, directionSection ? `\n${directionSection}\n` : "", outlineSection, cardsSection, continuitySection, promiseSection, constraints ? `\n${constraints}\n` : "", contextSection, followingSection, referenceSection].filter(Boolean).join("");
 }
 
 /** 修订类调用（验证门定向修订、事实矛盾定点修订）返回的整章正文：剥围栏、标题行与【给作者】，和首稿走同一套拆法 */
@@ -665,6 +713,10 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         previousPromise: state.previousPromise,
         previousChapter: state.previousChapters?.at(-1),
         instruction: state.instruction,
+        // 信息边界、到期承诺、未决问题也交给审查：写作时不许再加约束，该由审查来发现「该收的线没落」「说破了不该说的」
+        brief: state.chapterBrief,
+        duePromises: state.duePromises,
+        openQuestions: state.openQuestions,
       }, state.lintFindings, (perspective, index, total) => emitter?.progress("review", 75 + Math.round(index / total * 18), `${perspectiveLabel(perspective)}（${index + 1}/${total}）`));
       emitter?.progress("review", 94, `审查完成：${result.verdict}，${result.findings.length} 条`);
       const contextReport = state.contextReport ? { ...state.contextReport, reviewInputBytes: inputBytes } : undefined;

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isPlaceholderOutline, isWorkLogDocumentTitle, writingGuideFacts } from "@zhizhang/contracts";
+import { isPlaceholderOutline, isWorkLogDocumentTitle, omitFutureChapterFacts, writingGuideFacts } from "@zhizhang/contracts";
 
 export interface ContextReport {
   cache: "hit" | "miss";
@@ -1045,6 +1045,11 @@ export function prepareChapterInput(input: {
 }): PreparedChapterInput {
   const budgetBytes = contextBudgetBytes(input.contextWindowKTokens);
   const contextProfile = resolveContextProfile(input.instruction);
+  // 重写还没写到的章：卡片、总纲、设定里更晚的章号是未来，整句丢掉。最新章保留后面的规划
+  const historicalChapter = input.chapterPosition?.number && input.chapterPosition.total && input.chapterPosition.number < input.chapterPosition.total
+    ? input.chapterPosition.number
+    : 0;
+  const scrub = (text: string) => historicalChapter ? omitFutureChapterFacts(text, historicalChapter) : text;
   const weights = CONTEXT_PROFILE_WEIGHTS[contextProfile];
   const allOutlines = Array.isArray(input.outlines)
     ? input.outlines.filter(item => item && typeof item === "object") as ContextOutline[]
@@ -1056,7 +1061,7 @@ export function prepareChapterInput(input: {
     .map(item => ({ ...item, content: writingGuideFacts(item.title, String(item.content || "")) }))
     .filter(item => item.content.trim())
     .sort((left, right) => String(left.id ?? left.title ?? "").localeCompare(String(right.id ?? right.title ?? ""), "zh-CN"))
-    .map(item => `## ${compactText(item.title || item.kind || "世界观与作品设定", 80)}\n${compactText(stripProgressSnapshots(String(item.content)), worldSettingDocumentBytes(input.contextWindowKTokens))}`)
+    .map(item => `## ${compactText(item.title || item.kind || "世界观与作品设定", 80)}\n${compactText(scrub(stripProgressSnapshots(String(item.content))), worldSettingDocumentBytes(input.contextWindowKTokens))}`)
     .join("\n\n");
   // 总纲不参与相关度排序，也不走头尾截断：它有自己的骨架加相关段落的压法
   const masterOutlineSource = allOutlines
@@ -1065,7 +1070,12 @@ export function prepareChapterInput(input: {
     .map(item => String(item.content))
     .join("\n\n");
   const outlines = allOutlines.filter(item => item.kind !== "世界观与作品设定" && item.kind !== "总纲" && !isPlaceholderOutline(item.content));
-  const cards = Array.isArray(input.cards) ? input.cards.filter(item => item && typeof item === "object") as ContextCard[] : [];
+  const cards = (Array.isArray(input.cards) ? input.cards.filter(item => item && typeof item === "object") as ContextCard[] : []).map(card => historicalChapter ? {
+    ...card,
+    content: scrub(String(card.content || "")),
+    currentState: scrub(String(card.currentState || "")),
+    stateHistory: card.stateHistory?.map(entry => ({ ...entry, changes: scrub(String(entry.changes || "")) })),
+  } : card);
   const raw = {
     outline: allOutlines,
     cards,
@@ -1079,8 +1089,8 @@ export function prepareChapterInput(input: {
   };
   const sourceBytes = byteLength(JSON.stringify(raw));
   const text = queryText(input.instruction, outlines, Array.isArray(input.memories) ? input.memories as Array<Record<string, unknown>> : [], cards);
-  const masterOutline = compactMasterOutline(masterOutlineSource, text, masterOutlineBudget(input.contextWindowKTokens), input.chapterPosition?.number);
-  const storyLedger = buildStoryLedger(input.memories, input.chapterPosition, storyLedgerBudget(input.contextWindowKTokens));
+  const masterOutline = scrub(compactMasterOutline(masterOutlineSource, text, masterOutlineBudget(input.contextWindowKTokens), input.chapterPosition?.number));
+  const storyLedger = scrub(buildStoryLedger(input.memories, input.chapterPosition, storyLedgerBudget(input.contextWindowKTokens)));
   const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * weights.outline));
   const packedCards = compactCards(cards, text, Math.floor(budgetBytes * weights.cards));
   const memories = compactMemories(input.memories, Math.floor(budgetBytes * weights.memories));
@@ -1102,7 +1112,7 @@ export function prepareChapterInput(input: {
   const memoryDocuments = Array.isArray(input.memoryDocuments)
     ? input.memoryDocuments.filter(item => item && typeof item === "object" && !isStaleMemoryDocument((item as Record<string, unknown>).content)).slice(0, 5).map(item => {
       const document = item as Record<string, unknown>;
-      return { kind: compactText(document.kind || "记忆文档", 80), title: compactText(document.title || "", 100), content: tailText(document.content || "", memoryDocumentBytes) };
+      return { kind: compactText(document.kind || "记忆文档", 80), title: compactText(document.title || "", 100), content: tailText(scrub(String(document.content || "")), memoryDocumentBytes) };
     })
     : [];
   const sections = {

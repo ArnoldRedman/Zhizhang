@@ -61,6 +61,41 @@ function projectProfileLine(value: unknown): string {
 }
 
 /** 作者对【给作者】提问的答复：一问一答，空的丢掉 */
+function normalizeChapterBrief(value: unknown): { readerKnows?: string; protagonistKnows?: string; mustHide?: string; hintOnly?: string } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  const pick = (key: string) => typeof item[key] === "string" ? item[key].trim().slice(0, 800) : "";
+  const brief = {
+    readerKnows: pick("readerKnows") || undefined,
+    protagonistKnows: pick("protagonistKnows") || undefined,
+    mustHide: pick("mustHide") || undefined,
+    hintOnly: pick("hintOnly") || undefined,
+  };
+  return Object.values(brief).some(Boolean) ? brief : undefined;
+}
+
+function normalizeDuePromises(value: unknown): Array<{ text: string; dueChapter?: number; everyChapters?: number }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(item => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    const text = typeof row.text === "string" ? row.text.trim().slice(0, 240) : "";
+    if (!text) return [];
+    const due = Number(row.dueChapter);
+    const every = Number(row.everyChapters);
+    return [{
+      text,
+      dueChapter: Number.isInteger(due) && due > 0 ? due : undefined,
+      everyChapters: Number.isInteger(every) && every >= 2 ? every : undefined,
+    }];
+  }).slice(0, 8);
+}
+
+function normalizeOpenQuestions(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map(item => item.trim().slice(0, 240)).slice(0, 8);
+}
+
 function normalizeAuthorAnswers(value: unknown): Array<{ question: string; answer: string }> {
   if (!Array.isArray(value)) return [];
   return value
@@ -484,7 +519,7 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
       };
 
       const result = await runProjectAgent({
-        mode: mode === "execute" ? "execute" : "discuss",
+        mode: mode === "execute" || mode === "plan" ? mode : "discuss",
         instruction: String(instruction),
         project: projectRecord,
         onStage: working => Object.assign(projectRecord, working),
@@ -763,6 +798,10 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
         previousPromise: typeof req.params?.previousPromise === "string" ? req.params.previousPromise : undefined,
         previousChapter: prepared.previousChapters.at(-1),
         chapterPlan: prepared.outline,
+        // 旧章审查看的是同一份边界：章纲上填的四个栏、作者承诺账里本章到期的条目、还没拍板的问题
+        brief: normalizeChapterBrief(req.params?.chapterBrief),
+        duePromises: normalizeDuePromises(req.params?.duePromises),
+        openQuestions: normalizeOpenQuestions(req.params?.openQuestions),
       }, lintFindings);
       const usage = usages.reduce<Record<string, number>>((sum, item) => {
         for (const [key, value] of Object.entries(item)) sum[key] = (sum[key] || 0) + (Number(value) || 0);
@@ -973,6 +1012,9 @@ ${chapterContent}${compactCardContext}${nameTableContext}${compactGraphContext}
           recentOpenings: stringList(req.params?.recentOpenings, 6),
           recentEndings: stringList(req.params?.recentEndings, 6),
           previousPromise: typeof req.params?.previousPromise === "string" ? req.params.previousPromise : undefined,
+          chapterBrief: normalizeChapterBrief(req.params?.chapterBrief),
+          duePromises: normalizeDuePromises(req.params?.duePromises),
+          openQuestions: normalizeOpenQuestions(req.params?.openQuestions),
           allowedPhrases: stringList(req.params?.allowedPhrases, 60),
           benchmark: normalizeBenchmark(req.params?.benchmark),
         });

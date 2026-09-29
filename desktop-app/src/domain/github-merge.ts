@@ -118,7 +118,8 @@ export const mergeGithubProject = (local: Project, remote: Project): GithubMerge
   const [memoryDocuments, documentCount] = mergeCollection(local.memoryDocuments || [], remote.memoryDocuments || []);
   const [graphNodes, nodeCount] = mergeCollection(local.graphNodes || [], remote.graphNodes || []);
   const [graphEdges, edgeCount] = mergeCollection(local.graphEdges || [], remote.graphEdges || []);
-  result.otherUpdates = outlineCount + cardCount + memoryCount + documentCount + nodeCount + edgeCount;
+  const [promises, promiseCount] = mergeCollection(local.promises || [], remote.promises || []);
+  result.otherUpdates = outlineCount + cardCount + memoryCount + documentCount + nodeCount + edgeCount + promiseCount;
   // 每日码字量两边各记各的，同一天取大的那个，相加会重复统计
   const dailyWords: Record<string, number> = { ...remote.dailyWords, ...local.dailyWords };
   for (const [day, words] of Object.entries(remote.dailyWords || {})) dailyWords[day] = Math.max(words, dailyWords[day] || 0);
@@ -133,6 +134,7 @@ export const mergeGithubProject = (local: Project, remote: Project): GithubMerge
     memoryDocuments,
     graphNodes,
     graphEdges,
+    ...(local.promises?.length || remote.promises?.length ? { promises } : {}),
     dailyWords,
     wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
   };

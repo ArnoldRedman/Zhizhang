@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { authorAnswersSection, projectProfileSection, selectSkillsByIntent } from "../src/graphs/chapter-write.graph.js";
+import { authorAnswersSection, projectProfileSection, selectSkillsByIntent, writingConstraintsSection } from "../src/graphs/chapter-write.graph.js";
 
 describe("chapter skill intent selection", () => {
   const catalog = [
@@ -86,5 +86,36 @@ describe("authorAnswersSection", () => {
     expect(section).not.toContain("电台频率");
     expect(authorAnswersSection([])).toBe("");
     expect(authorAnswersSection(undefined)).toBe("");
+  });
+});
+
+describe("writingConstraintsSection", () => {
+  it("信息边界、到期承诺和未决问题进提示词，空的不出现", () => {
+    const section = writingConstraintsSection({
+      brief: { readerKnows: "读者知道灯还亮着", mustHide: "守夜人是父亲" },
+      duePromises: [{ text: "灯塔的枪得响", dueChapter: 130 }],
+      openQuestions: ["枪是谁的"],
+    });
+    // 隐瞒要写成「用别的说法盖过去」：只写「不能说破」时，模型最省事的执行方式就是让人物闭嘴、什么都不做
+    expect(section).toContain("他此刻不说破的：守夜人是父亲");
+    expect(section).toContain("嘴上用别的话盖过去");
+    expect(section).toContain("灯塔的枪得响（期限第 130 章）");
+    expect(section).toContain("每条落到一个具体场面");
+    expect(section).toContain("枪是谁的");
+    expect(section).toContain("只是不给出最终答案");
+    // 未拍的板不许写成「可以绕开」:那是教模型什么都不做
+    expect(section).not.toContain("可以绕开");
+    expect(section).not.toContain("不能说破");
+    expect(writingConstraintsSection({})).toBe("");
+  });
+
+  it("信息边界每章最多两条，优先留必须隐瞒与只给一半", () => {
+    const section = writingConstraintsSection({
+      brief: { readerKnows: "读者早就知道", protagonistKnows: "主角早就知道", mustHide: "底不能透", hintOnly: "信只露一半" },
+    });
+    expect(section).toContain("底不能透");
+    expect(section).toContain("信只露一半");
+    expect(section).not.toContain("读者早就知道");
+    expect(section).not.toContain("主角早就知道");
   });
 });

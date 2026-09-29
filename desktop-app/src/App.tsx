@@ -19,13 +19,15 @@ import { candidateExcerpts, deriveCardCandidates, ignoreCardCandidate, type Deri
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
 import { boundChapterOutlineFor, buildChapterWriteContext, defaultChapterInstruction, effectiveCards, masterOutlineHasChapterEntry, stageBeatsFor, stageBeatsTitle, stageRangeFor } from './features/chapter-agent/context';
+import { ChapterBriefFields, PromiseLedger } from './features/story-ledger/panels';
+import { replacePromises } from './domain/promises';
 import { draftAcceptanceIssues } from './features/chapter-agent/acceptance';
 import { analyzeAIChapter, buildAIDetectionReport } from './domain/ai-detection';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
 import type { DismantleChapter, DismantleBook, DismantleAggregate, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
-import { projectAgentSessionId, chapterOutlineNumber, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
+import { projectAgentSessionId, chapterOutlineNumber, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentMode, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
 import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
 import { readerFonts, themes, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
 import { usePaneSizes } from './features/editor/use-pane-sizes';
@@ -4684,11 +4686,12 @@ function App() {
     setProjectAgentProgress(0);
   };
 
-  const runProjectAgentChat = async () => {
+  const runProjectAgentChat = async (override?: { instruction: string; mode?: ProjectAgentMode }) => {
     const project = editingProjectRef.current;
     const session = projectAgentSessionRef.current;
-    const instruction = projectAgentInput.trim();
+    const instruction = (override?.instruction ?? projectAgentInput).trim();
     if (!project || !session || !instruction || projectAgentRunning) return;
+    const mode = override?.mode ?? session.mode;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写模型 API Key，再运行项目 Agent。' });
       return;
@@ -4698,18 +4701,18 @@ function App() {
     projectAgentRunRef.current = runId;
     // 发送时无条件回到底部：作者刚输入完，一定是在看最新一轮
     projectAgentPinnedRef.current = true;
-    setProjectAgentInput('');
+    if (!override) setProjectAgentInput('');
     setProjectAgentRunning(true);
     setProjectAgentProgress(1);
     setProjectAgentActivity([{ id: 'starting', message: '正在启动项目 Agent', status: 'active' }]);
-    setProjectAgentSession(current => current ? { ...current, messages: [...current.messages, userMessage], updatedAt: new Date().toISOString() } : current);
+    setProjectAgentSession(current => current ? { ...current, mode: mode || current.mode, messages: [...current.messages, userMessage], updatedAt: new Date().toISOString() } : current);
     try {
       await invoke<string>('start_agent_runtime');
       const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
       const result = await agentRpc<ProjectAgentResponse>('project.agent.chat', {
           runId,
           sessionId: session.sessionId,
-          mode: session.mode,
+          mode,
           instruction,
           project,
           activeChapterId: activeChapter?.id,
@@ -7338,7 +7341,7 @@ function App() {
               <div><strong>项目 Agent</strong><small>仅操作《{editingProject.title}》</small></div>
               <div className="project-agent-header-actions"><button className="icon-button" title="新建会话" disabled={projectAgentRunning} onClick={startNewProjectAgentSession}><Icon name="plus" size={15} /></button><button className="icon-button" title="关闭" onClick={() => setShowProjectAgent(false)}><Icon name="x" size={15} /></button></div>
             </header>
-            <div className="project-agent-mode" role="tablist" aria-label="项目 Agent 模式"><button className={projectAgentSession?.mode === 'discuss' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'discuss' } : current)}>讨论</button><button className={projectAgentSession?.mode === 'execute' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'execute' } : current)}>执行</button></div>
+            <div className="project-agent-mode" role="tablist" aria-label="项目 Agent 模式"><button className={projectAgentSession?.mode === 'discuss' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'discuss' } : current)}>讨论</button><button className={projectAgentSession?.mode === 'plan' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'plan' } : current)}>计划</button><button className={projectAgentSession?.mode === 'execute' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'execute' } : current)}>执行</button></div>
             <div
               className="project-agent-messages"
               ref={projectAgentMessagesRef}
@@ -7348,11 +7351,11 @@ function App() {
                 projectAgentPinnedRef.current = scrollHeight - scrollTop - clientHeight < 48;
               }}
             >
-              {!projectAgentSession ? <div className="project-agent-empty"><strong>正在读取会话</strong></div> : projectAgentSession.messages.length === 0 ? <div className="project-agent-empty"><strong>讨论全书，或让 Agent 整理项目</strong><span>执行模式下，所有写入都会先生成待确认变更。</span></div> : projectAgentSession.messages.map(message => <article key={message.id} className={`project-agent-message ${message.role} ${message.error ? 'error' : ''}`}><small>{message.role === 'user' ? '你' : '项目 Agent'}</small><p>{message.content}</p>{message.toolEvents?.length ? <div className="project-agent-tools">{message.toolEvents.map((event, index) => <span className={event.status} key={`${message.id}-${event.tool}-${index}`}><b>{event.tool}</b>{event.message}</span>)}</div> : null}</article>)}
+              {!projectAgentSession ? <div className="project-agent-empty"><strong>正在读取会话</strong></div> : projectAgentSession.messages.length === 0 ? <div className="project-agent-empty"><strong>讨论全书，或让 Agent 整理项目</strong><span>计划模式只出方案。执行模式下，所有写入都会先生成待确认变更。</span></div> : projectAgentSession.messages.map(message => <article key={message.id} className={`project-agent-message ${message.role} ${message.error ? 'error' : ''}`}><small>{message.role === 'user' ? '你' : '项目 Agent'}</small><p>{message.content}</p>{projectAgentSession.mode === 'plan' && message.role === 'assistant' && !message.error && message.id === [...projectAgentSession.messages].reverse().find(item => item.role === 'assistant' && !item.error)?.id ? <button type="button" className="btn-secondary" disabled={projectAgentRunning} onClick={() => void runProjectAgentChat({ instruction: `按下面已确认的方案执行。只生成待确认变更，不要扩大范围。\n\n${message.content}`, mode: 'execute' })}>按此方案执行</button> : null}{message.toolEvents?.length ? <div className="project-agent-tools">{message.toolEvents.map((event, index) => <span className={event.status} key={`${message.id}-${event.tool}-${index}`}><b>{event.tool}</b>{event.message}</span>)}</div> : null}</article>)}
               {projectAgentRunning && <section className="project-agent-running" aria-live="polite"><div><strong>正在处理项目</strong><span>{projectAgentProgress}%</span></div><i><b style={{ width: `${projectAgentProgress}%` }} /></i>{projectAgentActivity.map(item => <span className={item.status} key={item.id}>{item.message}</span>)}</section>}
               {projectAgentPendingChanges.length > 0 && <section className="project-agent-changes"><header><div><strong>待确认变更</strong><small>{projectAgentPendingChanges.length} 项，应用前不会写入</small></div><button className="link-button" disabled={projectAgentRunning} onClick={() => dismissProjectAgentChanges()}>全部放弃</button></header>{projectAgentPendingChanges.map(change => <article key={change.id}><div><strong>{projectAgentChangeLabel(change)}</strong><small>{change.summary}</small><span>{projectAgentChangeDetail(change)}</span><details><summary>预览内容</summary><pre>{projectAgentChangePreview(change)}</pre></details><div className="project-agent-change-actions"><button className="btn-secondary" disabled={projectAgentRunning} onClick={() => dismissProjectAgentChanges([change.id])}>放弃</button><button className="btn-primary" disabled={projectAgentRunning} onClick={() => void applyPendingProjectAgentChanges([change.id])}>应用</button></div></div></article>)}<button className="btn-primary" disabled={projectAgentRunning} onClick={() => void applyPendingProjectAgentChanges()}>应用全部变更</button></section>}
             </div>
-            <footer className="project-agent-composer"><textarea value={projectAgentInput} disabled={!projectAgentSession || projectAgentRunning} onChange={event => setProjectAgentInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void runProjectAgentChat(); } }} placeholder={projectAgentSession?.mode === 'execute' ? '例如：整理所有角色卡，并补充知识图谱关系' : '询问全书设定、剧情、人物或伏笔'} /><div><small>Ctrl / ⌘ + Enter 发送</small><button className="btn-primary" disabled={!projectAgentInput.trim() || !projectAgentSession || projectAgentRunning} onClick={() => void runProjectAgentChat()}>{projectAgentRunning ? '处理中...' : '发送'}</button></div></footer>
+            <footer className="project-agent-composer"><textarea value={projectAgentInput} disabled={!projectAgentSession || projectAgentRunning} onChange={event => setProjectAgentInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void runProjectAgentChat(); } }} placeholder={projectAgentSession?.mode === 'execute' ? '例如：整理所有角色卡，并补充知识图谱关系' : projectAgentSession?.mode === 'plan' ? '先说要改什么，这一轮只出方案' : '询问全书设定、剧情、人物或伏笔'} /><div><small>Ctrl / ⌘ + Enter 发送</small><button className="btn-primary" disabled={!projectAgentInput.trim() || !projectAgentSession || projectAgentRunning} onClick={() => void runProjectAgentChat()}>{projectAgentRunning ? '处理中...' : '发送'}</button></div></footer>
           </aside>}
 
           {notice && (
@@ -7569,6 +7572,7 @@ function App() {
                     <button className="btn-add-chapter" onClick={() => setShowOutlineTypeModal(true)}>+ 新建大纲</button>
                     <button className="outline-location-button" onClick={handleOpenOutlineLocation}>打开位置</button>
                   </div>
+                  <PromiseLedger promises={editingProject.promises || []} onChange={promises => updateEditorProject(project => replacePromises(project, promises))} />
                   <div className="outline-document-list">
                     {groupOutlines(editingProject.outlines).map(({ group, items }) => {
                       const collapsed = collapsedOutlineGroups.has(group);
@@ -7787,6 +7791,7 @@ function App() {
                   {activeOutline ? <>
                     <div className="outline-workspace-header"><div><span>{activeOutline.kind}</span><input className="outline-title-input" value={activeOutline.title} onChange={event => updateActiveOutline({ title: event.target.value })} placeholder="大纲标题" /><small>Markdown 大纲文档 · 内容会自动保存{outlineKeepsHistory(activeOutline.kind) ? ' · 模型覆盖前自动留底' : ''}</small></div><div className="outline-workspace-actions">{outlineKeepsHistory(activeOutline.kind) && <button className="editor-tool-button" disabled={!activeOutline.snapshots?.length} title={activeOutline.snapshots?.length ? '查看并恢复被覆盖前的版本' : '还没有历史版本'} onClick={() => setShowOutlineHistory(true)}>历史版本{activeOutline.snapshots?.length ? ` ${activeOutline.snapshots.length}` : ''}</button>}<button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div></div>
                     {renderDocumentSearchPanel('大纲', activeOutline.content, content => updateActiveOutline({ content }))}
+                    {activeOutline.kind === '章纲' && !activeOutline.title.startsWith('阶段节拍｜') && <ChapterBriefFields outline={activeOutline} onChange={updateActiveOutline} />}
                     <textarea className="outline-main-editor" value={activeOutline.content} onChange={event => updateActiveOutline({ content: event.target.value })} placeholder={`编辑${activeOutline.kind}内容...`} />
                   </> : <div className="empty-state"><p>从左侧选择一个大纲开始编辑。</p></div>}
                 </section>

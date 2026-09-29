@@ -387,6 +387,45 @@ describe("story ledger promise and author truth", () => {
   });
 });
 
+describe("omit future chapter facts", () => {
+  it("重写历史章时丢掉更晚章号的句子，盖住本章的卷名留下", () => {
+    const prepared = prepareChapterInput({
+      instruction: "重写第 130 章",
+      chapterPosition: { number: 130, total: 205 },
+      outlines: [
+        { kind: "世界观与作品设定", title: "人物",
+          content: "第10章相识。第151～204章领证、大婚。手机要充电。" },
+      ],
+      cards: [{ title: "沈妄", type: "角色卡", content: "句子短。第194章改称阿妄。", currentState: "第204章已体检" }],
+      contextWindowKTokens: 128,
+    });
+    expect(prepared.worldSetting).toContain("第10章相识");
+    expect(prepared.worldSetting).toContain("手机要充电");
+    expect(prepared.worldSetting).not.toContain("领证");
+    const cardText = prepared.cards.map(card => card.content).join("");
+    expect(cardText).toContain("句子短");
+    expect(cardText).not.toContain("第194章");
+    expect(cardText).not.toContain("已体检");
+
+    const currentVolume = prepareChapterInput({
+      instruction: "重写第 180 章",
+      chapterPosition: { number: 180, total: 205 },
+      outlines: [{ kind: "世界观与作品设定", title: "分卷", content: "第四卷（156～205章）正在进行。第204章已领证。" }],
+      contextWindowKTokens: 128,
+    });
+    expect(currentVolume.worldSetting).toContain("156～205章");
+    expect(currentVolume.worldSetting).not.toContain("已领证");
+
+    const latest = prepareChapterInput({
+      instruction: "写最新章",
+      chapterPosition: { number: 205, total: 205 },
+      cards: [{ title: "规划", type: "设定卡", content: "第206章揭晓身世。" }],
+      contextWindowKTokens: 128,
+    });
+    expect(latest.cards.map(card => card.content).join("")).toContain("第206章揭晓身世");
+  });
+});
+
 describe("buildStoryLedger · 感情线", () => {
   it("只带最近一次关系状态，不把几章没推进写成创作命令", () => {
     const memories = [

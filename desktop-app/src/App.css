@@ -2113,7 +2113,16 @@ select.input {
 .project-agent-header small { overflow: hidden; color: var(--text-4); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .project-agent-header-actions { display: flex; gap: 6px; }
 .project-agent-header-actions .icon-button { color: var(--accent-2-fg); }
-.project-agent-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--accent-2-bg); }
+.project-agent-mode { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--accent-2-bg); }
+.outline-promises, .chapter-brief-fields { margin: 8px 10px 0; padding: 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+.chapter-brief-fields { margin: 0 0 8px; }
+.outline-promises summary, .chapter-brief-fields summary { cursor: pointer; font-size: var(--fs-sm); }
+.outline-promises summary small, .chapter-brief-fields summary small { color: var(--text-4); }
+.chapter-brief-fields label, .outline-promises label { display: grid; gap: 4px; margin-top: 8px; font-size: var(--fs-xs); color: var(--text-4); }
+.promise-row { display: grid; gap: 6px; margin-top: 8px; }
+.promise-row-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: end; }
+.promise-row-meta label { margin-top: 0; }
+.promise-row-meta .input { width: 64px; }
 .project-agent-mode button { min-height: 32px; border: 1px solid transparent; border-radius: var(--r-full); background: transparent; color: var(--text-4); cursor: pointer; font-size: 11px; }
 .project-agent-mode button.active { border-color: var(--accent-2-line); background: var(--accent-2-bg); color: var(--accent-2-fg); }
 .project-agent-mode button:disabled { cursor: default; opacity: .55; }

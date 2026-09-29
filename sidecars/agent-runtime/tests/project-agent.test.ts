@@ -751,6 +751,45 @@ describe("project agent context regressions", () => {
     expect(requests[1].at(-1)?.content).toContain("</正文>");
   });
 
+  it("计划模式不给写入说明，finish 里的变更也会丢掉", async () => {
+    const requests: Array<Array<{ content: string }>> = [];
+    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+      requests.push(messages);
+      return { model: "test", content: JSON.stringify({ action: "finish", message: "先改第 2 章的雨，再补一张角色卡。", changes: [{ type: "chapter.delete", summary: "删章", targetId: 2 }] }) };
+    });
+    const result = await runProjectAgent({
+      mode: "plan", instruction: "规划怎么改第 2 章",
+      project,
+    }, { chat } as unknown as ModelApiClient, delegates());
+    expect(requests[0][0].content).toContain("计划模式只出方案");
+    expect(requests[0][0].content).not.toContain("chapter.delete");
+    expect(result.changes).toEqual([]);
+    expect(result.message).toContain("先改第 2 章");
+  });
+
+  it("计划模式下模型照提 edit：挡在跑变更之前，直接让它改写方案", async () => {
+    const requests: Array<Array<{ content: string }>> = [];
+    let call = 0;
+    const chat = vi.fn(async (messages: Array<{ content: string }>) => {
+      requests.push(messages);
+      call += 1;
+      // 第一轮不听提示词，直接提变更；第二轮才把方案写进 message
+      return {
+        model: "test",
+        content: call === 1
+          ? JSON.stringify({ action: "edit", changes: [{ type: "outline.upsert", summary: "改第 2 章章纲", kind: "章纲", title: "章纲｜第 2 章", content: "雨停下来。" }] })
+          : JSON.stringify({ action: "finish", message: "方案：把第 2 章的雨改成雨停，再补一张角色卡。", changes: [] }),
+      };
+    });
+    const result = await runProjectAgent({
+      mode: "plan", instruction: "规划怎么改第 2 章",
+      project,
+    }, { chat } as unknown as ModelApiClient, delegates());
+    expect(requests[1].at(-1)?.content).toContain("当前模式不能修改项目");
+    expect(result.changes).toEqual([]);
+    expect(result.message).toContain("雨停");
+  });
+
   it("1M 窗口也不会把整本书塞进一轮请求", async () => {
     const chat = vi.fn(async (messages: Array<{ content: string }>) => {
       expect(Buffer.byteLength(messages.map(message => message.content).join(""), "utf8")).toBeLessThanOrEqual(180_000);

@@ -201,6 +201,46 @@ test('作品默认技能只传技能目录里真有的名字', () => {
   assert.deepEqual(buildChapterWriteContext({ project: project(), chapter: chapters[3], instruction: '继续写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] }).params.defaultSkillNames, []);
 });
 
+test('章纲信息边界和到期承诺进写作参数，隐瞒没填时用上一章作者真相', () => {
+  const current = project({
+    outlines: project().outlines.map(item => item.id === 14 ? { ...item, readerKnows: '读者知道灯还亮着' } : item),
+    memories: project().memories.map(item => item.chapterId === 2 ? { ...item, authorTruth: ['守夜人是父亲'] } : item),
+    promises: [
+      { id: 'due', text: '灯塔的枪得响', dueChapter: 3, status: 'open', updatedAt: now },
+      { id: 'later', text: '还没到', dueChapter: 9, status: 'open', updatedAt: now },
+      { id: 'paid', text: '已经兑现', dueChapter: 2, status: 'paid', updatedAt: now },
+    ],
+    authorQuestions: [{ id: 'q1', chapterNumber: 2, chapterTitle: '第 2 章', question: '枪是谁的', answer: '', askedAt: now }],
+  });
+  const context = buildChapterWriteContext({ project: current, chapter: chapters[2], instruction: '写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  const brief = context.params.chapterBrief as { readerKnows?: string; mustHide?: string };
+  assert.equal(brief.readerKnows, '读者知道灯还亮着');
+  assert.equal(brief.mustHide, '守夜人是父亲');
+  assert.deepEqual((context.params.duePromises as Array<{ text: string }>).map(item => item.text), ['灯塔的枪得响']);
+  assert.deepEqual(context.params.openQuestions, ['枪是谁的']);
+});
+
+test('重写历史章时丢掉卡片和总纲里更晚的章号，本章纲里的禁止项留下', () => {
+  const current = project({
+    cards: [{ id: 9, type: '角色卡', title: '沈妄', content: '第1章相识。第151章领证。', pinned: true, createdAt: now, updatedAt: now }],
+    outlines: project().outlines.map(item => {
+      if (item.id === 12) return { ...item, content: '第1章相识。第151章领证。' };
+      if (item.id === 13) return { ...item, content: '不要写第 4 章的宣判。' };
+      return item;
+    }),
+  });
+  const context = buildChapterWriteContext({ project: current, chapter: chapters[1], instruction: '重写', skills: [], preferredSkillNames: [], extraOutlineIds: [], selectedCardIds: [] });
+  const card = (context.params.cards as Array<{ title: string; content: string }>).find(item => item.title === '沈妄');
+  assert.ok(card);
+  assert.match(card.content, /第1章相识/);
+  assert.doesNotMatch(card.content, /领证/);
+  const master = (context.params.outlines as Array<{ kind: string; content: string }>).find(item => item.kind === '总纲');
+  assert.ok(master);
+  assert.doesNotMatch(master.content, /领证/);
+  const outline = (context.params.outlines as Array<{ id: number; content: string }>).find(item => item.id === 13);
+  assert.match(outline?.content || '', /第 4 章/);
+});
+
 test('重写历史章时卡片状态回退到本章之前，最后一章照旧用最新状态', () => {
   const history = [
     { chapterId: 1, chapterTitle: '第 1 章', status: 'updated', changes: '刚搬进阁楼', updatedAt: now },

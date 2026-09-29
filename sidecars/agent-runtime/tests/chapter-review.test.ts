@@ -129,6 +129,32 @@ describe("chapter review", () => {
   });
 });
 
+describe("chapter review · 本章边界与承诺", () => {
+  const boundary = {
+    brief: { mustHide: "守夜人是父亲", hintOnly: "信里只露出一半", readerKnows: "读者知道灯还亮着" },
+    duePromises: [{ text: "灯塔的枪得响", dueChapter: 130 }],
+    openQuestions: ["枪是谁的"],
+  };
+
+  it("到期的承诺与信息边界进架构、一致性与综合视角，不进文字视角", () => {
+    for (const perspective of ["architect", "consistency", "solo"] as const) {
+      const text = chapterReviewRequest({ ...baseInput, ...boundary }, perspective).messages.map(message => message.content).join("\n");
+      expect(text).toContain("## 本章的边界与承诺");
+      expect(text).toContain("灯塔的枪得响（期限第 130 章）");
+      expect(text).toContain("守夜人是父亲");
+      expect(text).toContain("枪是谁的");
+    }
+    const prose = chapterReviewRequest({ ...baseInput, ...boundary }, "prose").messages.map(message => message.content).join("\n");
+    expect(prose).not.toContain("## 本章的边界与承诺");
+    expect(prose).not.toContain("灯塔的枪得响");
+  });
+
+  it("没填边界时整段不出现", () => {
+    const text = chapterReviewRequest(baseInput, "architect").messages.map(message => message.content).join("\n");
+    expect(text).not.toContain("## 本章的边界与承诺");
+  });
+});
+
 describe("chapter review · 感情线与人物区分", () => {
   it("作品定位进架构、人物、综合三个视角，不进文字与一致性视角", () => {
     const input = { ...baseInput, projectProfile: "## 作品定位\n类型：男频 / 都市日常\n标签：慢热高甜" };

@@ -1,7 +1,7 @@
 import type { ProjectAgentChange as ProjectAgentRawChange } from '@zhizhang/contracts';
 import type { Project, OutlineKind, CardType, MemoryDocumentKind, KnowledgeGraphNode } from '../../domain/project';
 
-export type ProjectAgentMode = 'discuss' | 'execute';
+export type ProjectAgentMode = 'discuss' | 'plan' | 'execute';
 export type ProjectAgentChangeStatus = 'pending' | 'applied' | 'dismissed';
 export type { ProjectAgentRawChange };
 export type ProjectAgentChange = ProjectAgentRawChange & { id: string; status: ProjectAgentChangeStatus; baseUpdatedAt?: string; baseFields?: Record<string, unknown> };
@@ -202,7 +202,7 @@ export const normalizeProjectAgentSession = (value: unknown, project: Project, s
     version: 1,
     projectId: project.id,
     sessionId,
-    mode: value.mode === 'execute' ? 'execute' : 'discuss',
+    mode: value.mode === 'execute' || value.mode === 'plan' ? value.mode : 'discuss',
     messages,
     changes,
     updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),

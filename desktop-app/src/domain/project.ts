@@ -41,6 +41,11 @@ export interface OutlineDocument {
   chapterId?: number;
   title: string;
   content: string;
+  /** 章纲上的写前信息边界：空着不挡写作，隐瞒没填时用上一章的作者真相补 */
+  readerKnows?: string;
+  protagonistKnows?: string;
+  mustHide?: string;
+  hintOnly?: string;
   createdAt: string;
   updatedAt: string;
   /** 被模型覆盖前的历史版本，最新在前；总纲和世界观类文档才存，章纲每次重来本来就该换 */
@@ -65,6 +70,18 @@ export interface AuthorQuestion {
   answer: string;
   askedAt: string;
   answeredAt?: string;
+}
+
+/** 作者登记的承诺。没填期限也没填节奏的不进写作，避免又把全部伏笔堆进每一章 */
+export interface StoryPromise {
+  id: string;
+  text: string;
+  plantedChapter?: number;
+  dueChapter?: number;
+  /** 至少 2。从埋设章起，每隔这么多章提醒一次 */
+  everyChapters?: number;
+  status: 'open' | 'paid' | 'dropped';
+  updatedAt: string;
 }
 
 /** 旧版存的待建卡候选（2026-09-22 之前按"本章新出现"登记）；读档时清掉，现在候选从图谱按反复出现推导 */
@@ -235,8 +252,10 @@ export interface Project {
   maxAIRate?: number;
   /** 全部卡片状态最近一次按近期正文校准到第几章；再写满十章就自动刷一次，不分连续创作还是手写 */
   cardStatesRefreshedThrough?: number;
-  /** 模型提给作者的问题与答复；未答的在章节页标出，已答的进每章提示词 */
+  /** 模型提给作者的问题与答复；未答的在章节页标出，已答的进每章提示词；没答的进写作提示词，标明不得写死 */
   authorQuestions?: AuthorQuestion[];
+  /** 作者可改的承诺：伏笔、隔几章发一次糖。只有到期或踩上节奏的才进本章提示词 */
+  promises?: StoryPromise[];
   /** 旧版存的待建卡候选，读档时清掉；候选现在由 card-candidates.ts 从图谱推导 */
   cardCandidates?: CardCandidate[];
   /** 作者点过"忽略"的候选名，之后再反复出现也不再提 */

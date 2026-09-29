@@ -29,7 +29,7 @@ export interface ProjectAgentResult {
 }
 
 interface ProjectAgentInput {
-  mode: "discuss" | "execute";
+  mode: "discuss" | "plan" | "execute";
   instruction: string;
   project: Record<string, unknown>;
   history?: Array<{ role?: unknown; content?: unknown }>;
@@ -493,7 +493,10 @@ const readPrompt = `你是应用内的小说项目助手，可以多轮检索当
 只依据实际读到的资料作答。索引和自动摘录不代表已读全文；open 会返回读取范围和下一段 offset，未读完时按游标继续读取，不得把未读部分当作缺失剧情。预算不足时说明尚不能确认。
 章节索引是「#目录位置｜真实ID｜原始标题」。目录位置不等于标题章号；先按标题确认作者所指章节，再用真实ID打开正文。检查跳号时同时核对相邻目录条目和正文，不可仅凭编号判断缺章。
 章数很多时索引只列首尾，可 search 查标题、list 翻目录，再批量 open。
-讨论模式只分析，changes 必须为空数组，不能使用 edit。执行模式可用 edit 修改临时项目，再 open 检查修改结果和相邻章节，最后 finish。`;
+讨论模式只分析，changes 必须为空数组，不能使用 edit。计划模式同样不能使用 edit，把方案写进 finish 的 message。执行模式可用 edit 修改临时项目，再 open 检查修改结果和相邻章节，最后 finish。`;
+
+const planPrompt = `计划模式只出方案，不能使用 edit，finish 的 changes 必须为空。
+方案写在 message 里：要改哪些资料、改成什么样、已知风险。作者确认后会另开一轮执行，这一轮不许动手。`;
 
 const executePrompt = `执行模式可提出待作者确认的变更，不能声称已经保存。更新已有对象必须使用真实 targetId，一次最多 16 项。
 变更放进 finish 的 changes 数组，用 type 区分；action 仍为 finish。
@@ -739,8 +742,10 @@ export async function runProjectAgent(
 
   const system: AgentMessage = { role: "system", content: input.mode === "execute" ? `${readPrompt}
 
-${executePrompt}` : readPrompt };
-  const request: AgentMessage = { role: "user", content: `模式：${input.mode === "execute" ? "执行" : "讨论"}
+${executePrompt}` : input.mode === "plan" ? `${readPrompt}
+
+${planPrompt}` : readPrompt };
+  const request: AgentMessage = { role: "user", content: `模式：${input.mode === "execute" ? "执行" : input.mode === "plan" ? "计划" : "讨论"}
 
 ## 本轮请求
 ${input.instruction}` };
@@ -766,7 +771,7 @@ ${context.packet}`, history, messages, requestLimit);
       turn = parseAgentTurn(response.content);
     } catch {
       const rawProse = response.content.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "").trim();
-      if (input.mode === "discuss" && rawProse.length >= 40 && !/^[{\[]/u.test(rawProse) && !rawProse.includes('"action"') && !isDsmlOrToolCall(rawProse) && !isFormatRepairMetaComplaint(rawProse)) {
+      if (input.mode !== "execute" && rawProse.length >= 40 && !/^[{\[]/u.test(rawProse) && !rawProse.includes('"action"') && !isDsmlOrToolCall(rawProse) && !isFormatRepairMetaComplaint(rawProse)) {
         turn = { action: "finish", message: compactText(rawProse, 4800), changes: [] };
       } else {
         // 唯一的格式恢复轮保留原任务与已读资料，不把残缺指令当作分析结论
@@ -791,10 +796,17 @@ ${compactText(rawProse, 2000) || "（空）"}` },
     }
 
     if (turn.action === "edit") {
+      // 讨论/计划模式没有写入能力：挡在跑变更之前。只在提示词里要求它別 edit 时，模型仍会先规划一遍变更、
+      // 再逐条报错，白花一轮；这里把「本模式不能写」当堂告诉它，让它直接把方案写进 message
+      if (input.mode !== "execute") {
+        messages.push({ role: "assistant", content: JSON.stringify({ action: "edit", summaries: turn.changes.map(change => change.summary) }) });
+        messages.push({ role: "user", content: "当前模式不能修改项目。请把要改的资料、改成什么样、已知风险写进 finish 的 message，changes 留空。" });
+        toolEvents.push({ tool: "project.edit", status: "error", message: "当前模式不能修改项目，已挡在写入前" });
+        continue;
+      }
       const results: string[] = [];
       for (const change of turn.changes) {
         try {
-          if (input.mode !== "execute") throw new Error("讨论模式不能修改项目");
           if (["chapter.delete", "outline.delete", "chapter.parts", "chapter.titles"].includes(change.type)) throw new Error("此变更请放在 finish 中交给作者确认");
           input.onDelegate?.({ done: 0, total: turn.changes.length, label: change.summary, status: "start" });
           const produced = ProjectAgentChangeSchema.parse(await produce(change));
@@ -823,7 +835,7 @@ ${compactText(rawProse, 2000) || "（空）"}` },
   }
 
   if (!plan) return { message: "本轮达到步数上限，已保留完成的临时稿供预览；其余范围尚未完成。", changes: staged, toolEvents };
-  if (input.mode === "discuss") return { message: plan.message, changes: [], toolEvents };
+  if (input.mode !== "execute") return { message: plan.message, changes: [], toolEvents };
 
   // 按提案顺序更新临时项目，后续委派从同一份项目读取已完成的新稿
   const budgetMs = Math.max(0, Number(input.delegateBudgetMs) || Math.max(DELEGATE_BUDGET_MS, plan.changes.length * PER_DELEGATE_BUDGET_MS));

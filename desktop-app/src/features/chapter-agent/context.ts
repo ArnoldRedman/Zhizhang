@@ -1,9 +1,10 @@
 import type { Chapter, KnowledgeCard, OutlineDocument, Project } from '../../domain/project';
 import type { Skill } from '../../domain/skill';
 import type { DismantleAggregate, WritingStyle } from '../../domain/library';
-import { firstSentence, isPlaceholderOutline, isWorkLogDocumentTitle, lastSentence, writingGuideFacts } from '@zhizhang/contracts';
+import { firstSentence, isPlaceholderOutline, isWorkLogDocumentTitle, lastSentence, omitFutureChapterFacts, writingGuideFacts } from '@zhizhang/contracts';
 import { buildMemoryDocuments, recentChapterMemories } from '../../domain/memory.ts';
-import { answeredAuthorQuestions } from '../../domain/outline.ts';
+import { answeredAuthorQuestions, pendingAuthorQuestions } from '../../domain/outline.ts';
+import { duePromises } from '../../domain/promises.ts';
 import { chapterBoundToOutline } from '../outline/model.ts';
 
 /**
@@ -115,6 +116,24 @@ export const rollbackCardState = (card: KnowledgeCard, project: Project, chapter
   return { ...card, currentState: latest?.changes || '', stateHistory: earlier };
 };
 
+/** 章纲上填了才用；隐瞒空着时用上一章的作者真相，不因为没填就停笔 */
+export const compileChapterBrief = (project: Project, chapter: Chapter, chapterNumber: number) => {
+  const outline = boundChapterOutlineFor(project, chapter);
+  const previous = chapterNumber > 1 ? project.chapters[chapterNumber - 2] : undefined;
+  const truth = previous ? project.memories.find(memory => memory.chapterId === previous.id)?.authorTruth?.map(item => item.trim()).filter(Boolean) : undefined;
+  const readerKnows = outline?.readerKnows?.trim() || '';
+  const protagonistKnows = outline?.protagonistKnows?.trim() || '';
+  const hintOnly = outline?.hintOnly?.trim() || '';
+  const mustHide = outline?.mustHide?.trim() || (truth?.length ? truth.slice(0, 6).join('；') : '');
+  if (!readerKnows && !protagonistKnows && !mustHide && !hintOnly) return undefined;
+  return {
+    ...(readerKnows ? { readerKnows } : {}),
+    ...(protagonistKnows ? { protagonistKnows } : {}),
+    ...(mustHide ? { mustHide } : {}),
+    ...(hintOnly ? { hintOnly } : {}),
+  };
+};
+
 export const buildChapterWriteContext = (input: ChapterWriteContextInput): ChapterWriteContext => {
   const { project, chapter } = input;
   const chapterIndex = project.chapters.findIndex(item => item.id === chapter.id);
@@ -127,12 +146,27 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
   const boundOutline = boundChapterOutlineFor(project, chapter);
   // 阶段节拍表不当普通章纲带：它单独走 stageBeats，运行时只取本章那一行
   // 工作台账不带；混合文风文档只取硬事实与考据，其他世界设定照常带
+  const scrub = (text: string) => historical ? omitFutureChapterFacts(text, chapterNumber) : text;
   const outlines = project.outlines.filter(outline => !outline.title.startsWith('阶段节拍｜') && !(outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title)) && (outline.kind === '世界观与作品设定' || outline.kind === '总纲'
     || outline.id === boundOutline?.id || input.extraOutlineIds.includes(outline.id)))
-    .map(outline => outline.kind === '世界观与作品设定' ? { ...outline, content: writingGuideFacts(outline.title, outline.content) } : outline)
+    .map(outline => {
+      const content = outline.kind === '世界观与作品设定' ? writingGuideFacts(outline.title, outline.content) : outline.content;
+      // 章纲是本章要写什么，里面提到后面的章号是禁止项，不能当未来事实删掉
+      const scrubbed = historical && (outline.kind === '世界观与作品设定' || outline.kind === '总纲') ? scrub(content) : content;
+      return { ...outline, content: scrubbed };
+    })
     .filter(outline => outline.content.trim());
   const cards = effectiveCards(project, input.selectedCardIds, `${boundOutline?.content || ''}\n${(previousChapter?.content || '').slice(-8000)}\n${input.instruction}`)
-    .map(card => historical ? rollbackCardState(card, project, chapterNumber) : card);
+    .map(card => {
+      const rolled = historical ? rollbackCardState(card, project, chapterNumber) : card;
+      if (!historical) return rolled;
+      return {
+        ...rolled,
+        content: scrub(rolled.content),
+        currentState: scrub(rolled.currentState || ''),
+        stateHistory: (rolled.stateHistory || []).map(entry => ({ ...entry, changes: scrub(entry.changes) })),
+      };
+    });
   const skills = input.skills.map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content }));
   return {
     boundOutline,
@@ -190,13 +224,16 @@ export const buildChapterWriteContext = (input: ChapterWriteContextInput): Chapt
       })),
       memoryDocuments: memoryDocuments
         .filter(document => contextDocumentKinds.has(document.kind))
-        .map(document => ({ kind: document.kind, title: document.title, content: document.content })),
+        .map(document => ({ kind: document.kind, title: document.title, content: scrub(document.content) })),
       // 验证门与三档审查：档位、引号风格、作者允许的句式来自项目设置；最近几章的开头结尾与上一章承诺从正文和记忆里取
       reviewMode: project.reviewMode || 'lean',
       quoteStyle: project.quoteStyle,
       allowedPhrases: project.allowedPhrases || [],
       ...recentChapterEcho(project, chapterNumber),
       previousPromise: previousChapter ? project.memories.find(memory => memory.chapterId === previousChapter.id)?.nextChapterPromise || undefined : undefined,
+      chapterBrief: compileChapterBrief(project, chapter, chapterNumber),
+      duePromises: duePromises(project.promises, chapterNumber).map(item => ({ text: item.text, dueChapter: item.dueChapter, everyChapters: item.everyChapters })),
+      openQuestions: pendingAuthorQuestions(project).map(item => item.question).slice(0, 8),
       // 作者对模型提问的答复：之后每章按答复写，模型不再重复问
       authorAnswers: answeredAuthorQuestions(project),
       // 对标资料只传写作要用的三样，文风档案已经作为 WritingStyle 单独绑定，不重复带
