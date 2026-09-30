@@ -35,6 +35,13 @@ const clientWith = (content: string) => ({
 }) as unknown as ModelApiClient;
 
 describe("project agent", () => {
+  it("从 JSON 前后说明或多个对象中只提取第一个完整动作", async () => {
+    const client = clientWith('这里是说明。{"action":"finish","message":"已生成","changes":[]}\n{"action":"finish","message":"重复","changes":[]}');
+    const result = await runProjectAgent({ mode: "execute", instruction: "检查项目", project }, client, delegates());
+    expect(result.message).toBe("已生成");
+    expect(result.toolEvents.some(event => event.tool === "project.format")).toBe(false);
+  });
+
   it("追加件不能作为新建或整篇替换资料进入提案", async () => {
     const client = clientWith(JSON.stringify({ action: "finish", message: "登记日志", changes: [
       { type: "outline.upsert", summary: "追加日志", targetId: 11, kind: "章纲", title: "修订日志", content: "# 追加件｜本轮登记\n只包含新增记录" },

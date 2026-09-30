@@ -255,8 +255,35 @@ function extractJsonObject(value: string): Record<string, unknown> | null {
   const candidates: string[] = [];
   const stripped = value.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "").trim();
   candidates.push(stripped);
-  // 前后缀散文：第一个 { 到最后一个 }
+  // 模型有时在 JSON 前后补说明，或连续输出多个对象；按字符串状态提取第一个完整对象
   const first = stripped.indexOf("{");
+  if (first >= 0) {
+    let depth = 0;
+    let quote = false;
+    let escaped = false;
+    for (let index = first; index < stripped.length; index += 1) {
+      const char = stripped[index];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') quote = false;
+        continue;
+      }
+      if (char === '"') {
+        quote = true;
+        continue;
+      }
+      if (char === "{") depth += 1;
+      if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          candidates.push(stripped.slice(first, index + 1));
+          break;
+        }
+      }
+    }
+  }
+  // 兼容对象前后夹少量散文，但不把半截 JSON 猜成写入动作
   const last = stripped.lastIndexOf("}");
   if (first >= 0 && last > first) candidates.push(stripped.slice(first, last + 1));
   for (const candidate of candidates) {
@@ -266,7 +293,7 @@ function extractJsonObject(value: string): Record<string, unknown> | null {
       continue;
     }
   }
-  // 补齐被截断的括号：从 { 到最后一个完整字符串后，逐层补 }
+  // 仅在 JSON 已有完整字符串、只缺末尾括号时补齐；字段内容被截断时不会猜测
   if (first >= 0) {
     const tail = stripped.slice(first);
     for (let close = 1; close <= 8; close += 1) {
