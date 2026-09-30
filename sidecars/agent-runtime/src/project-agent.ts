@@ -768,6 +768,10 @@ export async function runProjectAgent(
     completedChanges.add(key);
     return produced;
   };
+  const planningRequest = async (messages: AgentMessage[], options: Parameters<ModelApiClient["chat"]>[1]) => {
+    if (typeof client.chatStream === "function") return client.chatStream(messages, options);
+    return client.chat(messages, options);
+  };
   const history = (input.history || []).slice(-10).flatMap(message => {
     const role: "user" | "assistant" | null = message.role === "assistant" ? "assistant" : message.role === "user" ? "user" : null;
     const content = compactText(message.content || "", 4000);
@@ -806,7 +810,7 @@ ${context.packet}`, history, messages, requestLimit);
     // 大项目的规划轮也可能长时间生成，使用流式避免网关等待完整响应超时
     let response: { content: string };
     try {
-      response = await client.chatStream(turnMessages, { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 12_000, retryAttempts: 2 });
+      response = await planningRequest(turnMessages, { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 12_000, retryAttempts: 2 });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       toolEvents.push({ tool: "project.request", status: "error", message });
@@ -823,7 +827,7 @@ ${context.packet}`, history, messages, requestLimit);
       } else {
         // 唯一的格式恢复轮保留原任务与已读资料，不把残缺指令当作分析结论
         try {
-          const repaired = await client.chatStream([
+          const repaired = await planningRequest([
             ...turnMessages,
             { role: "user", content: `上一轮未返回有效动作。请依据本轮请求和已读资料返回一个合法 JSON 动作；资料不足可继续检索。待修复输出：
 ${compactText(rawProse, 2000) || "（空）"}` },
