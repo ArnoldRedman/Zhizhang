@@ -1,119 +1,96 @@
-# 织章 Desktop
+# 织章桌面端
 
-桌面端 AI 小说写作助手 - 基于 Tauri + React 构建的跨平台应用
+织章桌面端是基于 **Tauri 2、React、TypeScript 和 Node.js Agent Runtime** 的本地优先长篇小说创作应用。它提供项目写作、书籍管理、拆书、扫榜、文风、技能、记忆、知识图谱、项目 Agent、批量审查和本地备份等功能。
 
-## ✨ 特性
+## 当前工作区
 
-- 🖥️ **跨平台支持**: Windows、macOS、Linux
-- ⚡ **轻量高效**: 包体积 ~5MB，内存占用 ~100MB
-- 🔒 **安全可靠**: Rust 后端隔离，IPC 白名单机制
-- 🎨 **现代 UI**: React + TypeScript，暗色主题
-- 🤖 **智能写作**: 集成 LangGraph AI 工作流
+打开一本小说后，编辑器顶部提供三个视图：
 
-## 🏗️ 架构
+- **写作**：章节目录、正文编辑和章节操作。
+- **资料**：本章资料、章纲、信息边界、承诺账、卡片、图谱、文风、技能和记忆。
+- **任务**：连续创作、重写旧章、旧章审查和批量修订。
 
-```
-Tauri Window (React)
-    ↕ IPC
-Rust Backend
-    ↕ stdio (JSON-RPC)
-Node.js Sidecar (agent-runtime)
-    - LangGraph
-    - SQLite + FTS5 + Vector
-    - LLM API
-```
+右上角的「项目 Agent」支持讨论、计划和执行模式。执行前会生成待确认变更，应用后才写入项目；「更多」菜单包含历史、通读、统计、格式化、导出和快捷键。
 
-## 🚀 开发
+## 开发环境
 
-### 前置要求
+- Node.js 20+
+- Rust stable
+- Windows 需要 WebView2 和 Rust 的 Windows 构建环境
+- macOS/iOS 需要 Xcode；Android 需要 Android SDK
 
-- Node.js 18+
-- Rust 1.70+
-- 操作系统特定依赖:
-  - **macOS**: Xcode Command Line Tools
-  - **Linux**: `webkit2gtk`, `libssl-dev`, `libgtk-3-dev`
-  - **Windows**: WebView2 (通常已预装)
+## 安装依赖
 
-### 安装依赖
+从仓库根目录执行：
 
 ```bash
-cd desktop-app
 npm install
+npm install --prefix desktop-app
 ```
 
-### 开发模式
+## 开发模式
+
+```bash
+npm run tauri:dev --prefix desktop-app
+```
+
+该命令会准备 Agent Runtime、启动 Vite 和 Tauri 窗口。需要单独调试前端时，也可以在 `desktop-app` 目录执行：
 
 ```bash
 npm run dev
 ```
 
-这会启动:
-1. Vite 开发服务器 (http://localhost:5173)
-2. Tauri 窗口 (热重载)
-3. Node.js sidecar (agent-runtime)
+## 构建
 
-### 构建发布
+构建桌面端：
 
 ```bash
-npm run build
+npm run tauri:build --prefix desktop-app
 ```
 
-生成的安装包位于 `src-tauri/target/release/bundle/`
+构建脚本会先编译共享契约和 Agent Runtime，再执行前端构建和 Rust release 构建。桌面产物位于 `desktop-app/src-tauri/target/release/`；带安装包的构建产物位于其 `bundle/` 子目录。
 
-## 📁 项目结构
+移动端构建见 [MOBILE.md](MOBILE.md)。
 
-```
+## 目录结构
+
+```text
 desktop-app/
-├── src/                    # React 前端代码
-│   ├── App.tsx            # 主应用组件
-│   ├── App.css            # 样式
-│   └── main.tsx           # 入口文件
-├── src-tauri/             # Tauri Rust 后端
-│   ├── src/
-│   │   └── main.rs        # Rust 主程序
-│   ├── Cargo.toml         # Rust 依赖
-│   └── tauri.conf.json    # Tauri 配置
+├── src/
+│   ├── domain/       # 作品、章节、书库、技能和导出模型
+│   ├── features/     # 章节、记忆、Agent、书库等功能逻辑
+│   ├── platform/     # 移动端书源与同步适配
+│   ├── services/     # Agent、原生存储和平台能力端口
+│   ├── App.tsx       # 当前桌面工作区组合与页面交互
+│   └── App.css       # 应用样式
+├── src-tauri/
+│   ├── src/           # Rust IPC、资源存储、备份和 Agent 生命周期
+│   └── tauri.conf.json
+├── scripts/           # Agent Runtime 准备脚本
 └── package.json
 ```
 
-## 🎨 UI 设计
+Agent Runtime 位于仓库根目录的 `sidecars/agent-runtime`，共享 RPC 契约位于 `packages/contracts`，模型协议位于 `packages/model-protocol`。
 
-- **配色方案**: 暗色主题 (#0F1117 背景 + #FBBF24 强调色)
-- **字体**: 系统默认 sans-serif
-- **布局**: 侧边栏 (280px) + 主编辑区
+## 验证
 
-## 🔌 API
+Agent Runtime 类型检查：
 
-### Tauri Commands
-
-```typescript
-// 启动 agent runtime
-await invoke('start_agent_runtime')
-
-// 调用 RPC
-await invoke('call_agent_rpc', {
-  method: 'generateChapter',
-  params: { projectId, chapterId, instruction }
-})
+```bash
+npm run typecheck --prefix sidecars/agent-runtime
 ```
 
-## 📝 TODO
+桌面端类型检查和 lint：
 
-- [ ] 实现完整的 stdio 双向通信
-- [ ] 添加流式输出支持
-- [ ] 人物/地点/伏笔管理面板
-- [ ] 项目管理功能
-- [ ] 设置页面 (API Key 配置)
-- [ ] 导出功能 (TXT, EPUB, PDF)
+```bash
+npm run typecheck --prefix desktop-app
+npm run lint --prefix desktop-app
+```
 
-## 🛠️ 技术栈
+完整构建会自动执行共享包构建、Agent Runtime 准备、Vite 构建和 Tauri 构建。
 
-- **前端**: React 19 + TypeScript
-- **桌面框架**: Tauri 2.0
-- **后端**: Rust (IPC + Sidecar 管理)
-- **构建工具**: Vite 8
-- **AI 引擎**: ../sidecars/agent-runtime
+## 数据和安全
 
-## 📄 许可证
+Tauri 负责把项目、书籍、拆书和文风保存到本机应用数据目录，正文和较大的资料会拆成独立文件。备份与同步由用户主动触发。
 
-MIT
+不要把 API Key、访问令牌、Cookie、个人小说正文、备份包或构建产物提交到 Git。仓库许可证见根目录 [LICENSE](../LICENSE)，贡献规范见 [CONTRIBUTING.md](../CONTRIBUTING.md)。
