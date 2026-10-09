@@ -14,7 +14,7 @@
 
 ## 开发环境
 
-- Node.js 20+
+- Node.js 22+（CI 与本机开发使用 24）
 - Rust stable
 - Windows 需要 WebView2 和 Rust 的 Windows 构建环境
 - macOS/iOS 需要 Xcode；Android 需要 Android SDK

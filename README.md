@@ -204,7 +204,7 @@
 
 ### 环境要求
 
-- Node.js 20+
+- Node.js 22+（CI 与本机开发使用 24；测试脚本依赖 Node 22 起的 `node --test` glob 支持）
 - Rust stable 与 Tauri 对应平台依赖
 - macOS/iOS 需要 Xcode，Android 需要 Android SDK，Windows 需要对应构建环境
 
