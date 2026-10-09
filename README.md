@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/ArnoldRedman/Zhizhang?label=release&color=d2565b)](https://github.com/ArnoldRedman/Zhizhang/releases)
 [![质量门禁](https://github.com/ArnoldRedman/Zhizhang/actions/workflows/quality.yml/badge.svg)](https://github.com/ArnoldRedman/Zhizhang/actions/workflows/quality.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-8a2be2)](LICENSE)
-![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-2f7d5f)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android%20%7C%20iOS-2f7d5f)
 
 ## 目录
 
@@ -207,6 +207,15 @@
 - Node.js 22+（CI 与本机开发使用 24；测试脚本依赖 Node 22 起的 `node --test` glob 支持）
 - Rust stable 与 Tauri 对应平台依赖
 - macOS/iOS 需要 Xcode，Android 需要 Android SDK，Windows 需要对应构建环境
+
+### 发布安装包
+
+打 `v*` 标签或手动触发 `Release` 工作流，会构建并挂到 GitHub Release：
+
+- **Windows x64**：`.exe`（NSIS）与 `.msi`
+- **Linux x64**：`.deb`、`.rpm` 与 `.AppImage`（在 Ubuntu 22.04 上构建，glibc 2.35 可覆盖 Ubuntu 22.04 / 24.04 与 Debian 12+）
+
+macOS、Android 与 iOS 仍可在本地按 [desktop-app/MOBILE.md](desktop-app/MOBILE.md) 构建，暂不在 CI 发布。
 
 ### 启动
 

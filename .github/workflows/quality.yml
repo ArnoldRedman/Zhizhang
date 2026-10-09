@@ -1,5 +1,5 @@
 # 日常提交的质量门禁
-# 发布工作流（release-windows.yml）只在打 tag 或手动触发时才跑检查，
+# 发布工作流（release-desktop.yml）只在打 tag 或手动触发时才跑检查，
 # 平时 push 到 main 和提 PR 都没有任何静态检查，类型错误只能等到发布或运行时才暴露。
 # 这里让每次 push 与 PR 都跑同一套 npm run check：共享包构建、运行时测试与类型检查、
 # 前端 lint/测试/类型检查/构建、Rust check 与测试。

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "发布版本，例如 v1.0.0"
+        description: "发布版本，例如 v1.1.0"
         required: true
         type: string
 
@@ -35,10 +35,18 @@ jobs:
       - run: npm run check
 
   build:
-    name: Build Windows x64
+    name: Build ${{ matrix.label }}
     needs: quality
-    runs-on: windows-latest
-    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: windows-x64, runner: windows-latest, kind: windows }
+          # Linux 包固定在 22.04 上构建：glibc 2.35 覆盖 Ubuntu 22.04 / 24.04 与 Debian 12+，
+          # 换到更新的镜像构建会把最低 glibc 要求一起抬高
+          - { label: linux-x64, runner: ubuntu-22.04, kind: linux }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -49,18 +57,32 @@ jobs:
             package-lock.json
             desktop-app/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri Linux dependencies
+        if: matrix.kind == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev libfuse2
       - run: npm ci
       - run: npm ci --prefix desktop-app
-      - name: Build Windows
+      - name: Build ${{ matrix.label }}
         run: npm run tauri:build --prefix desktop-app
       - name: Package Windows assets
+        if: matrix.kind == 'windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release-assets | Out-Null
           Get-ChildItem desktop-app/src-tauri/target/release/bundle -Recurse -Include *.msi,*.exe | ForEach-Object { Copy-Item $_.FullName release-assets/ -Force }
+      - name: Package Linux assets
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find desktop-app/src-tauri/target/release/bundle -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec cp {} release-assets/ \;
+          ls -lh release-assets
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x64
+          name: ${{ matrix.label }}
           path: release-assets/*
           if-no-files-found: error
 
