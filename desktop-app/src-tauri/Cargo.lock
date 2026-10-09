@@ -4894,7 +4894,7 @@ dependencies = [
 
 [[package]]
 name = "zhizhang"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "flate2",
  "serde",

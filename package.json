@@ -1,6 +1,6 @@
 {
   "name": "zhizhang",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "workspaces": ["packages/contracts", "packages/model-protocol", "sidecars/agent-runtime"],
