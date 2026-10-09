@@ -1741,8 +1741,9 @@ function App() {
    * 这几个 DOM 节点在切章时是复用的（React 只换 value 不换节点），不归零的话滚动位置会留在上一章读到的地方；
    * 只在章节 id 变化时执行：打字、自动保存、Agent 改稿都会替换章节对象但不改 id，不能把正在读的位置拉回开头
    */
+  const activeChapterId = activeChapter?.id;
   useLayoutEffect(() => {
-    if (!activeChapter) return;
+    if (activeChapterId === undefined) return;
     const editor = chapterEditorRef.current;
     if (editor) {
       editor.setSelectionRange(0, 0);
@@ -1750,7 +1751,7 @@ function App() {
     }
     if (highlightLayerRef.current) highlightLayerRef.current.scrollTop = 0;
     if (readingArticleRef.current) readingArticleRef.current.scrollTop = 0;
-  }, [activeChapter?.id]);
+  }, [activeChapterId]);
   /**
    * 目录跟随当前章：当前章滚到列表可见区域
    * 新建/插入/Alt 切章/项目 Agent 产出都会改 activeChapter，与其在每个入口补 scrollIntoView，不如统一在这里跟随；
