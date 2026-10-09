@@ -6,9 +6,13 @@ import qianyueSourceData from "../data/qianyue-novel-sources.json" with { type: 
 import fanqiePuaMaps from "../data/fanqie-pua-map.json" with { type: "json" };
 
 const webProxyAgents = new Map<string, ProxyAgent>();
+const webRateLimits = new Map<string, number>();
 type WebFetchOptions = {
   headers?: Record<string, string>;
   retries?: number;
+  method?: 'GET' | 'POST';
+  body?: string;
+  encoding?: string;
 };
 
 const fetchWebText = async (url: string, params?: Record<string, unknown>, options: WebFetchOptions = {}): Promise<string> => {
@@ -22,11 +26,23 @@ const fetchWebText = async (url: string, params?: Record<string, unknown>, optio
       webProxyAgents.set(proxyURL, dispatcher);
     }
   }
+  const origin = new URL(url).origin;
+  const rateLimitKey = `${origin}|${proxyEnabled ? proxyURL : ""}`;
+  const checkRateLimit = () => {
+    const remaining = (webRateLimits.get(rateLimitKey) || 0) - Date.now();
+    if (remaining > 0) throw new Error(`书籍服务 ${new URL(url).hostname} 请求受限（HTTP 429），请在 ${Math.ceil(remaining / 1000)} 秒后重试`);
+    webRateLimits.delete(rateLimitKey);
+  };
   let lastError: unknown;
   const retries = Math.max(1, Math.min(4, options.retries ?? 3));
   for (let attempt = 0; attempt < retries; attempt += 1) {
+    checkRateLimit();
+    let retryable = true;
     try {
       const response = await fetch(url, {
+        method: options.method || 'GET',
+        ...(options.body ? { body: options.body } : {}),
+        signal: AbortSignal.timeout(15_000),
         headers: {
           "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
           Accept: "text/html,application/json;q=0.9,*/*;q=0.8",
@@ -35,9 +51,25 @@ const fetchWebText = async (url: string, params?: Record<string, unknown>, optio
         },
         ...(dispatcher ? { dispatcher } : {}),
       } as RequestInit);
-      if (!response.ok) throw new Error(`书籍服务返回 HTTP ${response.status}`);
+      if (response.status === 429) {
+        const retryAfter = response.headers.get("retry-after")?.trim();
+        const seconds = retryAfter && /^\d+$/u.test(retryAfter) ? Number(retryAfter) : NaN;
+        const retryAt = Number.isFinite(seconds) ? Date.now() + seconds * 1000 : Date.parse(retryAfter || "");
+        // 尊重服务端冷却时间，同一出口下的分类和榜单请求一起暂停，避免快速重试加重限流
+        webRateLimits.set(rateLimitKey, Math.max(webRateLimits.get(rateLimitKey) || 0, Number.isFinite(retryAt) && retryAt > Date.now() ? retryAt : Date.now() + 60_000));
+        await response.body?.cancel();
+        checkRateLimit();
+      }
+      retryable = response.ok || response.status >= 500 || response.status === 408;
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`书籍服务 ${new URL(url).hostname} 返回 HTTP ${response.status}`);
+      }
+      if (options.encoding && !/^utf-?8$/iu.test(options.encoding)) return iconv.decode(Buffer.from(await response.arrayBuffer()), options.encoding);
       return await response.text();
     } catch (error) {
+      checkRateLimit();
+      if (!retryable) throw error;
       lastError = error;
       if (attempt < retries - 1) await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
     }
@@ -47,6 +79,7 @@ const fetchWebText = async (url: string, params?: Record<string, unknown>, optio
 
 const decodeWebText = (value: string): string => value
   .replace(/<br\s*\/?>/giu, "\n")
+  .replace(/<\/(?:p|div|li|h[1-6])>/giu, "\n")
   .replace(/<[^>]+>/gu, "")
   .replace(/&nbsp;/giu, " ")
   .replace(/&amp;/giu, "&")
@@ -58,7 +91,7 @@ const decodeWebText = (value: string): string => value
 
 // Normal reader pages also load the CAPTCHA script. Only the dedicated challenge
 // page title identifies a completed redirect to verification.
-const isFanqieVerificationPage = (html: string): boolean => /<title>\s*验证码中间页\s*<\/title>/iu.test(html);
+const isFanqieVerificationPage = (html: string): boolean => /<title>\s*(?:验证码中间页|安全验证|访问验证)\s*<\/title>/iu.test(html);
 
 const fanqiePuaStarts = [58344, 58345] as const;
 const decodeFanqiePuaText = (content: string, mode = 0): string => {
@@ -215,11 +248,7 @@ const getFanqieSessionCookie = (params?: Record<string, unknown>): string => {
   fanqieSessionCookies.set(key, created);
   return created;
 };
-const replaceFanqieSessionCookie = (params?: Record<string, unknown>): string => {
-  const created = createFanqieSessionCookie();
-  fanqieSessionCookies.set(fanqieSessionKey(params), created);
-  return created;
-};
+const fanqieVerificationUntil = new Map<string, number>();
 
 const isFanqieBlockedReaderPage = (html: string): boolean => {
   if (isFanqieVerificationPage(html)) return true;
@@ -228,25 +257,22 @@ const isFanqieBlockedReaderPage = (html: string): boolean => {
 };
 
 const fetchFanqieReaderHtml = async (chapter: FanqieChapterLink, bookId: string, params?: Record<string, unknown>): Promise<string> => {
-  let lastError: Error | undefined;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const cookie = attempt === 0 ? getFanqieSessionCookie(params) : replaceFanqieSessionCookie(params);
-    try {
-      const html = await fetchWebText(chapter.url, params, {
-        retries: 1,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-          Referer: `https://fanqienovel.com/page/${bookId}`,
-          Cookie: cookie,
-        },
-      });
-      if (!isFanqieBlockedReaderPage(html)) return html;
-      lastError = new Error("番茄返回了验证码页面");
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-    }
+  const key = fanqieSessionKey(params);
+  const blockedMessage = '番茄返回验证码页，已暂停该出口的正文请求一分钟；请在官方页面确认访问状态，或使用可用书源/本地 TXT';
+  if ((fanqieVerificationUntil.get(key) || 0) > Date.now()) throw new Error(blockedMessage);
+  const html = await fetchWebText(chapter.url, params, {
+    retries: 1,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+      Referer: `https://fanqienovel.com/page/${bookId}`,
+      Cookie: getFanqieSessionCookie(params),
+    },
+  });
+  if (isFanqieBlockedReaderPage(html)) {
+    fanqieVerificationUntil.set(key, Date.now() + 60_000);
+    throw new Error(blockedMessage);
   }
-  throw lastError || new Error("番茄章节未返回有效页面");
+  return html;
 };
 
 const fanqieChapterLinksFromPage = (html: string, maxChapters: number): FanqieChapterLink[] => {
@@ -294,7 +320,7 @@ const downloadFanqieChapter = async (chapter: FanqieChapterLink, number: number,
   const html = await fetchFanqieReaderHtml(chapter, bookId, params);
   const content = extractFanqieReaderContent(html);
   const expectedWords = fanqieExpectedWordCount(html);
-  const complete = content.length > 0 && (expectedWords === 0 || content.length >= Math.min(expectedWords * 0.65, 500));
+  const complete = isCompleteChapterContent(content, expectedWords);
   return {
     id: `fanqie-chapter:${chapter.id}`,
     number,
@@ -314,7 +340,7 @@ const downloadFanqieBook = async (bookUrl: string, sourceBookId: string, params?
   const pageHtml = await fetchWebText(bookUrl, params);
   const chapterLinks = fanqieChapterLinksFromPage(pageHtml, Math.max(1, Math.floor(maxChapters)));
   if (!chapterLinks.length) throw new Error("未找到章节目录，书籍页面可能已变更");
-  return concurrentMap(chapterLinks, 4, async (chapter, index) => {
+  return concurrentMap(chapterLinks, 2, async (chapter, index) => {
     try {
       return await downloadFanqieChapter(chapter, index + 1, bookId, params);
     } catch (error) {
@@ -473,7 +499,7 @@ const parseQianyueRequest = (raw: string, source: QianyueSource, item: unknown, 
   const extraHeaders = descriptor.headers && typeof descriptor.headers === "object" ? descriptor.headers as Record<string, string> : {};
   const charset = String(descriptor.charset || source.encoding || "utf-8");
   const body = typeof descriptor.body === "string" ? qianyueInterpolate(descriptor.body, item, variables) : undefined;
-  const url = resolveBookUrl(source.baseUrl, urlPart.replace(/\n/gu, "").trim());
+  const url = resolveBookUrl(variables.baseUrl || source.baseUrl, urlPart.replace(/\n/gu, "").trim());
   if (!url) throw new Error("书源地址规则无效");
   return { url, method: String(descriptor.method || (body ? "POST" : "GET")).toUpperCase() === "POST" ? "POST" : "GET", body, encoding: charset, headers: { ...baseHeaders, ...extraHeaders } };
 };
@@ -496,66 +522,46 @@ const withoutExpiredAuthorization = (headers: Record<string, string>): Record<st
 );
 
 const fetchQianyueResource = async (request: ReturnType<typeof parseQianyueRequest>, params?: Record<string, unknown>): Promise<string> => {
-  const proxyEnabled = params?.proxyEnabled === true;
-  const proxyURL = typeof params?.proxyURL === "string" ? params.proxyURL.trim() : "";
-  let dispatcher: ProxyAgent | undefined;
-  if (proxyEnabled && proxyURL) {
-    dispatcher = webProxyAgents.get(proxyURL) || new ProxyAgent(proxyURL);
-    webProxyAgents.set(proxyURL, dispatcher);
-  }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8_000);
+  const headers = withoutExpiredAuthorization(request.headers);
+  const execute = (requestHeaders: Record<string, string>) => fetchWebText(request.url, params, {
+    method: request.method, body: request.body, encoding: request.encoding, retries: 2,
+    headers: { ...(request.body ? { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' } : {}), ...requestHeaders },
+  });
   try {
-    const requestHeaders = withoutExpiredAuthorization(request.headers);
-    const execute = async (headers: Record<string, string>) => fetch(request.url, {
-      method: request.method,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        Accept: "text/html,application/json;q=0.9,*/*;q=0.8",
-        ...(request.body ? { "Content-Type": "application/x-www-form-urlencoded; charset=utf-8" } : {}),
-        ...headers,
-      },
-      ...(request.body ? { body: request.body } : {}),
-      ...(dispatcher ? { dispatcher } : {}),
-      signal: controller.signal,
-    } as RequestInit);
-    let response = await execute(requestHeaders);
-    if (response.status === 401 || response.status === 403) {
-      const hasAuthorization = Object.keys(requestHeaders).some(key => key.toLowerCase() === "authorization");
-      if (hasAuthorization) {
-        response = await execute(Object.fromEntries(Object.entries(requestHeaders).filter(([key]) => key.toLowerCase() !== "authorization")));
-      }
+    return await execute(headers);
+  } catch (error) {
+    if (/HTTP (?:401|403)\b/u.test(String(error)) && Object.keys(headers).some(key => key.toLowerCase() === 'authorization')) {
+      return execute(Object.fromEntries(Object.entries(headers).filter(([key]) => key.toLowerCase() !== 'authorization')));
     }
-    if (!response.ok) throw new Error(`书源返回 HTTP ${response.status}`);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    return request.encoding.toLowerCase().includes("gb") ? iconv.decode(bytes, "gbk") : bytes.toString("utf-8");
-  } finally {
-    clearTimeout(timeout);
+    throw error;
   }
 };
 
 const qianyueHtmlSelector = (rule: string): { selector: string; attribute: string } => {
-  const normalized = rule.split("##")[0].replace(/^@css:/iu, "");
+  const normalized = rule.split("##")[0].replace(/^@css:/iu, "").replace(/^@(?=href$|text$|html$)/u, "");
   const segments = normalized.split("@");
-  const attribute = ["text", "html", "href", "src", "content", "textNodes"].includes(segments.at(-1) || "") ? segments.pop() || "text" : "text";
+  const attribute = ["text", "html", "href", "src", "content", "value", "textNodes"].includes(segments.at(-1) || "") ? segments.pop() || "text" : "text";
   const selector = segments.join(" ")
     .replace(/\bclass\.([\w-]+(?:\s+[\w-]+)*)/gu, (_match, names: string) => `.${names.trim().replace(/\s+/gu, ".")}`)
     .replace(/\bid\.([\w-]+)/gu, "#$1")
     .replace(/\btag\./gu, "")
-    .replace(/\.(-?\d+)\b/gu, (_match, index: string) => Number(index) >= 0 ? `:eq(${index})` : "")
-    .replace(/!.*$/u, "")
+    .replace(/\.(-?\d+)\b/gu, (_match, index: string) => `:eq(${index})`)
+    .replace(/!(-?\d+(?::-?\d+)*)/gu, (_match, indexes: string) => indexes.split(':').map(index => `:not(:eq(${index}))`).join(''))
+    .replace(/\btext\.([^@\s]+)/gu, (_match, text: string) => `${attribute === 'href' ? 'a' : '*'}:contains(${JSON.stringify(text)})`)
     .trim();
   return { selector, attribute };
 };
 
-const qianyueHtmlValues = (html: string, rule: unknown, context?: ReturnType<typeof loadHtml>): string[] => {
-  const $ = context || loadHtml(html);
+const qianyueHtmlValues = (html: string, rule: unknown, context?: ReturnType<typeof loadHtml>, elements = false): string[] => {
+  const $ = context || loadHtml(html, undefined, false);
   for (const alternative of String(rule || "").split("||")) {
     if (/^(?:@js:|<js>)/iu.test(alternative.trim())) continue;
     const { selector, attribute } = qianyueHtmlSelector(alternative.trim());
-    if (!selector) continue;
-    const values = $(selector).toArray().map(element => {
+    if (!alternative.trim()) continue;
+    const nodes = selector ? $(selector) : $.root().children();
+    const values = nodes.toArray().map(element => {
       const node = $(element);
+      if (elements) return $.html(element);
       const value = attribute === "html" ? node.html() || "" : attribute === "text" || attribute === "textNodes" ? node.text() : node.attr(attribute) || "";
       return applyQianyueReplacement(value, alternative);
     }).filter(Boolean);
@@ -573,12 +579,12 @@ const parseMaybeJson = (text: string): unknown | null => {
 const qianyueRuleValues = (payload: string, rule: unknown): unknown[] => {
   const json = parseMaybeJson(payload);
   if (json !== null && !String(rule || "").includes("@html") && !String(rule || "").includes("@href")) return qianyuePathValues(json, rule);
-  return qianyueHtmlValues(payload, rule);
+  return qianyueHtmlValues(payload, rule, undefined, true);
 };
 
 const qianyueScalar = (payload: string, item: unknown, rule: unknown): string => {
   const json = parseMaybeJson(payload);
-  return json !== null ? qianyueValue(item, rule) : qianyueHtmlValues(payload, rule, loadHtml(typeof item === "string" ? item : payload))[0] || "";
+  return json !== null ? qianyueValue(item, rule) : qianyueHtmlValues(typeof item === "string" ? item : payload, rule)[0] || "";
 };
 
 const qianyueChapterUrl = (rule: string, item: unknown, tocUrl: string): string => {
@@ -594,7 +600,10 @@ const qianyueChapterUrl = (rule: string, item: unknown, tocUrl: string): string 
       return "";
     }
   }
-  return resolveBookUrl(tocUrl, qianyueInterpolate(rule, item, { baseUrl: tocUrl, key: "", page: "1" }));
+  const rawUrl = typeof item === 'string' && item.trim().startsWith('<')
+    ? qianyueScalar(item, item, rule)
+    : qianyueInterpolate(rule, item, { baseUrl: tocUrl, key: "", page: "1" });
+  return rawUrl ? resolveBookUrl(tocUrl, rawUrl) : "";
 };
 
 const searchQianyueSource = async (source: QianyueSource, query: string, params?: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
@@ -602,12 +611,10 @@ const searchQianyueSource = async (source: QianyueSource, query: string, params?
   const payload = await fetchQianyueResource(request, params);
   const items = qianyueRuleValues(payload, source.ruleSearch.bookList);
   const json = parseMaybeJson(payload);
-  const $ = json === null ? loadHtml(payload) : null;
   return items.slice(0, 30).map((item, index) => {
-    const localPayload = typeof item === "string" && json === null ? item : payload;
-    const value = (rule: unknown) => json !== null ? qianyueValue(item, rule) : qianyueHtmlValues(localPayload, rule, $ || undefined)[index] || "";
+    const value = (rule: unknown) => qianyueScalar(payload, item, rule);
     const title = value(source.ruleSearch.name);
-    const rawUrl = qianyueInterpolate(String(source.ruleSearch.bookUrl || ""), item, { key: query, page: "1", baseUrl: request.url });
+    const rawUrl = json !== null ? qianyueInterpolate(String(source.ruleSearch.bookUrl || ""), item, { key: query, page: "1", baseUrl: request.url }) : value(source.ruleSearch.bookUrl);
     const url = resolveBookUrl(request.url, rawUrl || value(source.ruleSearch.bookUrl));
     return {
       id: `${source.id}:${Buffer.from(url || `${title}-${index}`).toString("base64url")}`,
@@ -636,33 +643,55 @@ const qianyueChapterLinks = async (source: QianyueSource, bookUrl: string, param
   const infoPayload = await fetchQianyueResource(infoRequest, params);
   const infoJson = parseMaybeJson(infoPayload);
   const info = infoJson !== null && source.ruleBookInfo.init ? qianyuePathValues(infoJson, source.ruleBookInfo.init)[0] || infoJson : infoJson;
-  const tocRule = String(source.ruleBookInfo.tocUrl || bookUrl);
-  const tocRequest = parseQianyueRequest(tocRule, source, info, { key: "", page: "1", baseUrl: bookUrl });
-  const tocPayload = await fetchQianyueResource(tocRequest, params);
-  const tocItems = qianyueRuleValues(tocPayload, source.ruleToc.chapterList).slice(0, Math.max(1, Math.floor(maxChapters)));
-  if (!tocItems.length) throw new Error("书源没有返回章节目录");
-  const chapterRule = String(source.ruleToc.chapterUrl || "");
-  const titleRule = source.ruleToc.chapterName;
-  return tocItems.map((item, index) => ({
-    number: index + 1,
-    title: qianyueValue(item, titleRule) || `第 ${index + 1} 章`,
-    url: qianyueChapterUrl(chapterRule, item, tocRequest.url),
-  }));
+  const tocRule = String(source.ruleBookInfo.tocUrl || '').trim();
+  const tocUrl = !tocRule ? infoRequest.url : infoJson !== null || /^(?:https?:|\/|\{\{)/u.test(tocRule)
+    ? qianyueInterpolate(tocRule, info, { key: '', page: '1', baseUrl: infoRequest.url })
+    : qianyueScalar(infoPayload, infoPayload, tocRule);
+  if (!tocUrl) throw new Error('书源目录地址规则未返回链接，当前规则可能需要脚本支持');
+  const firstRequest = parseQianyueRequest(tocUrl, source, info, { key: '', page: '1', baseUrl: infoRequest.url });
+  const pending = [firstRequest.url];
+  const visited = new Set<string>();
+  const seen = new Set<string>();
+  const chapters: QianyueChapterLink[] = [];
+  while (pending.length && chapters.length < maxChapters) {
+    const url = pending.shift()!;
+    if (visited.has(url)) continue;
+    if (visited.size >= 1000) throw new Error('目录分页超过 1000 页，请检查书源规则，未保存残缺目录');
+    visited.add(url);
+    const request = url === firstRequest.url ? firstRequest : parseQianyueRequest(url, source, {}, { key: '', page: '1', baseUrl: url });
+    const payload = url === infoRequest.url ? infoPayload : await fetchQianyueResource(request, params);
+    const items = qianyueRuleValues(payload, source.ruleToc.chapterList);
+    if (!items.length) throw new Error(`书源目录第 ${visited.size} 页没有章节，未保存残缺目录`);
+    for (const item of items) {
+      const chapterUrl = qianyueChapterUrl(String(source.ruleToc.chapterUrl || ''), item, url);
+      const title = qianyueScalar(payload, item, source.ruleToc.chapterName);
+      if (!chapterUrl) throw new Error('书源章节链接解析失败，未保存残缺目录');
+      if (seen.has(chapterUrl)) continue;
+      seen.add(chapterUrl);
+      chapters.push({ number: chapters.length + 1, title: title || `第 ${chapters.length + 1} 章`, url: chapterUrl });
+      if (chapters.length >= maxChapters) break;
+    }
+    const nextRule = String(source.ruleToc.nextTocUrl || '').trim();
+    if (nextRule) {
+      if (/@js:|<js>/iu.test(nextRule)) throw new Error('目录分页规则需要脚本支持，当前无法确认完整目录');
+      const values = parseMaybeJson(payload) !== null ? qianyuePathValues(parseMaybeJson(payload), nextRule).map(String) : qianyueHtmlValues(payload, nextRule);
+      for (const value of values) {
+        const next = resolveBookUrl(url, value);
+        if (next && new URL(next).origin === new URL(firstRequest.url).origin && !visited.has(next) && !pending.includes(next)) pending.push(next);
+      }
+    }
+  }
+  return chapters;
 };
 
 const downloadQianyueSource = async (source: QianyueSource, bookUrl: string, params?: Record<string, unknown>, maxChapters = Number.MAX_SAFE_INTEGER): Promise<Array<Record<string, unknown>>> => {
   const links = await qianyueChapterLinks(source, bookUrl, params, maxChapters);
-  return concurrentMap(links, 4, async (chapter, index) => {
-    if (!chapter.url) return { id: `${source.id}:chapter:${index}`, number: chapter.number, title: chapter.title, url: "", content: "", wordCount: 0, downloaded: false };
+  return concurrentMap(links, 2, async (chapter, index) => {
+    const entry = { ...chapter, id: `${source.id}:chapter:${Buffer.from(chapter.url || String(index)).toString('base64url')}` };
     try {
-      const chapterRequest = parseQianyueRequest(chapter.url, source, {}, { key: "", page: "1", baseUrl: chapter.url });
-      const chapterPayload = await fetchQianyueResource(chapterRequest, params);
-      const contentJson = parseMaybeJson(chapterPayload);
-      const rawContent = contentJson !== null ? qianyueValue(contentJson, source.ruleContent.content) : qianyueHtmlValues(chapterPayload, source.ruleContent.content)[0] || "";
-      const content = cleanBookSourceContent(rawContent, []);
-      return { id: `${source.id}:chapter:${Buffer.from(chapter.url).toString("base64url")}`, number: chapter.number, title: chapter.title, url: chapter.url, content, wordCount: content.replace(/\s/gu, "").length, downloaded: Boolean(content) };
-    } catch {
-      return { id: `${source.id}:chapter:${Buffer.from(chapter.url).toString("base64url")}`, number: chapter.number, title: chapter.title, url: chapter.url, content: "", wordCount: 0, downloaded: false };
+      return await downloadQianyueChapter(source, entry, params);
+    } catch (error) {
+      return { ...entry, content: '', wordCount: 0, downloaded: false, unavailableReason: error instanceof Error ? error.message : '章节下载失败' };
     }
   });
 };
@@ -675,32 +704,14 @@ const sourceSearchBody = (template: string, query: string): string => template
   .replace(/%q/gu, encodeURIComponent(query))
   .replace(/%s/gu, () => JSON.stringify(query).slice(1, -1));
 
-const fetchBookSourceHtml = async (url: string, params: Record<string, unknown> | undefined, options: { method?: "GET" | "POST"; body?: string; contentType?: string; encoding?: string } = {}): Promise<string> => {
-  const proxyEnabled = params?.proxyEnabled === true;
-  const proxyURL = typeof params?.proxyURL === "string" ? params.proxyURL.trim() : "";
-  let dispatcher: ProxyAgent | undefined;
-  if (proxyEnabled && proxyURL) {
-    dispatcher = webProxyAgents.get(proxyURL);
-    if (!dispatcher) {
-      dispatcher = new ProxyAgent(proxyURL);
-      webProxyAgents.set(proxyURL, dispatcher);
-    }
-  }
-  const response = await fetch(url, {
-    method: options.method || "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      ...(options.body ? { "Content-Type": options.contentType || "application/json; charset=utf-8" } : {}),
-    },
-    ...(options.body ? { body: options.body } : {}),
-    ...(dispatcher ? { dispatcher } : {}),
-  } as RequestInit);
-  if (!response.ok) throw new Error(`书源返回 HTTP ${response.status}`);
-  const bytes = Buffer.from(await response.arrayBuffer());
-  return options.encoding && options.encoding.toLowerCase() !== "utf-8" ? iconv.decode(bytes, options.encoding) : bytes.toString("utf-8");
-};
+const fetchBookSourceHtml = async (url: string, params: Record<string, unknown> | undefined, options: { method?: "GET" | "POST"; body?: string; contentType?: string; encoding?: string } = {}): Promise<string> => fetchWebText(url, params, {
+  method: options.method, body: options.body, encoding: options.encoding, retries: 2,
+  headers: {
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    ...(options.body ? { 'Content-Type': options.contentType || 'application/json; charset=utf-8' } : {}),
+  },
+});
 
 const cleanBookSourceContent = (content: string, patterns: string[] = []): string => {
   let cleaned = decodeWebText(content);
@@ -816,50 +827,88 @@ const downloadConfiguredBookSource = async (source: BookSourceDefinition, bookUr
     const bookId = match?.[1]?.replace(/\.html?$/iu, "") || "";
     if (bookId) directoryUrl = source.directoryUrlTemplate.replace(/%s/gu, bookId);
   }
-  const directoryHtml = await fetchBookSourceHtml(directoryUrl, params, { encoding: source.encoding });
-  const $ = loadHtml(directoryHtml);
   const links: Array<{ title: string; url: string }> = [];
   const seen = new Set<string>();
-  $(source.directorySelector).each((_index, element) => {
-    const anchor = $(element);
-    const title = anchor.text().trim();
-    const url = resolveBookUrl(directoryUrl, anchor.attr("href") || "");
-    if (!title || !url || seen.has(url)) return;
-    seen.add(url);
-    links.push({ title, url });
-  });
+  const visited = new Set<string>();
+  let pageUrl: string | undefined = directoryUrl;
+  while (pageUrl && links.length < maxChapters) {
+    if (visited.has(pageUrl) || visited.size >= 1000) throw new Error('目录分页循环或超过 1000 页，未保存残缺目录');
+    visited.add(pageUrl);
+    const html = await fetchBookSourceHtml(pageUrl, params, { encoding: source.encoding });
+    const $ = loadHtml(html);
+    const items = $(source.directorySelector).toArray();
+    if (!items.length) throw new Error(`书源目录第 ${visited.size} 页为空，未保存残缺目录`);
+    for (const element of items) {
+      const anchor = $(element);
+      const title = anchor.text().trim();
+      const href = anchor.attr('href');
+      const url = href ? resolveBookUrl(pageUrl, href) : '';
+      if (!title || !url || seen.has(url)) continue;
+      seen.add(url);
+      links.push({ title, url });
+    }
+    pageUrl = nextContentPage(html, 'text.下一页@href||text.下页@href', pageUrl);
+  }
   const targets = links.slice(0, Math.max(1, Math.floor(maxChapters)));
   if (!targets.length) throw new Error("书源没有返回章节目录");
   const chapters: Array<Record<string, unknown>> = [];
   for (let index = 0; index < targets.length; index += 1) {
     const chapter = targets[index];
+    const entry = { ...chapter, id: `${source.id}:chapter:${Buffer.from(chapter.url).toString('base64url')}`, number: index + 1 };
     try {
-      const html = await fetchBookSourceHtml(chapter.url, params, { encoding: source.encoding });
-      const content = cleanBookSourceContent(loadHtml(html)(source.contentSelector).html() || "", source.filterPatterns);
-      chapters.push({ id: `${source.id}:chapter:${Buffer.from(chapter.url).toString("base64url")}`, number: index + 1, title: chapter.title, url: chapter.url, content, wordCount: content.length, downloaded: Boolean(content) });
-    } catch {
-      chapters.push({ id: `${source.id}:chapter:${Buffer.from(chapter.url).toString("base64url")}`, number: index + 1, title: chapter.title, url: chapter.url, content: "", wordCount: 0, downloaded: false });
+      chapters.push(await downloadConfiguredBookChapter(source, entry, params));
+    } catch (error) {
+      chapters.push({ ...entry, content: '', wordCount: 0, downloaded: false, unavailableReason: error instanceof Error ? error.message : '章节下载失败' });
     }
   }
   return chapters;
 };
 
+// 只跟进明确的章内分页，绝不把“下一章”拼进当前章节
+const nextContentPage = (html: string, rule: string, currentUrl: string): string | undefined => {
+  if (!rule) return undefined;
+  if (/@js:|<js>/iu.test(rule)) throw new Error('正文分页规则需要脚本支持，当前无法确认本章完整性');
+  const $ = loadHtml(html);
+  const values = qianyueHtmlValues(html, rule);
+  for (const value of values) {
+    const url = resolveBookUrl(currentUrl, value);
+    if (!url || url === currentUrl || new URL(url).origin !== new URL(currentUrl).origin) continue;
+    const label = $('a').filter((_index, element) => resolveBookUrl(currentUrl, $(element).attr('href') || '') === url).first().text().trim();
+    if (/下一章|下章|上一章|目录/u.test(label)) continue;
+    if (/下一页|下页|下一頁/u.test(label)) return url;
+  }
+  return undefined;
+};
+
+const checkedChapterContent = (content: string, chapter: Record<string, unknown>): Record<string, unknown> => {
+  if (!content) throw new Error('书源没有返回本章正文');
+  const complete = isCompleteChapterContent(content, Number(chapter.expectedWords) || 0);
+  return { ...chapter, content, wordCount: content.replace(/\s/gu, '').length, downloaded: complete,
+    unavailableReason: complete ? undefined : '正文过短，疑似预览或不完整内容，请核对后重试' };
+};
+
 const downloadQianyueChapter = async (source: QianyueSource, chapter: Record<string, unknown>, params?: Record<string, unknown>): Promise<Record<string, unknown>> => {
   const chapterUrl = String(chapter.url || "").trim();
   if (!chapterUrl) throw new Error("该章节缺少可下载地址");
-  const request = parseQianyueRequest(chapterUrl, source, {}, { key: "", page: "1", baseUrl: chapterUrl });
-  const payload = await fetchQianyueResource(request, params);
-  const contentJson = parseMaybeJson(payload);
-  const rawContent = contentJson !== null ? qianyueValue(contentJson, source.ruleContent.content) : qianyueHtmlValues(payload, source.ruleContent.content)[0] || "";
-  const content = cleanBookSourceContent(rawContent, []);
-  if (!content) throw new Error("书源没有返回本章正文");
-  return {
-    ...chapter,
-    content,
-    wordCount: content.replace(/\s/gu, "").length,
-    downloaded: true,
-    unavailableReason: undefined,
-  };
+  const parts: string[] = [];
+  const visited = new Set<string>();
+  let url: string | undefined = chapterUrl;
+  while (url) {
+    if (visited.has(url) || visited.size >= 100) throw new Error('正文分页循环或超过 100 页，未将片段标记为完整');
+    visited.add(url);
+    const request = parseQianyueRequest(url, source, {}, { key: '', page: '1', baseUrl: url });
+    const payload = await fetchQianyueResource(request, params);
+    const json = parseMaybeJson(payload);
+    // 一条正文规则可能命中多个段落，必须全部保留
+    const raw = json !== null ? qianyueValue(json, source.ruleContent.content) : qianyueHtmlValues(payload, source.ruleContent.content).join('\n');
+    const content = cleanBookSourceContent(raw, []);
+    if (!content) throw new Error(`书源正文第 ${visited.size} 页为空，未将片段标记为完整`);
+    parts.push(content);
+    const next: string | undefined = json === null ? nextContentPage(payload, String(source.ruleContent.nextContentUrl || ''), url) : undefined;
+    if (!next && /本章未完.*(?:下一页|下页)|点击下一页继续/u.test(content)) throw new Error('本章还有分页，但书源未提供可用的下一页链接');
+    url = next;
+  }
+  return checkedChapterContent(parts.join('\n\n'), chapter);
 };
 
 const normalizedBookMatchText = (value: unknown): string => String(value || "").toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
@@ -887,8 +936,7 @@ const downloadFallbackChapter = async (title: string, chapterNumber: number, cha
       const candidate = candidates.find(item => normalizedBookMatchText(item.title) === normalizedTitle);
       if (!candidate?.url) continue;
       const links = await qianyueChapterLinks(source, String(candidate.url), params, Math.max(chapterNumber + 2, 50));
-      const link = links.find(item => normalizedBookMatchText(item.title) === normalizedChapterTitle)
-        || links.find(item => item.number === chapterNumber);
+      const link = links.find(item => normalizedBookMatchText(item.title) === normalizedChapterTitle);
       if (!link?.url) continue;
       const downloaded = await downloadQianyueChapter(source, { number: chapterNumber, title: chapterTitle, url: link.url }, params);
       const content = String(downloaded.content || "");
@@ -904,10 +952,23 @@ const downloadFallbackChapter = async (title: string, chapterNumber: number, cha
 const downloadConfiguredBookChapter = async (source: BookSourceDefinition, chapter: Record<string, unknown>, params?: Record<string, unknown>): Promise<Record<string, unknown>> => {
   const chapterUrl = String(chapter.url || "").trim();
   if (!chapterUrl) throw new Error("该章节缺少可下载地址");
-  const html = await fetchBookSourceHtml(chapterUrl, params, { encoding: source.encoding });
-  const content = cleanBookSourceContent(loadHtml(html)(source.contentSelector).html() || "", source.filterPatterns);
-  if (!content) throw new Error("书源没有返回本章正文");
-  return { ...chapter, content, wordCount: content.length, downloaded: true, unavailableReason: undefined };
+  const parts: string[] = [];
+  const visited = new Set<string>();
+  let url: string | undefined = chapterUrl;
+  while (url) {
+    if (visited.has(url) || visited.size >= 100) throw new Error('正文分页循环或超过 100 页，未将片段标记为完整');
+    visited.add(url);
+    const html = await fetchBookSourceHtml(url, params, { encoding: source.encoding });
+    const $ = loadHtml(html);
+    const raw = $(source.contentSelector).toArray().map(element => $(element).html() || '').join('\n');
+    const content = cleanBookSourceContent(raw, source.filterPatterns);
+    if (!content) throw new Error(`书源正文第 ${visited.size} 页为空，未将片段标记为完整`);
+    parts.push(content);
+    const next: string | undefined = nextContentPage(html, 'text.下一页@href||text.下页@href', url);
+    if (!next && /本章未完.*(?:下一页|下页)|点击下一页继续/u.test(decodeWebText(raw))) throw new Error('本章还有分页，但书源未提供可用的下一页链接');
+    url = next;
+  }
+  return checkedChapterContent(parts.join('\n\n'), chapter);
 };
 
 const parseChineseNumber = (value: string): number | undefined => {
@@ -918,96 +979,132 @@ const parseChineseNumber = (value: string): number | undefined => {
   return Number.isFinite(number) ? Math.round(number) : undefined;
 };
 
-const parseNovelCatchRanking = (html: string, rankType: string, gender: string): Array<Record<string, unknown>> => {
-  const $ = loadHtml(html);
-  const rows: Array<Record<string, unknown>> = [];
-  const seen = new Set<string>();
-  $('div.border-b.border-line').each((_index, element) => {
-    const card = $(element);
-    const titleLink = card.find('a[href^="/book/"]').filter((_index, item) => Boolean($(item).text().trim())).first();
-    const href = titleLink.attr('href') || '';
-    const bookId = href.match(/\/(\d+)$/u)?.[1] || '';
-    const title = titleLink.text().trim();
-    if (!bookId || !title || seen.has(bookId)) return;
-    seen.add(bookId);
-    const info = card.find('.mt-1.flex.flex-wrap.items-center').first().text().replace(/\s+/gu, ' ').trim();
-    const infoParts = info.split('·').map(item => item.trim()).filter(Boolean);
-    const cardText = card.text().replace(/\s+/gu, ' ').trim();
-    const rank = Number(card.find('.font-mono.text-\[15px\]').first().text().trim()) || rows.length + 1;
-    const wordCount = parseChineseNumber(infoParts.find(item => /字$/u.test(item)) || '');
-    const readMatch = cardText.match(/([\d.]+\s*万?)在读/u);
-    rows.push({
-      id: `fanqie:${bookId}`,
-      sourceId: 'novelcatch-rank',
-      sourceBookId: bookId,
-      title,
-      author: infoParts[0] || '未知作者',
-      intro: card.find('p.line-clamp-2').first().text().replace(/\s+/gu, ' ').trim(),
-      cover: resolveBookUrl('https://novelcatch.com/rank', card.find('img').first().attr('src') || '') || undefined,
-      category: card.find('a[href^="/category/"]').first().text().trim() || undefined,
-      rank,
-      rankType,
-      gender: gender === 'male' || gender === 'female' ? gender : 'all',
-      platform: 'fanqie',
-      url: `https://fanqienovel.com/page/${bookId}`,
-      wordCount,
-      readCount: readMatch ? parseChineseNumber(readMatch[1]) : undefined,
-    });
-  });
-  return rows.slice(0, 60);
-};
-
-const novelCatchRankingSections = [
-  { key: 'male-read', label: '男频阅读', gender: 'm', list: 'read' },
-  { key: 'male-new', label: '男频新书', gender: 'm', list: 'new' },
-  { key: 'female-read', label: '女频阅读', gender: 'f', list: 'read' },
-  { key: 'female-new', label: '女频新书', gender: 'f', list: 'new' },
+const fanqieRankingSections = [
+  { key: 'male-read', label: '男频阅读', gender: 'male', list: 'read', prefix: '1_2_' },
+  { key: 'male-new', label: '男频新书', gender: 'male', list: 'new', prefix: '1_1_' },
+  { key: 'female-read', label: '女频阅读', gender: 'female', list: 'read', prefix: '0_2_' },
+  { key: 'female-new', label: '女频新书', gender: 'female', list: 'new', prefix: '0_1_' },
 ] as const;
 
-const parseNovelCatchRankLinks = (html: string, section: typeof novelCatchRankingSections[number]) => {
-  const $ = loadHtml(html);
-  const categories: Array<Record<string, unknown>> = [];
-  const seen = new Set<string>();
-  $('a[href^="/rank?"]').each((_index, element) => {
-    const href = $(element).attr('href') || '';
-    const url = resolveBookUrl('https://novelcatch.com/rank', href);
-    if (!url || seen.has(url)) return;
-    const parsed = new URL(url);
-    if (parsed.searchParams.get('gender') !== section.gender || parsed.searchParams.get('list') !== section.list) return;
-    const category = parsed.searchParams.get('category');
-    if (!category) return;
-    seen.add(url);
-    categories.push({ id: category, label: $(element).text().trim(), url, gender: section.gender === 'f' ? 'female' : 'male', list: section.list });
+// 分类加载和榜单刷新复用一分钟内的页面，并合并尚未完成的同页请求
+const rankingPages = new Map<string, { pending: Promise<string>; expiresAt: number }>();
+const fetchRankingPage = (url: string, params?: Record<string, unknown>): Promise<string> => {
+  const key = `${fanqieSessionKey(params)}|${url}`;
+  const cached = rankingPages.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.pending;
+  const entry = { pending: fetchWebText(url, params, { headers: {
+    Referer: `${new URL(url).origin}/rank/`,
+    // 起点移动站需要移动端标识，桌面标识会被导向另一套页面
+    ...(new URL(url).hostname === 'm.qidian.com' ? { 'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36' } : {}),
+  } }), expiresAt: Infinity };
+  rankingPages.set(key, entry);
+  entry.pending = entry.pending.then(html => {
+    entry.expiresAt = Date.now() + 60_000;
+    return html;
+  }, error => {
+    rankingPages.delete(key);
+    throw error;
   });
-  return categories;
+  return entry.pending;
 };
 
-const fetchNovelCatchRankingCategories = async (params?: Record<string, unknown>) => {
-  const sections = await Promise.all(novelCatchRankingSections.map(async section => {
-    const url = `https://novelcatch.com/rank?gender=${section.gender}&list=${section.list}`;
-    const html = await fetchWebText(url, params);
-    return { key: section.key, label: section.label, url, categories: parseNovelCatchRankLinks(html, section) };
-  }));
-  if (!sections.some(section => section.categories.length)) throw new Error('NovelCatch 官方榜单没有返回分类链接');
+const fetchFanqieRankingCategories = async (params?: Record<string, unknown>) => {
+  const $ = loadHtml(await fetchRankingPage('https://fanqienovel.com/rank', params));
+  const sections = fanqieRankingSections.map(section => {
+    const seen = new Set<string>();
+    const categories = $(`a[href^="/rank/${section.prefix}"]`).toArray().flatMap(element => {
+      const href = $(element).attr('href') || '';
+      const id = href.match(/^\/rank\/[01]_[12]_(\d+)$/u)?.[1];
+      const label = $(element).text().trim();
+      if (!id || !label || seen.has(id)) return [];
+      seen.add(id);
+      return [{ id, label, url: `https://fanqienovel.com${href}`, gender: section.gender, list: section.list }];
+    });
+    return { key: section.key, label: section.label, categories };
+  });
+  if (sections.some(section => !section.categories.length)) throw new Error('番茄官网未返回完整的榜单分类，请稍后重试');
   return sections;
 };
 
-const fetchNovelCatchRanking = async (rankType: string, gender: string, rankUrl: string | undefined, params?: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
-  const sectionGender = gender === 'female' ? 'f' : 'm';
-  const sectionList = rankType === 'new' ? 'new' : 'read';
-  const fallbackUrl = `https://novelcatch.com/rank?gender=${sectionGender}&list=${sectionList}&category=all`;
-  const url = rankUrl && /^https:\/\/novelcatch\.com\/rank\?/u.test(rankUrl) ? rankUrl : fallbackUrl;
-  const rows = parseNovelCatchRanking(await fetchWebText(url, params), rankType, gender);
-  if (!rows.length) throw new Error('NovelCatch 官方榜单没有返回可用书籍，请稍后刷新');
+const fetchFanqieRanking = async (rankType: string, gender: string, rankUrl: string | undefined, params?: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
+  // 默认总榜汇总各分类首页的样本，不冒充官网独立总榜；任一分类失败就保留前端旧数据
+  if (!rankUrl) {
+    const sections = await fetchFanqieRankingCategories(params);
+    const section = sections.find(item => item.key === `${gender === 'female' ? 'female' : 'male'}-${rankType === 'new' ? 'new' : 'read'}`)!;
+    const books = new Map<string, Record<string, unknown>>();
+    for (const category of section.categories) {
+      const rows = await fetchFanqieRanking(rankType, gender, category.url, params);
+      for (const row of rows) {
+        const id = String(row.id);
+        const existing = books.get(id);
+        if (!existing || Number(row.readCount) > Number(existing.readCount)) books.set(id, { ...row, category: category.label });
+      }
+    }
+    return [...books.values()].sort((a, b) => Number(b.readCount) - Number(a.readCount) || String(a.id).localeCompare(String(b.id)))
+      .slice(0, 60).map((book, index) => ({ ...book, rank: index + 1 }));
+  }
+  const prefix = `${gender === 'female' ? 0 : 1}_${rankType === 'new' ? 1 : 2}_`;
+  // 指定分类时必须匹配当前频道与榜型，不接受外部网址
+  if (!new RegExp(`^https://fanqienovel\\.com/rank/${prefix}\\d+$`, 'u').test(rankUrl)) {
+    throw new Error('请先选择番茄官网的题材分类，再刷新榜单');
+  }
+  const $ = loadHtml(await fetchRankingPage(rankUrl, params));
+  // SSR 的图片是占位图，真实封面和字数来自同页 JSON；只解析数据，不执行网页脚本
+  const script = $('script').toArray().map(element => $(element).text()).find(text => text.includes('window.__INITIAL_STATE__='));
+  const serialized = script?.match(/window\.__INITIAL_STATE__=(\{[\s\S]*\});\s*\}/u)?.[1];
+  let metadata: Array<Record<string, unknown>> = [];
+  if (serialized) {
+    try {
+      const state = JSON.parse(serialized);
+      if (Array.isArray(state?.rank?.book_list)) metadata = state.rank.book_list.filter((item: unknown) => item && typeof item === 'object');
+    } catch { /* 页面数据格式变化时仍保留可读榜单，不采用占位封面 */ }
+  }
+  const rows = $('.rank-book-item').toArray().flatMap(element => {
+    const item = $(element);
+    const link = item.find('.title a[href^="/page/"]').first();
+    const id = link.attr('href')?.match(/^\/page\/(\d+)$/u)?.[1];
+    const title = decodeFanqieContent(link.text().trim());
+    if (!id || !title) return [];
+    const data = metadata.find(book => String(book.bookId) === id);
+    return [{
+      id: `fanqie:${id}`, sourceBookId: id, title,
+      author: decodeFanqieContent(item.find('.author').text().trim()),
+      intro: decodeFanqieContent(item.find('.abstract').text().trim()),
+      cover: typeof data?.thumbUri === 'string' ? resolveBookUrl(rankUrl, data.thumbUri) : undefined,
+      wordCount: Number(data?.wordNumber) || undefined,
+      rank: Number(item.find('.book-item-index h1').text()) || 0,
+      readCount: data?.read_count != null && Number.isFinite(Number(data.read_count)) ? Number(data.read_count) : parseChineseNumber(item.find('.book-item-count').text().replace(/^在读[：:]/u, '').trim()),
+      rankType, gender, platform: 'fanqie', url: `https://fanqienovel.com/page/${id}`,
+    }];
+  });
+  if (!rows.length) throw new Error('番茄官网未返回榜单书籍，页面可能需要验证或结构已变化');
   return rows;
 };
 
 const fetchQidianRanking = async (rankType: string, gender: string, params?: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
-  const basePath = rankType === "new" ? "signnewbook" : rankType === "read" ? "readindex" : "yuepiao";
+  const basePath = rankType === "new" ? "sign" : rankType === "read" ? "readindex" : "yuepiao";
   // 起点榜单统一使用官网默认榜单，不再区分男频/女频频道。
-  const pageUrl = `https://www.qidian.com/rank/${basePath}/`;
+  const pageUrl = `https://m.qidian.com/rank/${basePath}/`;
   const parseRankingPage = (html: string) => {
     const $ = loadHtml(html);
+    const mobileBooks = $('.y-list__item').toArray().flatMap(element => {
+      const item = $(element);
+      const link = item.find('a[href*="/book/"]').first();
+      const id = link.attr('href')?.match(/\/book\/(\d+)/u)?.[1];
+      const titleNode = link.find('h2');
+      const title = titleNode.text().trim();
+      if (!id || !title) return [];
+      const metadata = link.find('p[class*="_subTitle_"]').text().split('·').map(value => value.trim());
+      return [{
+        id: `qidian:${id}`, sourceBookId: id, title, author: metadata[0] || '未知作者',
+        category: metadata[1] || undefined, wordCount: parseChineseNumber(metadata[2] || ''),
+        intro: link.find('p[class*="_bookDesc_"]').text().trim(),
+        cover: resolveBookUrl(pageUrl, link.find('img').attr('data-src') || link.find('img').attr('src') || '') || undefined,
+        rank: Number(titleNode.attr('title')?.match(/第(\d+)位/u)?.[1]) || Number(item.attr('data-index')) + 1,
+        rankType, gender: 'all', platform: 'qidian', url: `https://www.qidian.com/book/${id}/`,
+      }];
+    });
+    if (mobileBooks.length) return mobileBooks;
     // 页面顶部也可能带 data-rid 的导航项；先筛出真实书籍行再截取，避免
     // 前置无关元素占满 slice 后造成“返回 0 本书”。
     const rankRows = $('[data-rid], li.rank-list-item, .rank-list .book-mid-info').toArray().filter(element => {
@@ -1049,16 +1146,10 @@ const fetchQidianRanking = async (rankType: string, gender: string, params?: Rec
       return [{ id: `qidian:${id}`, sourceBookId: id, title, author: card.find('.author a.name, .author a').first().text().trim() || '未知作者', intro: card.find('.intro, [class*="intro"]').first().text().trim(), cover: resolveBookUrl(pageUrl, card.find('img').first().attr('src') || '') || undefined, category: undefined, rank: index + 1, rankType, gender: 'all', platform: 'qidian', url: href }];
     }).slice(0, 60);
   };
-  const requestOptions = { headers: { Referer: 'https://www.qidian.com/rank/' } };
-  let books = parseRankingPage(await fetchWebText(pageUrl, params, requestOptions));
-  // 部分代理出口会被起点的 WAF 直接替换为探针页。榜单是公开页面，解析不到
-  // 书籍时自动直连重试一次，避免把代理校验页误报为“榜单没有书”。
-  if (!books.length && params?.proxyEnabled === true) {
-    books = parseRankingPage(await fetchWebText(pageUrl, { ...params, proxyEnabled: false }, requestOptions));
-  }
+  const html = await fetchRankingPage(pageUrl, params);
+  const books = parseRankingPage(html);
   if (!books.length) {
-    const probe = await fetchWebText(pageUrl, { ...params, proxyEnabled: false }, requestOptions).catch(() => '');
-    if (/C2WF946J0\/probe\.js|var\s+buid\s*=|challenge|verify/iu.test(probe)) throw new Error(`起点中文网${basePath}返回了反爬校验页，请更换代理出口或稍后重试`);
+    if (/C2WF946J0\/probe\.js|var\s+buid\s*=|<title>[^<]*(?:验证|校验)/iu.test(html)) throw new Error(`起点中文网${basePath}返回了校验页，请在浏览器中打开官方榜单确认访问状态`);
     throw new Error(`起点中文网${basePath}未找到书籍条目，官网结构可能已变化`);
   }
   return books;
@@ -1091,7 +1182,7 @@ const fetchFalooRanking = async (rankType: string, gender: string, params?: Reco
 
 export {
   qianyueSources, webBookSources, searchQianyueSource, searchConfiguredBookSource, searchFanqieSource,
-  searchAllBookSources, fetchNovelCatchRankingCategories, fetchQidianRanking, fetchFalooRanking,
-  fetchNovelCatchRanking, downloadFanqieChapter, downloadFallbackChapter, downloadQianyueChapter,
+  searchAllBookSources, fetchFanqieRankingCategories, fetchQidianRanking, fetchFalooRanking,
+  fetchFanqieRanking, downloadFanqieChapter, downloadFallbackChapter, downloadQianyueChapter,
   downloadConfiguredBookChapter, downloadQianyueSource, downloadConfiguredBookSource, downloadFanqieBook,
 };

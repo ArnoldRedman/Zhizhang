@@ -26,6 +26,7 @@ import { analyzeAIChapter, buildAIDetectionReport } from './domain/ai-detection'
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
 import type { DismantleChapter, DismantleBook, DismantleAggregate, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
+import { mergeDownloadedChapters, matchDownloadBook } from './features/library/download';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
 import { projectAgentSessionId, chapterOutlineNumber, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentMode, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
 import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
@@ -85,7 +86,7 @@ const fanqieSectionOptions: Array<{ value: FanqieSection; label: string; gender:
 
 const rankingTypeOptions = (platform: RankingPlatform): Array<{ value: RankingType; label: string }> => {
   if (platform === 'fanqie') return [{ value: 'read', label: '阅读榜' }, { value: 'new', label: '新书榜' }];
-  if (platform === 'qidian') return [{ value: 'hot', label: '月票榜' }, { value: 'new', label: '签约作者新书榜' }, { value: 'read', label: '阅读指数榜' }];
+  if (platform === 'qidian') return [{ value: 'hot', label: '月票榜' }, { value: 'new', label: '签约榜' }, { value: 'read', label: '阅读指数榜' }];
   if (platform === 'faloo') return [{ value: 'read', label: '24小时畅销榜' }];
   return [{ value: 'read', label: '阅读榜' }];
 };
@@ -1412,7 +1413,7 @@ function App() {
     if (activeTab !== 'rankings' || rankingPlatform !== 'fanqie' || Object.values(fanqieCategories).some(items => items.length)) return;
     if (!('__TAURI_INTERNALS__' in window)) return;
     setFanqieCategoriesLoading(true);
-    void agentRpc<{ sections?: Array<{ key: FanqieSection; categories?: RankingCategoryOption[] }> }>('ranking.categories', { ...agentNetworkParams(agentConfig) })
+    void agentRpc<{ sections?: Array<{ key: FanqieSection; categories?: RankingCategoryOption[] }> }>('ranking.categories', { proxyEnabled: agentConfig.proxyEnabled, proxyURL: agentConfig.proxyURL.trim(), proxyBypassLocal: agentConfig.proxyBypassLocal })
       .then(result => {
         const next = { 'male-read': [], 'male-new': [], 'female-read': [], 'female-new': [] } as Record<FanqieSection, RankingCategoryOption[]>;
         (result.sections || []).forEach(section => { if (section.key in next) next[section.key as FanqieSection] = Array.isArray(section.categories) ? section.categories : []; });
@@ -1421,7 +1422,7 @@ function App() {
       })
       .catch(error => setNotice({ title: '番茄榜单分类加载失败', content: String(error) }))
       .finally(() => setFanqieCategoriesLoading(false));
-  }, [activeTab, rankingPlatform, fanqieCategories, agentConfig]);
+  }, [activeTab, rankingPlatform, fanqieCategories, agentConfig.proxyEnabled, agentConfig.proxyURL, agentConfig.proxyBypassLocal]);
 
   const [agentInstruction, setAgentInstruction] = useState(defaultChapterInstruction);
   const [outlineAgentInstruction, setOutlineAgentInstruction] = useState('根据作品设定和当前大纲内容补全结构，明确章节目标、冲突推进、人物动机和结尾钩子。');
@@ -2553,7 +2554,7 @@ function App() {
   };
 
   const createDismantleFromLibrary = (book: LibraryBook) => {
-    const chapters = book.chapters.filter(chapter => chapter.content.trim()).map((chapter, index) => normalizeDismantleChapter({
+    const chapters = book.chapters.filter(chapter => chapter.downloaded && chapter.content.trim()).map((chapter, index) => normalizeDismantleChapter({
       id: localResourceId('dismantle-chapter'), number: chapter.number || index + 1, title: chapter.title,
       sourceContent: chapter.content, status: 'pending', updatedAt: new Date().toISOString(),
     }, index));
@@ -2563,10 +2564,12 @@ function App() {
     }
     const existing = dismantleBooks.find(item => item.sourceLibraryBookId === book.id);
     if (existing) {
+      const added = chapters.filter(chapter => !existing.chapters.some(item => item.number === chapter.number && item.title === chapter.title));
+      if (added.length) updateDismantleBook(existing.id, current => ({ ...current, chapters: [...current.chapters, ...added].sort((a, b) => a.number - b.number), updatedAt: new Date().toISOString() }));
       setActiveDismantleBookId(existing.id);
-      setActiveDismantleChapterId(existing.chapters[0]?.id || null);
+      setActiveDismantleChapterId(existing.chapters[0]?.id || added[0]?.id || null);
       setActiveTab('dismantles');
-      setNotice({ title: '已打开拆书资料', content: `《${book.title}》已经在拆书管理中。` });
+      setNotice({ title: '已打开拆书资料', content: `《${book.title}》新增 ${added.length} 章；原有分析保留。书库仍有 ${book.chapters.filter(chapter => !chapter.downloaded).length} 章未完整下载。` });
       return;
     }
     const now = new Date().toISOString();
@@ -2579,7 +2582,7 @@ function App() {
     setActiveDismantleChapterId(chapters[0]?.id || null);
     setSelectedDismantleChapterIds(chapters.slice(0, 1).map(chapter => chapter.id));
     setActiveTab('dismantles');
-    setNotice({ title: '已加入拆书管理', content: `《${book.title}》共 ${chapters.length} 章可分析。` });
+    setNotice({ title: '已加入拆书管理', content: `《${book.title}》共 ${chapters.length} 章可分析，另有 ${book.chapters.length - chapters.length} 章未完整下载，不参与拆书。` });
   };
 
   const runBookSearch = async () => {
@@ -2624,10 +2627,10 @@ function App() {
     try {
       let downloadable: LibraryBook | RankingBook = book;
       if ('platform' in book && book.platform !== 'fanqie') {
-        const search = await agentRpc<{ books?: Partial<LibraryBook>[] }>('book.search', { query: book.title, source: 'qianyue-kuwo', ...agentNetworkParams(agentConfig) });
+        const search = await agentRpc<{ books?: Partial<LibraryBook>[] }>('book.search.all', { query: book.title, ...agentNetworkParams(agentConfig) });
         const candidates = (search.books || []).map(candidate => normalizeLibraryBook(candidate));
-        const matched = candidates.find(candidate => candidate.title.trim() === book.title.trim()) || candidates[0];
-        if (!matched) throw new Error(`小说书源中没有找到《${book.title}》，可在书籍管理中切换书源搜索。`);
+        const matched = matchDownloadBook(candidates, book.title, book.author);
+        if (!matched) throw new Error(`全部书源中没有匹配到《${book.title}》及其作者，请到书籍管理核对搜索结果，或导入本地 TXT。`);
         downloadable = matched;
       }
       const result = await agentRpc<{ chapters?: Partial<LibraryBookChapter>[]; intro?: string; cover?: string; downloadedChapterCount?: number; completedChapterCount?: number }>('book.download', {
@@ -2636,18 +2639,20 @@ function App() {
           ...agentNetworkParams(agentConfig),
         });
       const downloadedChapterCount = Number(result.completedChapterCount) || (result.chapters || []).filter(chapter => chapter.downloaded === true && typeof chapter.content === 'string' && chapter.content.trim()).length;
-      if (!downloadedChapterCount) throw new Error('没有获取到完整正文，未保存空章节。可稍后重试，或导入本地 TXT。');
+      if (!result.chapters?.length) throw new Error('没有获取到章节目录，可稍后重试或导入本地 TXT。');
       const now = new Date().toISOString();
-      const normalized = normalizeLibraryBook({ ...downloadable, id: libraryBooks.find(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id))?.id || localResourceId('book'), chapters: (result.chapters || []).map((chapter, index) => normalizeLibraryBookChapter(chapter, index)), intro: result.intro || downloadable.intro, cover: result.cover || downloadable.cover, downloadedAt: now, createdAt: now, updatedAt: now });
+      const normalized = normalizeLibraryBook({ ...downloadable, sourceId: downloadable.sourceId || 'fanqie', id: libraryBooks.find(item => (item.sourceId || 'fanqie') === (downloadable.sourceId || 'fanqie') && item.sourceBookId === (downloadable.sourceBookId || downloadable.id))?.id || localResourceId('book'), chapters: (result.chapters || []).map((chapter, index) => normalizeLibraryBookChapter(chapter, index)), intro: result.intro || downloadable.intro, cover: result.cover || downloadable.cover, downloadedAt: now, createdAt: now, updatedAt: now });
+      const previous = libraryBooks.find(item => item.id === normalized.id);
+      if (previous) normalized.chapters = mergeDownloadedChapters(previous.chapters, normalized.chapters);
       setLibraryBooks(current => {
-        const existing = current.findIndex(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id) || item.id === normalized.id);
-        if (existing >= 0) return current.map((item, index) => index === existing ? { ...item, ...normalized, id: item.id } : item);
+        const existing = current.findIndex(item => (item.sourceId || 'fanqie') === normalized.sourceId && item.sourceBookId === normalized.sourceBookId);
+        if (existing >= 0) return current.map((item, index) => index === existing ? { ...item, ...normalized, id: item.id, chapters: mergeDownloadedChapters(item.chapters, normalized.chapters) } : item);
         return [...current, normalized];
       });
       setActiveLibraryBookId(normalized.id);
       setActiveLibraryChapterId(normalized.chapters[0]?.id || null);
       setActiveTab('books');
-      setNotice({ title: '小说下载完成', content: `《${normalized.title}》已保存 ${downloadedChapterCount}/${normalized.chapters.length} 章完整正文到书籍管理。` });
+      setNotice({ title: downloadedChapterCount === normalized.chapters.length ? '书源目录下载完成' : '书籍已保存，仍有缺章', content: `《${normalized.title}》本次成功 ${downloadedChapterCount}/${normalized.chapters.length} 章。失败章节及原因已保留，可点“重新下载未完成”；目录本身是否齐全仍需与原书核对。` });
       return normalized;
     } catch (error) {
       setNotice({ title: '小说下载失败', content: String(error) });
@@ -2676,13 +2681,11 @@ function App() {
     setLibraryChapterDownloadRunningId(chapter.id);
     try {
       const refreshed = await requestLibraryChapterDownload(book, chapter);
-      if (refreshed.downloaded) {
-        setLibraryBooks(current => current.map(item => item.id === book.id ? {
-          ...item,
-          chapters: item.chapters.map(existing => existing.id === chapter.id ? refreshed : existing),
-          updatedAt: new Date().toISOString(),
-        } : item));
-      }
+      setLibraryBooks(current => current.map(item => item.id === book.id ? {
+        ...item,
+        chapters: item.chapters.map(existing => existing.id === chapter.id ? mergeDownloadedChapters([existing], [refreshed])[0] : existing),
+        updatedAt: new Date().toISOString(),
+      } : item));
       setActiveLibraryChapterId(chapter.id);
       setNotice(refreshed.downloaded
         ? { title: '本章下载完成', content: `《${book.title}》${refreshed.title}已保存 ${refreshed.wordCount.toLocaleString()} 字。` }
@@ -2708,12 +2711,10 @@ function App() {
       for (const chapter of pending) {
         try {
           const refreshed = await requestLibraryChapterDownload(book, chapter);
-          if (refreshed.downloaded) {
-            updates.set(chapter.id, refreshed);
-            completed += 1;
-          }
-        } catch {
-          // Keep the existing preview and continue with the remaining chapters.
+          updates.set(chapter.id, mergeDownloadedChapters([chapter], [refreshed])[0]);
+          if (refreshed.downloaded) completed += 1;
+        } catch (error) {
+          updates.set(chapter.id, { ...chapter, unavailableReason: String(error) });
         }
       }
       if (updates.size) {
@@ -5472,7 +5473,7 @@ function App() {
       selectedCardIds: [],
     });
     await invoke<string>('start_agent_runtime');
-    return agentRpc<{ reviewResult: AgentReviewResult }>('chapter.review', {
+    return agentRpc<{ reviewResult: AgentReviewResult; lintFindings?: AgentDraftResult['lintFindings'] }>('chapter.review', {
       runId: `review-${chapter.id}`,
       ...context.params,
       existingContent: chapter.content,
@@ -5931,11 +5932,28 @@ function App() {
       });
       const content = result.content?.trim() || '';
       if (!content) throw new Error('修改模型没有返回正文');
+      // 改完就是一篇新正文，旧审查报告不能替它担保；作者点一次修订就该能直接写入，所以接着自动复审一次
+      const body = splitChapterTitleHeading(content).content;
       setAgentDraft(current => current ? { ...current, draftContent: content, reviewResult: undefined } : current);
       setAgentDisplayContent(content);
       setAgentAuthorFeedback('');
-      setDraftRevision({ status: 'done', startedAt, message: `修订完成，共 ${countNovelCharacters(content).toLocaleString()} 字，用时 ${Math.round((Date.now() - startedAt) / 1000)} 秒；尚未写入原章` });
-      setNotice({ title: '草稿已按意见修改', content: '请重新运行审查；原章仍未写入。' });
+      setDraftRevision({ status: 'running', startedAt, message: '修订完成，正在复审这一版，通过后就能直接写入' });
+      try {
+        const recheck = await reviewExistingChapter(editingProject, { ...activeChapter, content: body });
+        setAgentDraft(current => current ? { ...current, reviewResult: recheck.reviewResult, lintFindings: recheck.lintFindings || [] } : current);
+        const issues = draftAcceptanceIssues(body, Math.round(Number(editingProject.chapterTargetWords) || 3000), recheck.reviewResult);
+        setDraftRevision({
+          status: 'done',
+          startedAt,
+          message: `修订并复审完成，共 ${countNovelCharacters(content).toLocaleString()} 字，用时 ${Math.round((Date.now() - startedAt) / 1000)} 秒；${issues.length ? `复审未通过：${issues.join('；')}` : '复审通过，接受并写入即可'}；尚未写入原章`,
+        });
+        setNotice({ title: issues.length ? '草稿已修改，复审未通过' : '草稿已修改并通过复审', content: issues.length ? `${issues.join('；')}。确认无误后可覆盖写入。` : '原章仍未写入，点“接受并写入”即可。' });
+      } catch (error) {
+        // 复审失败不动已经改好的正文，写不写由作者自己决定
+        const message = error instanceof Error ? error.message : String(error);
+        setDraftRevision({ status: 'error', startedAt, message: `修订完成，但复审失败：${message}。这一版没有有效审查，接受并写入会要求确认` });
+        setNotice({ title: '草稿已修改，复审失败', content: `${message}。草稿已保留，可再点一次修改，或直接覆盖写入。` });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setDraftRevision({ status: 'error', startedAt, message: `修订失败：${message}。原草稿已保留，可重试` });
@@ -8527,7 +8545,7 @@ function App() {
                     <div className="agent-author-feedback">
                       <label htmlFor="agent-author-feedback"><strong>作者补充意见</strong><small>审查意见会自动带入；你可以补充哪些地方必须改、哪些建议不要采纳。</small></label>
                       <textarea id="agent-author-feedback" className="input" rows={4} value={agentAuthorFeedback} placeholder="例如：庭审胜利后幼薇要明显哭出来；沈妄不要只用动作回应；本章停在法院，不要提前写夜里翻笔记本。" onChange={(event) => setAgentAuthorFeedback(event.target.value)} />
-                      <button className="btn-secondary" disabled={draftRevision?.status === 'running' || agentRunning(agentStage)} aria-busy={draftRevision?.status === 'running'} onClick={reviseAgentDraftWithFeedback}>{draftRevision?.status === 'running' ? `修订中 · 已用 ${Math.max(0, Math.floor((nowTick - draftRevision.startedAt) / 1000))} 秒` : '按审查和作者意见修改'}</button>
+                      <button className="btn-secondary" disabled={draftRevision?.status === 'running' || agentRunning(agentStage)} aria-busy={draftRevision?.status === 'running'} onClick={reviseAgentDraftWithFeedback}>{draftRevision?.status === 'running' ? `修订与复审中 · 已用 ${Math.max(0, Math.floor((nowTick - draftRevision.startedAt) / 1000))} 秒` : '按审查和作者意见修改'}</button>
                       {draftRevision && <p role="status" className={draftRevision.status === 'error' ? 'agent-review-error' : 'empty-hint compact'}>{draftRevision.message}</p>}
                     </div>
                     <div className="agent-result-actions">
@@ -8699,7 +8717,7 @@ function App() {
             <div className="library-workspace" style={{ ['--pane-library-list' as string]: `${panes.sizes.libraryList}px` }}>
               <PaneResizer name="libraryList" axis="x" label="拖动调整书籍列表宽度，双击复位" controller={panes} />
               <aside className="library-list"><div className="panel-section-title">已下载书籍 <span>{libraryBooks.length}</span></div>{libraryBooks.length === 0 ? <p className="empty-hint">还没有下载书籍。可先搜索，或从扫榜管理下载。</p> : libraryBooks.map(book => <button type="button" key={book.id} className={`library-book-item ${book.id === activeLibraryBookId ? 'active' : ''}`} onClick={() => { setActiveLibraryBookId(book.id); setActiveLibraryChapterId(book.chapters[0]?.id || null); }}><strong>{book.title}</strong><small>{book.author} · {book.chapters.length} 章</small></button>)}</aside>
-              {activeLibraryBook ? <section className="library-detail"><header className="library-detail-header"><div><span>{activeLibraryBook.source}</span><h3>{activeLibraryBook.title}</h3><small>{activeLibraryBook.author} · {activeLibraryBook.chapters.length} 章 · {activeLibraryBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="library-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_library_book_location', { bookId: activeLibraryBook.id, bookTitle: activeLibraryBook.title }).catch(error => setNotice({ title: '打开书籍位置失败', content: String(error) }))}>打开位置</button>{activeLibraryBook.chapters.some(chapter => !chapter.downloaded) && <button className="link-button" disabled={libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryUnfinishedLibraryChapters(activeLibraryBook)}>{libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}` ? '重新下载中...' : '重新下载未完成'}</button>}<button className="btn-primary library-dismantle-button" onClick={() => createDismantleFromLibrary(activeLibraryBook)}><span>拆</span>一键拆书</button><button className="link-button danger-link" onClick={() => void deleteLibraryBook(activeLibraryBook)}>删除</button></div></header><p className="library-intro">{activeLibraryBook.intro || '暂无简介'}</p><div className="library-reading-workspace" style={{ ['--pane-library-reader' as string]: `${panes.sizes.libraryReader}px` }}><PaneResizer name="libraryReader" axis="x" label="拖动调整章节目录宽度，双击复位" controller={panes} /><div className="library-chapter-pane"><div className="library-chapter-pane-heading"><strong>章节目录</strong><span>{activeLibraryBook.chapters.length} 章</span></div><div className="library-chapter-list">{activeLibraryBook.chapters.map(chapter => <div className={`library-chapter-row ${chapter.id === activeLibraryChapter?.id ? 'active' : ''}`} key={chapter.id}><button type="button" className="library-chapter-select" onClick={() => setActiveLibraryChapterId(chapter.id)}><span>第 {chapter.number} 章</span><strong>{chapter.title}</strong><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.downloaded ? '已下载' : '未下载'}</small></button>{!chapter.downloaded && <button type="button" className="library-chapter-retry" disabled={libraryChapterDownloadRunningId === chapter.id || libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryLibraryChapter(activeLibraryBook, chapter)}>{libraryChapterDownloadRunningId === chapter.id ? '下载中...' : '重新下载'}</button>}</div>)}</div></div><article className="library-reader">{activeLibraryChapter ? <><header className="library-reader-header"><div><span>第 {activeLibraryChapter.number} 章</span><h4>{activeLibraryChapter.title}</h4><small>{activeLibraryChapter.wordCount.toLocaleString()} 字</small></div><button className="btn-secondary" disabled={libraryOutlineRunningId === activeLibraryChapter.id || !activeLibraryChapter.content.trim()} onClick={() => void generateLibraryChapterOutline(activeLibraryBook, activeLibraryChapter)}>{libraryOutlineRunningId === activeLibraryChapter.id ? '生成章纲中...' : '生成章纲'}</button></header>{activeLibraryChapter.unavailableReason && <div className="library-chapter-warning">{activeLibraryChapter.unavailableReason}</div>}{activeLibraryChapter.content.trim() ? <pre className="library-reader-content">{activeLibraryChapter.content}</pre> : <div className="library-reader-empty">该章节没有可阅读的本地正文。</div>}{activeLibraryChapter.outline && <details className="library-reader-outline" open><summary>本章章纲</summary><pre>{activeLibraryChapter.outline}</pre></details>}</> : <div className="library-reader-empty">选择章节开始阅读。</div>}</article></div></section> : <div className="empty-state"><p>选择一本已下载书籍查看章节。</p></div>}
+              {activeLibraryBook ? <section className="library-detail"><header className="library-detail-header"><div><span>{activeLibraryBook.source}</span><h3>{activeLibraryBook.title}</h3><small>{activeLibraryBook.author} · {activeLibraryBook.chapters.length} 章 · {activeLibraryBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="library-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_library_book_location', { bookId: activeLibraryBook.id, bookTitle: activeLibraryBook.title }).catch(error => setNotice({ title: '打开书籍位置失败', content: String(error) }))}>打开位置</button>{activeLibraryBook.chapters.some(chapter => !chapter.downloaded) && <button className="link-button" disabled={libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryUnfinishedLibraryChapters(activeLibraryBook)}>{libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}` ? '重新下载中...' : '重新下载未完成'}</button>}<button className="btn-secondary" disabled={bookDownloadRunningId === activeLibraryBook.id || Boolean(libraryChapterDownloadRunningId) || activeLibraryBook.sourceId === 'local-txt'} onClick={() => void downloadLibraryBook(activeLibraryBook)}>{bookDownloadRunningId === activeLibraryBook.id ? '重新下载中...' : '刷新目录并重新下载'}</button><button className="btn-primary library-dismantle-button" onClick={() => createDismantleFromLibrary(activeLibraryBook)}><span>拆</span>一键拆书</button><button className="link-button danger-link" onClick={() => void deleteLibraryBook(activeLibraryBook)}>删除</button></div></header><p className="library-intro">{activeLibraryBook.intro || '暂无简介'}</p><div className="library-reading-workspace" style={{ ['--pane-library-reader' as string]: `${panes.sizes.libraryReader}px` }}><PaneResizer name="libraryReader" axis="x" label="拖动调整章节目录宽度，双击复位" controller={panes} /><div className="library-chapter-pane"><div className="library-chapter-pane-heading"><strong>章节目录</strong><span>{activeLibraryBook.chapters.length} 章</span></div><div className="library-chapter-list">{activeLibraryBook.chapters.map(chapter => <div className={`library-chapter-row ${chapter.id === activeLibraryChapter?.id ? 'active' : ''}`} key={chapter.id}><button type="button" className="library-chapter-select" onClick={() => setActiveLibraryChapterId(chapter.id)}><span>第 {chapter.number} 章</span><strong>{chapter.title}</strong><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.downloaded ? '已下载' : '未下载'}</small></button>{!chapter.downloaded && <button type="button" className="library-chapter-retry" disabled={libraryChapterDownloadRunningId === chapter.id || libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryLibraryChapter(activeLibraryBook, chapter)}>{libraryChapterDownloadRunningId === chapter.id ? '下载中...' : '重新下载'}</button>}</div>)}</div></div><article className="library-reader">{activeLibraryChapter ? <><header className="library-reader-header"><div><span>第 {activeLibraryChapter.number} 章</span><h4>{activeLibraryChapter.title}</h4><small>{activeLibraryChapter.wordCount.toLocaleString()} 字</small></div><button className="btn-secondary" disabled={libraryOutlineRunningId === activeLibraryChapter.id || !activeLibraryChapter.content.trim()} onClick={() => void generateLibraryChapterOutline(activeLibraryBook, activeLibraryChapter)}>{libraryOutlineRunningId === activeLibraryChapter.id ? '生成章纲中...' : '生成章纲'}</button></header>{activeLibraryChapter.unavailableReason && <div className="library-chapter-warning">{activeLibraryChapter.unavailableReason}</div>}{activeLibraryChapter.content.trim() ? <pre className="library-reader-content">{activeLibraryChapter.content}</pre> : <div className="library-reader-empty">该章节没有可阅读的本地正文。</div>}{activeLibraryChapter.outline && <details className="library-reader-outline" open><summary>本章章纲</summary><pre>{activeLibraryChapter.outline}</pre></details>}</> : <div className="library-reader-empty">选择章节开始阅读。</div>}</article></div></section> : <div className="empty-state"><p>选择一本已下载书籍查看章节。</p></div>}
             </div>
           </div>
         )}
@@ -8711,7 +8729,7 @@ function App() {
         {activeTab === 'rankings' && (
           <div className="ranking-page">
             <header className="page-header"><div><span className="page-eyebrow">市场观察</span><h2>扫榜管理</h2><p>聚合番茄小说网、起点和飞卢榜单，选书后可下载或进入拆书流程。</p></div><div className="ranking-header-actions"><button className="btn-primary" onClick={() => void fetchRankingBooks()} disabled={rankingLoading}>{rankingLoading ? '拉取中...' : '刷新榜单'}</button></div></header>
-            <div className="ranking-toolbar"><select className="select" aria-label="榜单平台" value={rankingPlatform} onChange={event => { const nextPlatform = event.target.value as RankingPlatform; setRankingPlatform(nextPlatform); setRankingBooks([]); if (nextPlatform === 'fanqie') { setFanqieSection('male-read'); setFanqieCategoryId('all'); setRankingType('read'); } else { setRankingType(rankingTypeOptions(nextPlatform)[0].value); } }}><option value="fanqie">番茄小说网</option><option value="qidian">起点中文网</option><option value="faloo">飞卢中文网</option></select>{rankingPlatform === 'fanqie' ? <><select className="select" aria-label="番茄榜单分类" value={fanqieSection} onChange={event => { setFanqieSection(event.target.value as FanqieSection); setFanqieCategoryId('all'); }} >{fanqieSectionOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select className="select" aria-label="番茄题材分类" value={fanqieCategoryId} onChange={event => setFanqieCategoryId(event.target.value)} disabled={fanqieCategoriesLoading}><option value="all">{fanqieCategoriesLoading ? '分类加载中...' : '总榜'}</option>{(fanqieCategories[fanqieSection] || []).filter(category => category.id !== 'all').map(category => <option key={category.id} value={category.id}>{category.label}</option>)}</select></> : <select className="select" value={rankingType} onChange={event => setRankingType(event.target.value as RankingType)}>{rankingTypeOptions(rankingPlatform).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>}<input className="input" value={rankingQuery} onChange={event => setRankingQuery(event.target.value)} placeholder="筛选书名、作者、分类" />{rankingSourceName && <span className="ranking-source-label">数据来源：{rankingSourceName}</span>}</div>
+            <div className="ranking-toolbar"><select className="select" aria-label="榜单平台" value={rankingPlatform} onChange={event => { const nextPlatform = event.target.value as RankingPlatform; setRankingPlatform(nextPlatform); setRankingBooks([]); if (nextPlatform === 'fanqie') { setFanqieSection('male-read'); setFanqieCategoryId('all'); setRankingType('read'); } else { setRankingType(rankingTypeOptions(nextPlatform)[0].value); } }}><option value="fanqie">番茄小说网</option><option value="qidian">起点中文网</option><option value="faloo">飞卢中文网</option></select>{rankingPlatform === 'fanqie' ? <><select className="select" aria-label="番茄榜单分类" value={fanqieSection} onChange={event => { setFanqieSection(event.target.value as FanqieSection); setFanqieCategoryId('all'); }} >{fanqieSectionOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select className="select" aria-label="番茄题材分类" value={fanqieCategoryId} onChange={event => setFanqieCategoryId(event.target.value)} disabled={fanqieCategoriesLoading}><option value="all">{fanqieCategoriesLoading ? '分类加载中...' : '总榜（分类汇总）'}</option>{(fanqieCategories[fanqieSection] || []).filter(category => category.id !== 'all').map(category => <option key={category.id} value={category.id}>{category.label}</option>)}</select></> : <select className="select" value={rankingType} onChange={event => setRankingType(event.target.value as RankingType)}>{rankingTypeOptions(rankingPlatform).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>}<input className="input" value={rankingQuery} onChange={event => setRankingQuery(event.target.value)} placeholder="筛选书名、作者、分类" />{rankingSourceName && <span className="ranking-source-label">数据来源：{rankingSourceName}</span>}</div>
             {visibleRankingBooks.length === 0 ? <div className="empty-state"><p>选择平台后点击“刷新榜单”。</p></div> : <div className="ranking-grid">{visibleRankingBooks.map(book => <article className="ranking-book-card" key={book.id}><div className="ranking-book-rank">{book.rank}</div><div className={`ranking-book-cover ${book.cover ? 'has-image' : ''}`}><span>{book.title.trim().slice(0, 1) || '书'}</span>{book.cover && <img src={book.cover} alt={`${book.title}封面`} loading="lazy" onError={event => event.currentTarget.parentElement?.classList.remove('has-image')} />}</div><div className="ranking-book-copy"><h3>{book.title}</h3><span>{book.author} · {book.category || '未分类'}</span><p>{book.intro || '暂无简介'}</p><small>{book.wordCount ? `${book.wordCount.toLocaleString()} 字` : '字数未知'}{book.readCount ? ` · ${book.readCount.toLocaleString()} 热度` : ''}</small><div className="ranking-book-actions"><button className="btn-secondary" disabled={bookDownloadRunningId === book.id} onClick={() => void downloadLibraryBook(book)}>{bookDownloadRunningId === book.id ? '下载中...' : '一键下载 TXT'}</button><button className="link-button" onClick={async () => { const downloaded = libraryBooks.find(item => item.title === book.title); const ready = downloaded || await downloadLibraryBook(book); if (ready) createDismantleFromLibrary(ready); }}>{bookDownloadRunningId === book.id ? '处理中...' : '一键拆书'}</button></div></div></article>)}</div>}
           </div>
         )}

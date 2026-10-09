@@ -2,8 +2,8 @@ import { compactText, contextBudgetBytes } from "../context/context-optimizer.js
 import { createModelApiClient, stringList } from "../application/model-client.js";
 import {
   qianyueSources, webBookSources, searchQianyueSource, searchConfiguredBookSource, searchFanqieSource,
-  searchAllBookSources, fetchNovelCatchRankingCategories, fetchQidianRanking, fetchFalooRanking,
-  fetchNovelCatchRanking, downloadFanqieChapter, downloadFallbackChapter, downloadQianyueChapter,
+  searchAllBookSources, fetchFanqieRankingCategories, fetchQidianRanking, fetchFalooRanking,
+  fetchFanqieRanking, downloadFanqieChapter, downloadFallbackChapter, downloadQianyueChapter,
   downloadConfiguredBookChapter, downloadQianyueSource, downloadConfiguredBookSource, downloadFanqieBook,
 } from "../sources/library-service.js";
 import type { RpcRegistry } from "./registry.js";
@@ -36,7 +36,7 @@ export const registerLibraryHandlers = (registry: RpcRegistry): RpcRegistry => r
     return { sources: [{ id: "fanqie", name: "番茄小说" }, ...qianyueSources.map(source => ({ id: source.id, name: source.name })), ...webBookSources.map(source => ({ id: source.id, name: source.name }))], defaultSourceId: "qianyue-kuwo" };
   })
   .register("ranking.categories", async params => {
-    return { sections: await fetchNovelCatchRankingCategories(params) };
+    return { sections: await fetchFanqieRankingCategories(params) };
   })
   .register("ranking.fetch", async params => {
     const { platform, rankType, gender, rankUrl } = params;
@@ -46,9 +46,8 @@ export const registerLibraryHandlers = (registry: RpcRegistry): RpcRegistry => r
     if (selectedPlatform === "qidian") return { books: await fetchQidianRanking(type, selectedGender, params), fetchedAt: new Date().toISOString() };
     if (selectedPlatform === "faloo") return { books: await fetchFalooRanking(type, selectedGender, params), fetchedAt: new Date().toISOString() };
     if (selectedPlatform !== "fanqie") throw new Error("未知扫榜平台");
-    const books = await fetchNovelCatchRanking(type, selectedGender, typeof rankUrl === "string" ? rankUrl : undefined, params);
-    if (!books.length) throw new Error("NovelCatch 番茄官方榜单没有返回书籍，请稍后刷新");
-    return { books: books.slice(0, 60), fetchedAt: new Date().toISOString(), sourceName: "番茄小说网" };
+    const books = await fetchFanqieRanking(type, selectedGender, typeof rankUrl === "string" ? rankUrl : undefined, params);
+    return { books: books.slice(0, 60), fetchedAt: new Date().toISOString(), sourceName: rankUrl ? "番茄小说网" : "番茄官网分类榜首页汇总（按在读排序）" };
   })
   .register("book.chapter.download", async params => {
     const { source, sourceBookId, chapter } = params;
@@ -116,7 +115,6 @@ export const registerLibraryHandlers = (registry: RpcRegistry): RpcRegistry => r
     }
     const chapters = await downloadFanqieBook(String(url), String(sourceBookId || ""), params, Number(maxChapters) || Number.MAX_SAFE_INTEGER);
     const downloadedChapterCount = chapters.filter(chapter => String(chapter.content || "").trim()).length;
-    if (!downloadedChapterCount) throw new Error("番茄正文没有返回有效内容，未保存空章节；请稍后重试或导入 TXT");
     const completedChapterCount = chapters.filter(chapter => chapter.downloaded === true).length;
     return { title: String(title || "未命名书籍"), author: String(author || "未知作者"), sourceBookId: String(sourceBookId || ""), chapters, downloadedChapterCount, completedChapterCount };
   })
