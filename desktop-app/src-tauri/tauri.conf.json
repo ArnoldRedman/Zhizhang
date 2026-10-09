@@ -1,6 +1,6 @@
 {
   "productName": "Zhizhang",
-  "version": "0.1.6",
+  "version": "1.0.0",
   "identifier": "com.zhizhang.app",
   "build": {
     "beforeDevCommand": "npm run dev",
