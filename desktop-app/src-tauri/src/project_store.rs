@@ -82,12 +82,10 @@ fn write_if_changed(path: &Path, content: &[u8]) -> Result<bool, String> {
 
 /// 删除目录里不再对应任何条目的 Markdown：改名或删除的条目不留旧文件，保留的文件不再先删后写
 fn remove_stale_markdown(dir: &Path, keep: &HashSet<PathBuf>) -> Result<(), String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("md") || keep.contains(&path) {
+    let mut found = Vec::new();
+    collect_markdown_files(dir, &mut found);
+    for path in found {
+        if keep.contains(&path) {
             continue;
         }
         fs::remove_file(&path).map_err(|error| format!("清理旧文件 {} 失败: {error}", path.display()))?;
@@ -96,7 +94,178 @@ fn remove_stale_markdown(dir: &Path, keep: &HashSet<PathBuf>) -> Result<(), Stri
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&path);
     }
+    prune_empty_directories(dir);
     Ok(())
+}
+
+/// 递归收集 `.md`：大纲允许建子目录，清理旧文件时也要下到子目录里比对
+fn collect_markdown_files(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_markdown_files(&path, found);
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) == Some("md") {
+            found.push(path);
+        }
+    }
+}
+
+/// 写完一轮后把空掉的资料子目录也收掉，否则手动迁走的目录会一直留在盘上
+fn prune_empty_directories(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        prune_empty_directories(&path);
+        let empty = fs::read_dir(&path).map(|inner| inner.filter_map(Result::ok).next().is_none()).unwrap_or(false);
+        if empty {
+            let _ = fs::remove_dir(&path);
+        }
+    }
+}
+
+/// 大纲文件在大纲目录下的相对路径。目录可以直接写在标题里：“设定/势力/寒渊宗”等同于
+/// 目录 设定/势力 + 文件 寒渊宗.md，两种写法都落到同一个位置
+pub fn outline_relative_path(folder: Option<&str>, title: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for segment in folder.unwrap_or("").split('/') {
+        let segment = segment.trim();
+        if !segment.is_empty() {
+            path.push(safe_folder_name(segment));
+        }
+    }
+    let mut segments: Vec<&str> = title.split('/').map(str::trim).filter(|segment| !segment.is_empty()).collect();
+    let file = segments.pop().unwrap_or("大纲");
+    for segment in segments {
+        path.push(safe_folder_name(segment));
+    }
+    path.push(format!("{}.md", safe_file_name(file)));
+    path
+}
+
+/// 在 大纲 下按文件名找资料；作者把 md 拖进子目录后靠它把结构纠正回来
+fn find_outline_file(dir: &Path, title: &str) -> Option<PathBuf> {
+    let wanted = format!("{}.md", safe_file_name(title.split('/').last().unwrap_or(title)));
+    let mut found = Vec::new();
+    collect_markdown_files(dir, &mut found);
+    found.into_iter().find(|path| path.file_name().and_then(|value| value.to_str()) == Some(wanted.as_str()))
+}
+
+/// 文件所在的子目录，拼成“设定/势力”这样的分组名；根目录返回空串
+fn folder_of_file(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.parent())
+        .map(|parent| parent.components().map(|part| part.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/"))
+        .unwrap_or_default()
+}
+
+/// 比对用的键就是相对路径：不同目录下的同名文件是两份资料
+fn outline_key(folder: &str, title: &str) -> String {
+    outline_relative_path(Some(folder), title).to_string_lossy().into_owned()
+}
+
+/// 作者在大纲目录里直接新建文件夹和 md，也应该算资料：文件夹名就是分组，文件名就是标题
+fn adopt_outline_files(project_dir: &Path, project: &mut Value) -> Result<(), String> {
+    let outline_dir = project_dir.join("大纲");
+    let mut found = Vec::new();
+    collect_markdown_files(&outline_dir, &mut found);
+    if found.is_empty() {
+        return Ok(());
+    }
+    let mut known: HashSet<String> = HashSet::new();
+    let mut next_id = 0_i64;
+    if let Some(outlines) = project.get("outlines").and_then(Value::as_array) {
+        for outline in outlines {
+            let title = outline.get("title").and_then(Value::as_str).unwrap_or("大纲");
+            let folder = outline.get("folder").and_then(Value::as_str).unwrap_or("");
+            known.insert(outline_key(folder, title));
+            if let Some(id) = outline.get("id").and_then(Value::as_i64) {
+                next_id = next_id.max(id);
+            }
+        }
+    }
+    let stamp = iso_timestamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0),
+    );
+    let mut additions: Vec<Value> = Vec::new();
+    for path in found {
+        let title = path.file_stem().and_then(|value| value.to_str()).unwrap_or("未命名").to_string();
+        let folder = path
+            .strip_prefix(&outline_dir)
+            .ok()
+            .and_then(|relative| relative.parent())
+            .map(|parent| parent.components().map(|part| part.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/"))
+            .unwrap_or_default();
+        // 旧数据只存标题不存目录，目录为空时按标题比对，避免重复收一份
+        if known.contains(&outline_key(&folder, &title)) || (folder.is_empty() && known.contains(&outline_key("", &title))) {
+            continue;
+        }
+        next_id += 1;
+        additions.push(serde_json::json!({
+            "id": next_id,
+            "kind": inferred_outline_kind(&title),
+            "title": title,
+            "folder": folder,
+            "content": fs::read_to_string(&path).unwrap_or_default(),
+            "createdAt": stamp,
+            "updatedAt": stamp,
+        }));
+    }
+    if additions.is_empty() {
+        return Ok(());
+    }
+    if !project.get("outlines").map(Value::is_array).unwrap_or(false) {
+        project["outlines"] = Value::Array(Vec::new());
+    }
+    if let Some(outlines) = project.get_mut("outlines").and_then(Value::as_array_mut) {
+        outlines.extend(additions);
+    }
+    Ok(())
+}
+
+/// 自动收进来的文件没有登记过的类型：审查报告和总纲能认出来，其余当长期设定
+fn inferred_outline_kind(title: &str) -> &'static str {
+    if title.starts_with("审查报告") {
+        "审查报告"
+    } else if title.contains("总纲") {
+        "总纲"
+    } else {
+        "世界观与作品设定"
+    }
+}
+
+/// 秒级时间戳转 ISO，只用于给自动收进来的文件填创建与更新时间
+fn iso_timestamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 #[cfg(test)]
@@ -187,6 +356,8 @@ fn load_projects_blocking(app: tauri::AppHandle) -> Result<Option<Value>, String
                 }
             }
 
+            // 同一个文件只能认给一份资料，避免两个同标题条目抢同一份内容
+            let mut resolved: HashSet<PathBuf> = HashSet::new();
             if let Some(outlines) = project.get_mut("outlines").and_then(Value::as_array_mut) {
                 for outline in outlines {
                     let title = outline
@@ -194,16 +365,25 @@ fn load_projects_blocking(app: tauri::AppHandle) -> Result<Option<Value>, String
                         .and_then(Value::as_str)
                         .or_else(|| outline.get("kind").and_then(Value::as_str))
                         .unwrap_or("大纲");
-                    let path = project_dir
-                        .join("大纲")
-                        .join(format!("{}.md", safe_file_name(title)));
+                    let folder = outline.get("folder").and_then(Value::as_str);
+                    let outline_dir = project_dir.join("大纲");
+                    let path = outline_dir.join(outline_relative_path(folder, title));
                     if path.exists() {
                         if let Ok(content) = fs::read_to_string(path) {
                             outline["content"] = Value::String(content);
                         }
+                    } else if let Some(found) = find_outline_file(&outline_dir, title).filter(|path| !resolved.contains(path)) {
+                        // 作者在资源管理器里把文件挪进了子目录：跟着文件的真实位置走，别按旧路径另写一份空文件
+                        if let Ok(content) = fs::read_to_string(&found) {
+                            outline["content"] = Value::String(content);
+                            outline["folder"] = Value::String(folder_of_file(&outline_dir, &found));
+                            resolved.insert(found);
+                        }
                     }
                 }
             }
+            // 作者在大纲目录里自建的文件夹同样是结构：未登记的 md 按目录名分组收进来
+            adopt_outline_files(&project_dir, &mut project)?;
             if let Some(cards) = project.get_mut("cards").and_then(Value::as_array_mut) {
                 for card in cards {
                     let card_type = card.get("type").and_then(Value::as_str).unwrap_or("角色卡");
@@ -373,7 +553,11 @@ fn save_projects_blocking(app: tauri::AppHandle, projects: Value) -> Result<Stri
                     .and_then(Value::as_str)
                     .unwrap_or("大纲");
                 let content = outline.get("content").and_then(Value::as_str).unwrap_or("");
-                let path = outline_dir.join(format!("{}.md", safe_file_name(title)));
+                let folder = outline.get("folder").and_then(Value::as_str).map(str::to_string);
+                let path = outline_dir.join(outline_relative_path(folder.as_deref(), title));
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| format!("创建大纲子目录失败: {error}"))?;
+                }
                 write_if_changed(&path, content.as_bytes())?;
                 kept_outline_files.insert(path);
                 outline["content"] = Value::String(String::new());
@@ -732,4 +916,34 @@ mod incremental_write_tests {
     }
 }
 
+#[cfg(test)]
+mod outline_directory_tests {
+    use super::{adopt_outline_files, outline_relative_path};
+    use std::fs;
+    use std::path::PathBuf;
 
+    #[test]
+    fn 标题里的目录段会落成子目录() {
+        assert_eq!(outline_relative_path(Some("设定/势力"), "寒渊宗"), PathBuf::from("设定").join("势力").join("寒渊宗.md"));
+        assert_eq!(outline_relative_path(None, "全书总纲"), PathBuf::from("全书总纲.md"));
+    }
+
+    #[test]
+    fn 大纲里手写的文件按目录收进结构() {
+        let root = std::env::temp_dir().join(format!("zhizhang-outline-{}", std::process::id()));
+        fs::create_dir_all(root.join("大纲/设定")).unwrap();
+        fs::write(root.join("大纲/设定/势力格局.md"), "# 势力").unwrap();
+        fs::write(root.join("大纲/总览.md"), "# 总览").unwrap();
+        let mut project = serde_json::json!({
+            "outlines": [{ "id": 3, "kind": "世界观与作品设定", "title": "总览", "folder": "", "content": "" }]
+        });
+        adopt_outline_files(&root, &mut project).unwrap();
+        let outlines = project["outlines"].as_array().unwrap();
+        assert_eq!(outlines.len(), 2, "已登记的同名文件不该重复收一份");
+        let added = &outlines[1];
+        assert_eq!(added["title"], serde_json::json!("势力格局"));
+        assert_eq!(added["folder"], serde_json::json!("设定"));
+        assert_eq!(added["id"], serde_json::json!(4));
+        fs::remove_dir_all(&root).ok();
+    }
+}

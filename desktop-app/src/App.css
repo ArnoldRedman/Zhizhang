@@ -656,6 +656,9 @@ main {
 
 .project-meta .genre { color: var(--accent-2-fg); }
 .project-meta .status { border-color: var(--accent-line); background: var(--accent-bg); color: var(--accent-fg); }
+/* 三种书架状态用颜色分开：待开坑是静音灰，连载中沿用主题色，已完结用完成色 */
+.project-meta .status-planned { border-color: var(--line); background: var(--surface-sunken); color: var(--text-3); }
+.project-meta .status-completed { border-color: var(--ok); background: var(--surface-sunken); color: var(--ok); }
 
 .project-stats {
   display: flex;
@@ -3912,6 +3915,28 @@ select.input {
 .outline-workspace-header small { display: block; margin-top: 6px; color: var(--text-5); font-size: 11px; }
 .outline-main-editor { flex: 1; width: 100%; min-height: 420px; resize: none; padding: 24px 28px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--text-2); font: var(--reader-size)/var(--reader-line) var(--reader-font); white-space: pre-wrap; }
 .outline-main-editor:focus { outline: 1px solid var(--accent-2-fg); border-color: var(--accent-2-fg); }
+
+/* Markdown 预览：资料里的表格、标题、列表按原文结构显示，不再是一墙竖线 */
+.markdown-preview { flex: 1; width: 100%; min-height: 420px; padding: 24px 28px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); color: var(--text-2); font: var(--reader-size)/var(--reader-line) var(--reader-font); overflow: auto; }
+.markdown-preview > :first-child { margin-top: 0; }
+.markdown-preview h1, .markdown-preview h2, .markdown-preview h3, .markdown-preview h4 { margin: 1.4em 0 .6em; color: var(--text-1); line-height: 1.4; }
+.markdown-preview h1 { font-size: 1.5em; }
+.markdown-preview h2 { font-size: 1.25em; }
+.markdown-preview h3 { font-size: 1.1em; }
+.markdown-preview p { margin: .7em 0; }
+.markdown-preview ul, .markdown-preview ol { margin: .7em 0; padding-left: 1.6em; }
+.markdown-preview li { margin: .25em 0; }
+.markdown-preview blockquote { margin: .8em 0; padding: .4em .9em; border-left: 3px solid var(--accent-line); background: var(--surface-sunken); color: var(--text-3); }
+.markdown-preview code { padding: 1px 5px; border-radius: 4px; background: var(--surface-sunken); font-family: var(--mono-font, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: .92em; }
+.markdown-preview pre { margin: .9em 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-sunken); overflow-x: auto; }
+.markdown-preview pre code { padding: 0; background: none; }
+.markdown-preview hr { margin: 1.4em 0; border: 0; border-top: 1px solid var(--line); }
+.markdown-preview a { color: var(--accent-2-fg); }
+.markdown-preview table { margin: 1em 0; border-collapse: collapse; width: 100%; font-size: .94em; }
+.markdown-preview th, .markdown-preview td { padding: 7px 10px; border: 1px solid var(--line); vertical-align: top; }
+.markdown-preview th { background: var(--surface-sunken); color: var(--text-1); font-weight: 600; white-space: nowrap; }
+.markdown-preview tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface-sunken) 55%, transparent); }
+.outline-folder-path { margin-right: 6px; color: var(--text-5); font-size: 11px; }
 .outline-agent-actions { display: grid; gap: 8px; margin-top: 12px; }
 .outline-agent-actions .btn-primary { width: 100%; }
 .outline-agent-progress { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 8px; border: 1px solid var(--accent-line); border-radius: var(--r-sm); background: var(--accent-bg); color: var(--accent-2-fg); font-size: 11px; }

@@ -14,7 +14,8 @@ import { cardAliasTerms, cardSearchTerms, refreshCardStatesForProject, stripHeur
 import { applyGraphDedupeSuggestion, cleanupKnowledgeGraph, deferredHonorifics, mergeGraphNodes, removeGraphNode, type GraphCleanupReport } from './domain/graph-cleanup';
 import { mergeKnowledgeGraph } from './domain/graph-merge';
 import { isSurnamedHonorific } from './domain/entity-terms';
-import { answerAuthorQuestion, answeredAuthorQuestions, dismissAuthorQuestion, groupOutlines, mergeGeneratedOutline, outlineKeepsHistory, outlineSnapshotLimit, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeReviewReportsForChapter, restoreOutlineSnapshot, stripLegacyCardCandidateNotes } from './domain/outline';
+import { answerAuthorQuestion, answeredAuthorQuestions, dismissAuthorQuestion, groupOutlines, mergeGeneratedOutline, outlineFolderOf, outlineKeepsHistory, outlineSnapshotLimit, pendingAuthorQuestions, pushOutlineSnapshot, recordAuthorQuestions, removeReviewReportsForChapter, restoreOutlineSnapshot, stripLegacyCardCandidateNotes } from './domain/outline';
+import { renderMarkdown } from './domain/markdown';
 import { candidateExcerpts, deriveCardCandidates, ignoreCardCandidate, type DerivedCardCandidate } from './domain/card-candidates';
 import { mapWithConcurrency } from './utils/concurrency';
 import { chapterNumberFromText, outlineByChapterNumber, plannedThroughChapterNumber, plannedVolumeEndChapter, resolveOutlineGenerationIntent } from './features/outline/model';
@@ -732,7 +733,7 @@ const normalizeStoredProject = (value: unknown): Project => {
     protagonist1: typeof project.protagonist1 === 'string' ? project.protagonist1 : '',
     protagonist2: typeof project.protagonist2 === 'string' ? project.protagonist2 : '',
     synopsis: typeof project.synopsis === 'string' ? project.synopsis : '',
-    status: project.status === 'completed' ? 'completed' : 'writing',
+    status: project.status === 'completed' ? 'completed' : project.status === 'planned' ? 'planned' : 'writing',
     chapters,
     outline: Array.isArray(project.outline) ? project.outline : [],
     outlines: Array.isArray(project.outlines) ? project.outlines : [],
@@ -1161,6 +1162,22 @@ const loadSessionId = (kind: string) => {
   localStorage.setItem(sessionStorageKey(kind), created);
   return created;
 };
+/**
+ * 上次读到的章节
+ * 每本书单独记一条，下次点进这本书直接回到那一章，不用再从第一章翻起
+ */
+/** 书架上的书籍状态：待开坑 / 连载中 / 已完结 */
+const projectStatusLabels: Record<Project['status'], string> = { planned: '待开坑', writing: '连载中', completed: '已完结' };
+
+const lastChapterStorageKey = (projectId: number) => `zhizhang.last-chapter.${projectId}`;
+const readLastChapterId = (projectId: number): number | null => {
+  const value = Number(localStorage.getItem(lastChapterStorageKey(projectId)));
+  return Number.isFinite(value) && value > 0 ? value : null;
+};
+const rememberLastChapter = (projectId: number, chapterId: number) => {
+  localStorage.setItem(lastChapterStorageKey(projectId), String(chapterId));
+};
+
 /** 开新对话：换一个 id，旧会话不再参与（小说资料不受影响） */
 const rotateSessionId = (kind: string) => {
   const created = createSessionId(kind);
@@ -1202,7 +1219,7 @@ function App() {
               protagonist1: project.protagonist1 ?? '',
               protagonist2: project.protagonist2 ?? '',
               synopsis: project.synopsis ?? '',
-              status: project.status === 'completed' ? 'completed' : 'writing',
+              status: project.status === 'completed' ? 'completed' : project.status === 'planned' ? 'planned' : 'writing',
               wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
               chapters,
               outline: Array.isArray(project.outline) ? project.outline : [],
@@ -1710,6 +1727,8 @@ function App() {
   const [exportRunning, setExportRunning] = useState(false);
   const [showChapterHistory, setShowChapterHistory] = useState(false);
   const [showOutlineHistory, setShowOutlineHistory] = useState(false);
+  // Markdown 预览：大纲与卡片资料里有大量表格，纯 textarea 看不出结构，可切预览
+  const [markdownPreview, setMarkdownPreview] = useState(false);
   // 大纲页哪些分组收起：章纲和审查报告一本书攒几十份，默认收起；其余展开
   const [collapsedOutlineGroups, setCollapsedOutlineGroups] = useState<Set<string>>(() => new Set(['章纲', '审查报告']));
   // 待答面板里正在敲的答复，按问题 id 存；点"答复"才写进项目
@@ -1752,6 +1771,15 @@ function App() {
     if (highlightLayerRef.current) highlightLayerRef.current.scrollTop = 0;
     if (readingArticleRef.current) readingArticleRef.current.scrollTop = 0;
   }, [activeChapterId]);
+
+  // 记住上次读到的章节：切章、新建、AI 续写都走同一个入口，下次打开这本书直接回到这里
+  useEffect(() => {
+    const project = editingProject;
+    if (!project || activeChapterId === undefined) return;
+    // 换书时两边的 setState 可能在过渡帧里错开一拍，章节不属于这本书就先不记
+    if (!project.chapters?.some(chapter => chapter.id === activeChapterId)) return;
+    rememberLastChapter(project.id, activeChapterId);
+  }, [editingProject, activeChapterId]);
   /**
    * 目录跟随当前章：当前章滚到列表可见区域
    * 新建/插入/Alt 切章/项目 Agent 产出都会改 activeChapter，与其在每个入口补 scrollIntoView，不如统一在这里跟随；
@@ -1824,6 +1852,7 @@ function App() {
     protagonist1: '',
     protagonist2: '',
     synopsis: '',
+    status: 'writing' as Project['status'],
   });
   const [projectGenerationSource, setProjectGenerationSource] = useState<'outline' | 'chapters'>('outline');
   const [projectGeneratingField, setProjectGeneratingField] = useState<'title' | 'synopsis' | null>(null);
@@ -2084,7 +2113,7 @@ function App() {
             // 旧版把"本章新出现，要不要建卡"堆在待答文档里、又存过一批候选：读档时删掉，候选现在从图谱按反复出现推导
             return stripLegacyCardCandidateNotes({
               ...project,
-              status: project.status === 'completed' ? 'completed' : 'writing',
+              status: project.status === 'completed' ? 'completed' : project.status === 'planned' ? 'planned' : 'writing',
               chapters,
               outline: Array.isArray(project.outline) ? project.outline : [],
               outlines: Array.isArray(project.outlines) ? project.outlines : [],
@@ -2349,6 +2378,7 @@ function App() {
         protagonist1: newProject.protagonist1.trim(),
         protagonist2: newProject.protagonist2.trim(),
         synopsis: newProject.synopsis.trim(),
+        status: newProject.status,
         updatedAt: now,
       };
       setProjects(current => current.map(project => project.id === updatedProject.id ? updatedProject : project));
@@ -2375,7 +2405,7 @@ function App() {
       protagonist1: newProject.protagonist1.trim(),
       protagonist2: newProject.protagonist2.trim(),
       synopsis: newProject.synopsis.trim(),
-      status: 'writing',
+      status: newProject.status,
       wordCount: 0,
       chapters: [],
       outline: [],
@@ -2412,6 +2442,7 @@ function App() {
       protagonist1: '',
       protagonist2: '',
       synopsis: '',
+      status: 'writing',
     });
     setProjectGenerationSource('outline');
     setProjectGeneratingField(null);
@@ -2443,6 +2474,7 @@ function App() {
       protagonist1: project.protagonist1 ?? '',
       protagonist2: project.protagonist2 ?? '',
       synopsis: project.synopsis ?? '',
+      status: project.status ?? 'writing',
     });
     setTagDraft(selectedTags);
     setActiveTagTab('主分类');
@@ -2932,7 +2964,7 @@ function App() {
     setImitationSource({ bookId: book.id, chapterId: chapter?.id });
     setProjectFormMode('create');
     setProjectEditingId(null);
-    setNewProject({ title: '', channel: '男频', selectedTags: defaultProjectTags('男频'), cover: '', protagonist1: '', protagonist2: '', synopsis: '' });
+    setNewProject({ title: '', channel: '男频', selectedTags: defaultProjectTags('男频'), cover: '', protagonist1: '', protagonist2: '', synopsis: '', status: 'writing' });
     setShowNewProjectModal(true);
     setActiveTab('projects');
     setNotice({ title: '已带入仿写创建', content: '请补充目标小说的书名、简介和分类后创建。只会带入抽象细纲，不会复制原文。' });
@@ -3121,7 +3153,7 @@ function App() {
     if (!editingProject) return;
     try {
       await nativeClient.saveProjects(projects);
-      await invoke<string>('open_outline_location', { projectId: editingProject.id, outlineTitle: activeOutline?.title ?? '大纲' });
+      await invoke<string>('open_outline_location', { projectId: editingProject.id, outlineTitle: activeOutline?.title ?? '大纲', outlineFolder: activeOutline?.folder ?? null });
     } catch (error) {
       setNotice({ title: '打开大纲位置失败', content: String(error) });
     }
@@ -3324,7 +3356,9 @@ function App() {
           graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
         };
         setEditingProject(normalizedProject);
-        setActiveChapter(chapters[0]);
+        // 上次读到的那一章还在就回到那里，否则退回第一章
+        const lastChapterId = readLastChapterId(projectId);
+        setActiveChapter(chapters.find(chapter => chapter.id === lastChapterId) ?? chapters[0]);
         setActiveOutlineId(normalizedProject.outlines[0]?.id ?? null);
         setSelectedCardIds([]);
         setActiveChapterMemoryId(normalizedProject.memories[0]?.id ?? null);
@@ -7551,7 +7585,7 @@ function App() {
                           </button>
                           {!collapsed && items.map(outline => (
                             <div key={outline.id} className={`outline-document-item ${activeOutlineId === outline.id ? 'active' : ''}`} onClick={() => setActiveOutlineId(outline.id)}>
-                              <div><strong>{outline.title}</strong><small>{outline.kind === '章纲' && outline.chapterId ? editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节' : outline.kind}{outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title) ? ' · 工作台账不进写作' : ''}{outline.kind === '世界观与作品设定' && isWritingGuideDocumentTitle(outline.title) ? ' · 写作时只取设定事实' : ''}{outline.snapshots?.length ? ` · ${outline.snapshots.length} 个历史版本` : ''}</small></div>
+                              <div><strong>{outline.title.split('/').pop()}</strong><small>{outline.kind === '章纲' && outline.chapterId ? editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节' : outline.kind}{outline.kind === '世界观与作品设定' && isWorkLogDocumentTitle(outline.title) ? ' · 工作台账不进写作' : ''}{outline.kind === '世界观与作品设定' && isWritingGuideDocumentTitle(outline.title) ? ' · 写作时只取设定事实' : ''}{outline.snapshots?.length ? ` · ${outline.snapshots.length} 个历史版本` : ''}</small></div>
                               <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}><Icon name="trash" size={14} /></button>
                             </div>
                           ))}
@@ -7870,20 +7904,20 @@ function App() {
               ) : editorSidebarTab === 'outline' ? (
                 <section className="outline-workspace">
                   {activeOutline ? <>
-                    <div className="outline-workspace-header"><div><span>{activeOutline.kind}</span><input className="outline-title-input" value={activeOutline.title} onChange={event => updateActiveOutline({ title: event.target.value })} placeholder="大纲标题" /><small>Markdown 大纲文档 · 内容会自动保存{outlineKeepsHistory(activeOutline.kind) ? ' · 模型覆盖前自动留底' : ''}</small></div><div className="outline-workspace-actions">{outlineKeepsHistory(activeOutline.kind) && <button className="editor-tool-button" disabled={!activeOutline.snapshots?.length} title={activeOutline.snapshots?.length ? '查看并恢复被覆盖前的版本' : '还没有历史版本'} onClick={() => setShowOutlineHistory(true)}>历史版本{activeOutline.snapshots?.length ? ` ${activeOutline.snapshots.length}` : ''}</button>}<button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div></div>
+                    <div className="outline-workspace-header"><div>{outlineFolderOf(activeOutline) && <span className="outline-folder-path">{outlineFolderOf(activeOutline).split('/').join(' / ')} /</span>}<span>{activeOutline.kind}</span><input className="outline-title-input" value={activeOutline.title} onChange={event => updateActiveOutline({ title: event.target.value })} placeholder="大纲标题，写“设定/势力”可直接建子目录" /><small>Markdown 大纲文档 · 内容会自动保存{outlineKeepsHistory(activeOutline.kind) ? ' · 模型覆盖前自动留底' : ''}</small></div><div className="outline-workspace-actions">{outlineKeepsHistory(activeOutline.kind) && <button className="editor-tool-button" disabled={!activeOutline.snapshots?.length} title={activeOutline.snapshots?.length ? '查看并恢复被覆盖前的版本' : '还没有历史版本'} onClick={() => setShowOutlineHistory(true)}>历史版本{activeOutline.snapshots?.length ? ` ${activeOutline.snapshots.length}` : ''}</button>}<button className={`editor-tool-button ${markdownPreview ? 'active' : ''}`} onClick={() => setMarkdownPreview(current => !current)}>预览 / 编辑</button><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div></div>
                     {renderDocumentSearchPanel('大纲', activeOutline.content, content => updateActiveOutline({ content }))}
                     {activeOutline.kind === '章纲' && !activeOutline.title.startsWith('阶段节拍｜') && <ChapterBriefFields outline={activeOutline} onChange={updateActiveOutline} />}
-                    <textarea className="outline-main-editor" value={activeOutline.content} onChange={event => updateActiveOutline({ content: event.target.value })} placeholder={`编辑${activeOutline.kind}内容...`} />
+                    {markdownPreview ? <article className="markdown-preview outline-markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdown(activeOutline.content) }} /> : <textarea className="outline-main-editor" value={activeOutline.content} onChange={event => updateActiveOutline({ content: event.target.value })} placeholder={`编辑${activeOutline.kind}内容...`} />}
                   </> : <div className="empty-state"><p>从左侧选择一个大纲开始编辑。</p></div>}
                 </section>
               ) : editorSidebarTab === 'cards' ? (
                 <section className="card-workspace">
                   <>
                     <div className="card-workspace-header"><span>{cardDraft.type}</span><input className="card-main-title-input" value={cardDraft.title} onChange={event => setCardDraft(current => ({ ...current, title: event.target.value }))} placeholder="卡片名称" /><small>知识卡 Markdown · 内容会自动保存</small></div>
-                    <div className="card-workspace-controls"><select className="select" value={cardDraft.type} onChange={event => setCardDraft(current => ({ ...current, type: event.target.value as CardType }))}><option value="角色卡">角色卡</option><option value="物品卡">物品卡</option><option value="地点卡">地点卡</option><option value="势力卡">势力卡</option><option value="金手指卡">金手指卡</option></select><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button><button className="btn-secondary" disabled={cardGenerating} onClick={generateCardWithAI}>{cardGenerating ? '生成中...' : 'AI 生成卡片'}</button>{activeCard && <button className="btn-secondary" onClick={() => void updateCardStatesFromBook(activeCard.id)}>更新状态</button>}</div>
+                    <div className="card-workspace-controls"><select className="select" value={cardDraft.type} onChange={event => setCardDraft(current => ({ ...current, type: event.target.value as CardType }))}><option value="角色卡">角色卡</option><option value="物品卡">物品卡</option><option value="地点卡">地点卡</option><option value="势力卡">势力卡</option><option value="金手指卡">金手指卡</option></select><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button><button className={`editor-tool-button ${markdownPreview ? 'active' : ''}`} onClick={() => setMarkdownPreview(current => !current)}>预览 / 编辑</button><button className="btn-secondary" disabled={cardGenerating} onClick={generateCardWithAI}>{cardGenerating ? '生成中...' : 'AI 生成卡片'}</button>{activeCard && <button className="btn-secondary" onClick={() => void updateCardStatesFromBook(activeCard.id)}>更新状态</button>}</div>
                     <div className="card-workspace-meta"><span>当前状态：{activeCard?.currentState || '尚未更新'}</span>{activeCard && <button className="link-button" onClick={() => void updateCardStatesFromBook(activeCard.id)}>全文检索并更新状态</button>}</div>
                     {renderDocumentSearchPanel('卡片', cardDraft.content, content => setCardDraft(current => ({ ...current, content })))}
-                    <textarea className="card-main-editor" value={cardDraft.content} onChange={event => setCardDraft(current => ({ ...current, content: event.target.value }))} placeholder="编辑卡片详细信息..." />
+                    {markdownPreview ? <article className="markdown-preview card-markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdown(cardDraft.content) }} /> : <textarea className="card-main-editor" value={cardDraft.content} onChange={event => setCardDraft(current => ({ ...current, content: event.target.value }))} placeholder="编辑卡片详细信息..." />}
                     <div className="card-workspace-footer"><span>{countNovelCharacters(cardDraft.content)} 字</span><button className="btn-primary" onClick={saveCard}>{activeCard ? '保存卡片' : '创建卡片'}</button></div>
                   </>
                 </section>
@@ -8661,7 +8695,7 @@ function App() {
                       <div className="project-meta">
                         <span className="genre">{project.subgenre ?? project.genre}</span>
                         {project.tags?.主题?.slice(0, 2).map(tag => <span key={tag} className="genre">{tag}</span>)}
-                        <span className="status">{project.status === 'completed' ? '已完结' : '连载中'}</span>
+                        <span className={`status status-${project.status ?? 'writing'}`}>{projectStatusLabels[project.status ?? 'writing']}</span>
                       </div>
                       <div className="project-stats">
                         <span>{project.wordCount.toLocaleString()} 字</span>
@@ -9251,6 +9285,20 @@ function App() {
                       </button>
                     ))}
                   </div>
+                </div>
+
+                <div className="create-form-row">
+                  <label htmlFor="project-status">书籍状态</label>
+                  <select
+                    id="project-status"
+                    className="select"
+                    value={newProject.status}
+                    onChange={(e) => setNewProject({ ...newProject, status: e.target.value as Project['status'] })}
+                  >
+                    <option value="planned">待开坑</option>
+                    <option value="writing">连载中</option>
+                    <option value="completed">已完结</option>
+                  </select>
                 </div>
 
                 <div className="create-form-row">

@@ -14,7 +14,7 @@ use resource_store::{
 };
 
 use project_store::{
-    app_data_directory, graph_node_relative_path, load_projects, save_projects, safe_file_name,
+    app_data_directory, graph_node_relative_path, load_projects, outline_relative_path, save_projects, safe_file_name,
 };
 #[cfg(test)]
 use project_store::{graph_node_profile_from_markdown, graph_node_to_markdown};
@@ -755,11 +755,13 @@ fn open_outline_location(
     app: tauri::AppHandle,
     project_id: i64,
     outline_title: Option<String>,
+    outline_folder: Option<String>,
 ) -> Result<String, String> {
     let title = outline_title.unwrap_or_else(|| "大纲".to_string());
+    // 大纲可能落在子目录里，定位时要把目录一并拼上
     let path = find_project_directory(&app, project_id)?
         .join("大纲")
-        .join(format!("{}.md", safe_file_name(&title)));
+        .join(outline_relative_path(outline_folder.as_deref(), &title));
     if !path.exists() {
         return Err("大纲 Markdown 尚未保存，请稍后再试".to_string());
     }

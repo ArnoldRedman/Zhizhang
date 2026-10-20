@@ -55,26 +55,50 @@ export const mergeGeneratedOutline = (outline: OutlineDocument, generated: strin
   return { ...pushOutlineSnapshot(outline, reason), content, updatedAt: now };
 };
 
-/** 大纲页的分组顺序：长期资料在前，逐章产物在后，报告最后 */
-export type OutlineGroup = '总纲' | '世界观与作品设定' | '阶段节拍' | '章纲' | '审查报告';
-export const outlineGroupOrder: OutlineGroup[] = ['总纲', '世界观与作品设定', '阶段节拍', '章纲', '审查报告'];
+/** 大纲页的分组顺序：长期资料在前，逐章产物在后，报告最后；作者自建的目录按名字插在中间 */
+export type OutlineGroup = string;
+const fixedGroupOrder = ['总纲', '世界观与作品设定', '阶段节拍', '章纲', '审查报告'];
+
+/** 标题里写“设定/修炼体系”就在大纲下建子目录；标题只留最后一段，前面的当目录 */
+export const splitOutlinePath = (value: string): { folder: string; title: string } => {
+  const segments = String(value ?? '').split('/').map(segment => segment.trim()).filter(Boolean);
+  if (segments.length === 0) return { folder: '', title: '' };
+  if (segments.length === 1) return { folder: '', title: segments[0] };
+  return { folder: segments.slice(0, -1).join('/'), title: segments[segments.length - 1] };
+};
+
+/** 资料在 大纲/ 下的相对路径，列表与“打开文件位置”都用它 */
+export const outlinePath = (outline: OutlineDocument): string => [outline.folder, outline.title].filter(Boolean).join('/');
+
+/** 资料所属目录：存在 folder 字段时用它，也可以直接把目录写在标题里（“设定/势力格局”） */
+export const outlineFolderOf = (outline: OutlineDocument): string => {
+  if (outline.folder) return outline.folder;
+  return outline.title.includes('/') ? splitOutlinePath(outline.title).folder : '';
+};
 
 export const outlineGroupOf = (outline: OutlineDocument): OutlineGroup => {
+  const folder = outlineFolderOf(outline);
+  if (folder) return folder;
   if (outline.kind === '章纲' && /^阶段节拍｜/u.test(outline.title)) return '阶段节拍';
   if (outline.kind === '审查报告' || outline.kind === '总纲' || outline.kind === '世界观与作品设定') return outline.kind;
   return '章纲';
 };
 
-/** 分组后的大纲列表；章纲与审查报告按章号倒序（最近写的在上面），其余按原顺序 */
+/** 分组后的大纲列表；固定分组在前，自建目录按名字排序，章纲与审查报告按章号倒序 */
 export const groupOutlines = (outlines: OutlineDocument[]): Array<{ group: OutlineGroup; items: OutlineDocument[] }> => {
   const chapterNumber = (outline: OutlineDocument) => Number(/第\s*(\d{1,4})\s*章/u.exec(outline.title)?.[1] || 0);
-  return outlineGroupOrder
-    .map(group => {
-      const items = outlines.filter(outline => outlineGroupOf(outline) === group);
-      if (group === '章纲' || group === '审查报告') items.sort((left, right) => chapterNumber(right) - chapterNumber(left));
-      return { group, items };
-    })
-    .filter(entry => entry.items.length > 0);
+  const groups = new Map<string, OutlineDocument[]>();
+  for (const outline of outlines) {
+    const group = outlineGroupOf(outline);
+    groups.set(group, [...(groups.get(group) ?? []), outline]);
+  }
+  const folderNames = [...groups.keys()].filter(group => !fixedGroupOrder.includes(group)).sort((left, right) => left.localeCompare(right, 'zh-Hans-CN'));
+  const order = ['总纲', '世界观与作品设定', '阶段节拍', ...folderNames, '章纲', '审查报告'].filter(group => groups.has(group));
+  return order.map(group => {
+    const items = groups.get(group)!;
+    if (group === '章纲' || group === '审查报告') items.sort((left, right) => chapterNumber(right) - chapterNumber(left));
+    return { group, items };
+  });
 };
 
 /** 某一章的审查报告标题前缀；重写或修订这一章后旧报告说的是被换掉的稿子，要删 */

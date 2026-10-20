@@ -93,6 +93,8 @@ React 通过 `src/services/agent-client.ts` 调用 Agent RPC，通过 `native-cl
 - `rpc/library-handlers.ts`：书籍、榜单、拆书和文风相关 RPC。
 - `sources/library-service.ts`：Fanqie、千阅、其他书源和榜单抓取。
 
+资料落盘规则：`大纲/` 支持子目录，`OutlineDocument.folder` 与标题里的 `/` 等价（`outline_relative_path`），保存时会建目录、清理时递归比对、载入时把用户自己新建的 md 按文件夹名收成结构；文件被手工挪进子目录时按文件名找回，避免在原位写出空文件。
+
 章节写作仍由 `graphs/chapter-write.graph.ts` 编排：上下文准备、检索、承接、构思（简短确定事件、人物动机和结尾）、正文（纯文本，第一行章名）、本地验证门、审查。验证门（`packages/contracts` 的 `prose-lint` 与 `punctuation`，桌面端与运行时共用）不调模型：引号与停顿标点直接归一，风格句式只作为 advisory 提示，只有截断、复读、占位符与工程词泄漏触发一次定向修订。审查按项目设置分 full / lean / solo 三档，对照紧邻上一章原文核查已完成结果；字数不合格、重复事件或 S1/S2 跨章事实冲突自动修一次，再走验证门和审查。最终验收由 `packages/contracts/src/chapter-acceptance.ts` 前后端共用：修后仍不过才停草稿，不能伪造通过或覆盖旧章；手动覆盖前必须确认。模型拿不准的事写成「【给作者】」行，运行时剥出来交给界面，连续创作时汇总进大纲页的“给作者｜待答”。项目绑定了做过全书聚合的拆书时（`book.aggregate`，`application/benchmark.ts`），构思看情绪模块与节奏表，正文只带一段同基调原文锚点。
 
 ### 写作提示词的约束原则

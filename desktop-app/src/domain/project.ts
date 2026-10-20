@@ -40,6 +40,8 @@ export interface OutlineDocument {
   kind: OutlineKind;
   chapterId?: number;
   title: string;
+  /** 大纲下的子目录（可多级，用 / 分隔）；作者按“设定/势力”这样建文件夹时，文件就跟着写进子目录 */
+  folder?: string;
   content: string;
   /** 章纲上的写前信息边界：空着不挡写作，隐瞒没填时用上一章的作者真相补 */
   readerKnows?: string;
@@ -219,7 +221,8 @@ export interface Project {
   protagonist1?: string;
   protagonist2?: string;
   synopsis?: string;
-  status: 'writing' | 'completed';
+  /** 书架状态：待开坑（只想好点子还没动笔）、连载中、已完结 */
+  status: 'planned' | 'writing' | 'completed';
   chapters: Chapter[];
   outline: OutlineNode[];
   outlines: OutlineDocument[];
